@@ -12,6 +12,7 @@ from harness.core.prompt import SystemPromptBuilder
 from harness.core.compaction import Compactor, TokenStats
 from harness.core.todo import TodoManager
 from harness.core.session import Session, SessionManager
+from harness.core.checkpoints import CheckpointManager, get_checkpoint_manager, set_checkpoint_manager
 from harness.core.subagents import SubagentOrchestrator
 from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta
 from harness.providers import get_provider
@@ -50,6 +51,10 @@ class HarnessAgent:
         )
         self.mcp_manager = MCPManager(self.tool_registry)
         self.mcp_manager.load_and_connect()
+
+        # Initialize checkpoint manager
+        self.checkpoint_manager = get_checkpoint_manager()
+        set_checkpoint_manager(self.checkpoint_manager)
 
         self.provider: BaseProvider = get_provider(config.provider, config)
         self.session_manager = SessionManager()
@@ -174,6 +179,14 @@ class HarnessAgent:
 
             for v in tool_calls_acc.values():
                 tname = v["name"]
+                if tname == "finish":
+                    try:
+                        fargs = json.loads(v["arguments"]) if v["arguments"] else {}
+                    except Exception:
+                        fargs = {}
+                    summary = str(fargs.get("summary", "")).strip() or "Task complete."
+                    accumulated_output += summary + "\n"
+                    return accumulated_output.strip(), turns
                 try:
                     args = json.loads(v["arguments"]) if v["arguments"] else {}
                 except Exception:
@@ -189,11 +202,13 @@ class HarnessAgent:
 
         if user_prompt:
             self.session.messages.append({"role": "user", "content": user_prompt})
+            self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
 
         # Process any pending steering instructions
         while self.steer_queue:
             st = self.steer_queue.pop(0)
             self.session.messages.append({"role": "user", "content": f"[STEERING GUIDANCE]: {st}"})
+            self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
 
         # Skills-first: eagerly consult the skill catalog via the list_skills tool at the
         # start of every task so the model always sees available skills before working,
@@ -226,8 +241,15 @@ class HarnessAgent:
         # Auto-compaction check
         sys_prompt = self._build_system_prompt(user_prompt or "")
         if self.config.auto_compact and self.compactor.should_compact(self.session.messages, sys_prompt):
+            old_messages = list(self.session.messages)
             compacted_msgs, stats = self.compactor.compact(self.session.messages)
             self.session.messages = compacted_msgs
+            
+            # Record message changes for checkpoint
+            self.checkpoint_manager.record_message_truncate(
+                0, len(old_messages) - len(compacted_msgs), 
+                old_messages[:len(old_messages) - len(compacted_msgs)]
+            )
             yield AgentEvent("compaction", stats)
 
         # Loop for tool executions (Super mode allows up to 25 steps, Build up to 10)
@@ -235,6 +257,9 @@ class HarnessAgent:
         current_loop = 0
         empty_streak = 0
         MAX_EMPTY_RETRIES = 2
+
+        # Create checkpoint at start of turn
+        self.checkpoint_manager.create_checkpoint(f"Turn {len(self.session.messages) // 2 + 1} start")
 
         while current_loop < max_loop and self.is_running:
             current_loop += 1
@@ -281,13 +306,27 @@ class HarnessAgent:
                 if empty_streak <= MAX_EMPTY_RETRIES:
                     self.session.messages.append({
                         "role": "user",
-                        "content": "[SYSTEM]: Your previous response was empty. Continue and produce a complete answer to the current task now.",
+                        "content": (
+                            "[SYSTEM]: Your previous response was empty. Either continue with concrete "
+                            "work by calling a tool, or — if the task is complete — immediately produce "
+                            "your FINAL ANSWER text now (or call `finish` with your final summary). Do not "
+                            "go silent."
+                        ),
                     })
                     yield AgentEvent("step_end", {"step": current_loop, "complete": False})
                     continue
-                yield AgentEvent("text_delta", "[Harness] The model returned an empty response after retries. Please rephrase your request or try again.")
+                # Second consecutive dead-end: recover the model's best final words instead
+                # of surfacing a raw error.
+                last_text = self._last_assistant_text()
+                if last_text:
+                    yield AgentEvent("text_delta", "\n[Harness] The model went quiet — here is its final message:\n")
+                    yield AgentEvent("text_delta", last_text)
+                else:
+                    yield AgentEvent("text_delta", "[Harness] The model returned an empty response after retries. Please rephrase your request or try again.")
                 yield AgentEvent("step_end", {"step": current_loop, "complete": True})
                 break
+
+            empty_streak = 0
 
             # Append assistant turn to history
             assistant_msg: Dict[str, Any] = {
@@ -307,6 +346,7 @@ class HarnessAgent:
                 ]
 
             self.session.messages.append(assistant_msg)
+            self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, assistant_msg)
 
             # If no tools called, agent has finished speaking for this turn
             if not tool_calls_accumulator:
@@ -314,6 +354,8 @@ class HarnessAgent:
                 break
 
             # Execute tool calls
+            stop_requested = False
+            finish_summary = ""
             for v in tool_calls_accumulator.values():
                 tool_name = v["name"]
                 raw_args = v["arguments"]
@@ -324,22 +366,45 @@ class HarnessAgent:
 
                 yield AgentEvent("tool_call_start", {"name": tool_name, "arguments": args})
 
+                # The `finish` tool is the model's explicit stop signal: deliver the
+                # summary and end the iteration without any further model calls.
+                if tool_name == "finish":
+                    finish_summary = str(args.get("summary", "")).strip() or "Task complete."
+                    self.session.messages.append({
+                        "role": "tool",
+                        "tool_call_id": v["id"],
+                        "name": "finish",
+                        "content": finish_summary,
+                    })
+                    self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
+                    stop_requested = True
+                    break
+
                 result = self.tool_registry.execute(tool_name, args, self.mode)
 
                 yield AgentEvent("tool_call_result", {"name": tool_name, "result": result})
 
                 # Append tool result to history
-                self.session.messages.append({
+                tool_result_msg = {
                     "role": "tool",
                     "tool_call_id": v["id"],
                     "name": tool_name,
                     "content": result,
-                })
+                }
+                self.session.messages.append(tool_result_msg)
+                self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, tool_result_msg)
+
+            if stop_requested:
+                yield AgentEvent("tool_call_result", {"name": "finish", "result": finish_summary})
+                yield AgentEvent("text_delta", finish_summary)
+                yield AgentEvent("step_end", {"step": current_loop, "complete": True})
+                break
 
             # Check if user injected steering during tool execution
             while self.steer_queue:
                 st = self.steer_queue.pop(0)
                 self.session.messages.append({"role": "user", "content": f"[STEERING GUIDANCE]: {st}"})
+                self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
 
             # Save session state
             self.session_manager.save(self.session)
@@ -348,6 +413,13 @@ class HarnessAgent:
         self.is_running = False
         self.session_manager.save(self.session)
         yield AgentEvent("turn_complete", {"messages_count": len(self.session.messages)})
+
+    def _last_assistant_text(self) -> str:
+        """Return the most recent non-empty assistant text as a best-effort final message."""
+        for m in reversed(self.session.messages):
+            if m.get("role") == "assistant" and m.get("content"):
+                return str(m["content"]).strip()
+        return ""
 
     def _build_system_prompt(self, current_query: str) -> str:
         mcp_summary = self.mcp_manager.format_summary()

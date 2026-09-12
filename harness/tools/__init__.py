@@ -13,6 +13,7 @@ from harness.tools.todo_tools import TodoCreateTool, TodoUpdateTool, TodoListToo
 from harness.tools.subagent_tools import SpawnSubagentTool
 from harness.tools.git_tools import GitStatusTool, GitDiffTool
 from harness.tools.skill_tools import ListSkillsTool, ReadSkillTool
+from harness.tools.finish import FinishTool
 from harness.skills.loader import SkillsManager
 from harness.core.modes import Mode, is_tool_allowed_in_mode
 from harness.core.permissions import PermissionManager
@@ -71,6 +72,9 @@ class ToolRegistry:
         # Skills
         self.register(ListSkillsTool(self.skills_manager))
         self.register(ReadSkillTool(self.skills_manager))
+
+        # Task control
+        self.register(FinishTool())
 
     def register(self, tool: Tool) -> None:
         self.tools[tool.name] = tool

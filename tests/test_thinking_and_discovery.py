@@ -121,5 +121,34 @@ class TestThinkingAndDiscovery(unittest.TestCase):
         self.assertFalse(renderer._is_thinking_visible)
         self.assertEqual(renderer._current_thinking, '')
 
+    def test_markdown_stream_flushes_each_segment_once(self):
+        renderer = TerminalRenderer('cyberpunk')
+        chunks = [
+            'First paragraph of the response.\n',
+            '\n',
+            '## A Heading\n',
+            '\n',
+            'Second paragraph with **bold** text.\n',
+        ]
+        for c in chunks:
+            renderer.render_agent_event(AgentEvent('text_delta', c))
+        full = ''.join(chunks)
+        self.assertEqual(renderer._md_buffer, full)
+
+        renderer._finish_markdown()
+        self.assertEqual(renderer._md_buffer, '')
+        self.assertIsNone(renderer._md_live)
+
+        renderer._finish_markdown()
+        self.assertEqual(renderer._md_buffer, '')
+
+    def test_markdown_preview_is_bounded(self):
+        renderer = TerminalRenderer('cyberpunk')
+        line = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n'
+        renderer._md_buffer = line * 100
+        preview = renderer._md_preview()
+        self.assertLessEqual(len(preview), len(line) * 40)
+        self.assertTrue(preview.startswith('Lorem ipsum'))
+
 if __name__ == '__main__':
     unittest.main()

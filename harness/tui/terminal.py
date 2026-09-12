@@ -155,11 +155,29 @@ class TerminalRenderer:
         self._current_thinking = ""
 
     def _finish_markdown(self):
-        """Stop the Live markdown display and reset the buffer."""
+        """Flush the streamed markdown segment once and reset the buffer."""
         if self._md_live is not None:
             self._md_live.stop()
             self._md_live = None
-        self._md_buffer = ""
+        if self._md_buffer:
+            self.console.print(Markdown(self._md_buffer, code_theme=self.theme.code_theme))
+            self._md_buffer = ""
+
+    def _md_preview(self) -> str:
+        """Return only the tail of the buffer so the Live region stays bounded.
+
+        Re-rendering the whole (ever-growing) document in a Live region causes
+        the terminal to scroll and leak duplicate frames into scrollback.
+        """
+        try:
+            height = self.console.height or 24
+        except Exception:
+            height = 24
+        limit = max(3, min(height - 2, 40))
+        lines = self._md_buffer.splitlines(keepends=True)
+        if len(lines) <= limit:
+            return self._md_buffer
+        return "".join(lines[-limit:])
 
     def render_agent_event(self, ev):
         """Render streaming agent events with live timing."""
@@ -194,18 +212,18 @@ class TerminalRenderer:
         elif etype == "text_delta":
             self._finish_thinking()
             self._md_buffer += str(data)
+            preview = Markdown(self._md_preview(), code_theme=self.theme.code_theme)
             if self._md_live is None:
                 self._md_live = Live(
-                    Markdown(self._md_buffer, code_theme=self.theme.code_theme),
+                    preview,
                     console=self.console,
                     refresh_per_second=15,
-                    vertical_overflow="visible",
+                    vertical_overflow="ellipsis",
+                    transient=True,
                 )
                 self._md_live.start()
             else:
-                self._md_live.update(
-                    Markdown(self._md_buffer, code_theme=self.theme.code_theme)
-                )
+                self._md_live.update(preview)
 
         elif etype == "tool_call_start":
             self._finish_markdown()

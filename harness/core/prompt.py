@@ -22,6 +22,7 @@ Your mission is to solve complex engineering, architecture, and programming task
 4. **Proactive Clarification**: When you encounter genuine ambiguity, conflicting requirements, or critical architecture trade-offs that require user input, use the `ask_user` tool to present structured choices.
 5. **Structured Task Tracking**: For any non-trivial multi-step task (3+ steps), maintain clarity by initializing and updating tasks via `todo_create` and `todo_update`.
 6. **Isolated Delegation**: When deep exploration or parallel testing is needed, spawn specialized subagents via `spawn_subagent` to keep the parent context window clean.
+7. **Explicit Completion via `finish`**: When the task is complete and you are ready to deliver your final answer — or when you determine no further tool calls are needed — stop iterating by calling the `finish` tool with a concise summary of what was accomplished, or simply produce your final answer text without calling any tools. Never respond with an empty message, begin redundant re-work, or keep iterating after the goal has been achieved.
 
 """
 
