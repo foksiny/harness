@@ -109,6 +109,8 @@ class CommandRegistry:
         try:
             m = Mode.from_string(ctx.args)
             ctx.agent.set_mode(m)
+            ctx.agent.config.mode = m.value
+            save_config(ctx.agent.config)
             ctx.renderer.print_success(f"Mode switched to: {m.value.upper()}")
         except Exception:
             ctx.renderer.print_error("Invalid mode. Choose from: plan, build, super.")
@@ -120,6 +122,8 @@ class CommandRegistry:
         try:
             p = PermissionLevel.from_string(ctx.args)
             ctx.agent.set_permission(p)
+            ctx.agent.config.permission = p.value
+            save_config(ctx.agent.config)
             ctx.renderer.print_success(f"Permission profile switched to: {p.value.upper()}")
         except Exception:
             ctx.renderer.print_error("Invalid permission. Choose from: secure, default, full.")
@@ -285,6 +289,9 @@ class CommandRegistry:
         pname = ctx.args.lower().strip()
         if pname in provs:
             ctx.agent.set_provider(pname)
+            ctx.agent.config.provider = pname
+            ctx.agent.config.model = ctx.agent.session.model
+            save_config(ctx.agent.config)
             ctx.renderer.print_success(f"Switched provider to: {provs[pname]} (Model: {ctx.agent.session.model})")
         else:
             ctx.renderer.print_error(f"Unknown provider '{pname}'. Use /provider to view supported list.")
@@ -295,6 +302,8 @@ class CommandRegistry:
             return
         new_model = ctx.args.strip()
         ctx.agent.session.model = new_model
+        ctx.agent.config.model = new_model
+        save_config(ctx.agent.config)
         spec = ctx.agent.provider.get_model_spec(new_model)
         ctx.agent.compactor.context_window = spec.context_window
         ctx.renderer.print_success(
@@ -307,6 +316,7 @@ class CommandRegistry:
             ctx.renderer.print_info(f"Current thinking effort: {ctx.agent.config.thinking_effort}. Options: off, low, medium, high, or integer tokens.")
             return
         ctx.agent.config.thinking_effort = ctx.args.strip()
+        save_config(ctx.agent.config)
         ctx.renderer.print_success(f"Thinking effort set to: {ctx.args.strip()}")
 
     def _cmd_todo(self, ctx: CommandContext):
