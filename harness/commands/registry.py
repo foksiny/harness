@@ -270,8 +270,17 @@ class CommandRegistry:
     def _cmd_provider(self, ctx: CommandContext):
         provs = list_providers()
         if not ctx.args:
-            lines = [f"- **{k}**: {v}" for k, v in provs.items()]
-            ctx.renderer.print_info(f"Active Provider: {ctx.agent.provider.display_name}\nAvailable Providers:\n" + "\n".join(lines))
+            md_lines = [
+                f"### ⚡ Active Provider: **{ctx.agent.provider.display_name}** (`{ctx.agent.provider.name}`)",
+                "",
+                "#### Available LLM Providers:",
+            ]
+            for k, v in provs.items():
+                active_str = "  *(active)*" if k == ctx.agent.provider.name else ""
+                md_lines.append(f"- **{k}**: {v}{active_str}")
+            md_lines.append("")
+            md_lines.append("*Switch provider:* `/provider <provider_id>`")
+            ctx.renderer.print_markdown("\n".join(md_lines))
             return
         pname = ctx.args.lower().strip()
         if pname in provs:

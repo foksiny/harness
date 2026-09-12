@@ -60,20 +60,31 @@ KNOWN_MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "gemini-1.5-flash": {"context": 1048576, "output": 8192, "thinking": False, "thinking_type": None},
 
     # ─── DeepSeek (direct + NIM-hosted + OpenRouter) ─────────────────────────
-    "deepseek-chat": {"context": 64000, "output": 8192, "thinking": False, "thinking_type": None},
+    "deepseek-chat": {"context": 163840, "output": 8192, "thinking": False, "thinking_type": None},
     "deepseek-reasoner": {"context": 64000, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
-    # DeepSeek V4 family — NOT reasoning models, they use standard chat
-    "deepseek-ai/deepseek-v4-0324": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
-    "deepseek-ai/deepseek-v4-pro-0813": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
-    "deepseek-ai/deepseek-v4-0813": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
+    # DeepSeek V4 family — 1M to 1.3M context window
+    "deepseek-ai/deepseek-v4-flash-0731": {"context": 1310720, "output": 32768, "thinking": False, "thinking_type": None},
+    "deepseek-ai/deepseek-v4-flash": {"context": 1048576, "output": 32768, "thinking": False, "thinking_type": None},
+    "deepseek/deepseek-v4-flash-0731": {"context": 1310720, "output": 32768, "thinking": False, "thinking_type": None},
+    "deepseek/deepseek-v4-flash": {"context": 1048576, "output": 32768, "thinking": False, "thinking_type": None},
+    "deepseek-ai/deepseek-v4-pro-0813": {"context": 1048576, "output": 32768, "thinking": False, "thinking_type": None},
+    "deepseek-ai/deepseek-v4-pro": {"context": 1048576, "output": 32768, "thinking": False, "thinking_type": None},
+    "deepseek/deepseek-v4-pro-0813": {"context": 1048576, "output": 32768, "thinking": False, "thinking_type": None},
+    "deepseek/deepseek-v4-pro": {"context": 1048576, "output": 32768, "thinking": False, "thinking_type": None},
+    "deepseek-ai/deepseek-v4-0324": {"context": 1048576, "output": 32768, "thinking": False, "thinking_type": None},
+    "deepseek-ai/deepseek-v4-0813": {"context": 1048576, "output": 32768, "thinking": False, "thinking_type": None},
+    "deepseek-ai/deepseek-v4": {"context": 1048576, "output": 32768, "thinking": False, "thinking_type": None},
     # DeepSeek V3 family
+    "deepseek-ai/deepseek-v3.2": {"context": 163840, "output": 16384, "thinking": False, "thinking_type": None},
+    "deepseek-ai/deepseek-v3.1": {"context": 163840, "output": 16384, "thinking": False, "thinking_type": None},
+    "deepseek-ai/deepseek-chat-v3.1": {"context": 163840, "output": 16384, "thinking": False, "thinking_type": None},
     "deepseek-ai/deepseek-v3": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
     "deepseek-ai/deepseek-v3-0324": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
     "deepseek-ai/deepseek-v3-0823": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
     # DeepSeek R1 reasoning family
     "deepseek-ai/deepseek-r1": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
     "deepseek-ai/DeepSeek-R1": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek-ai/deepseek-r1-0528": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
+    "deepseek-ai/deepseek-r1-0528": {"context": 163840, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
     # DeepSeek V2.5
     "deepseek-ai/deepseek-v2.5": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
 
@@ -190,7 +201,25 @@ def detect_context_window(model_name: str, provider: str = "") -> int:
     if any(p in name for p in ("o1", "o3", "o4", "gpt-5")):
         return 200_000
 
-    if any(p in name for p in ("gpt-4", "llama-3", "llama-4", "qwen-2", "qwen-3", "mistral", "deepseek", "grok")):
+    if "v4-flash-0731" in name:
+        return 1_310_720
+
+    if "v4" in name and any(x in name for x in ("deepseek", "flash", "pro")):
+        return 1_048_576
+
+    if "llama-4-maverick" in name:
+        return 1_048_576
+
+    if "llama-4-scout" in name or "llama-4" in name:
+        return 512_000
+
+    if "qwen-3" in name or "qwen3" in name:
+        return 1_000_000
+
+    if "v3.2" in name or "v3.1" in name:
+        return 163_840
+
+    if any(p in name for p in ("gpt-4", "llama-3", "qwen-2", "mistral", "deepseek", "grok")):
         return 128_000
 
     # 4. Provider-specific heuristics

@@ -17,15 +17,9 @@ class MockProvider(BaseProvider):
         self.call_history: List[Dict[str, Any]] = []
 
     def get_model_spec(self, model_name: Optional[str] = None) -> ModelSpec:
-        return ModelSpec(
-            name="mock-harness-model",
-            provider="mock",
-            context_window=128000,
-            max_output_tokens=4096,
-            supports_thinking=True,
-            thinking_type="reasoning_effort",
-            supports_tools=True,
-        )
+        m = model_name or self.default_model
+        from harness.providers.detector import inspect_model
+        return inspect_model(m, self.name)
 
     def stream_chat(
         self,

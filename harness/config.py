@@ -21,21 +21,21 @@ WORKSPACE_SKILLS_DIR = WORKSPACE_CONFIG_DIR / "skills"
 WORKSPACE_MCP_FILE = WORKSPACE_CONFIG_DIR / "mcp.json"
 WORKSPACE_THEMES_FILE = WORKSPACE_CONFIG_DIR / "themes.json"
 
-ENV_KEY_MAPPINGS = {
-    "openai": "OPENAI_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "gemini": "GEMINI_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
-    "nvidia": "NVIDIA_API_KEY",
-    "opencode": "OPENCODE_API_KEY",
-    "groq": "GROQ_API_KEY",
-    "deepseek": "DEEPSEEK_API_KEY",
-    "mistral": "MISTRAL_API_KEY",
-    "xai": "XAI_API_KEY",
-    "together": "TOGETHER_API_KEY",
-    "fireworks": "FIREWORKS_API_KEY",
-    "cohere": "CO_API_KEY",
-    "perplexity": "PERPLEXITY_API_KEY",
+ENV_KEY_MAPPINGS: Dict[str, List[str]] = {
+    "openai": ["OPENAI_API_KEY"],
+    "anthropic": ["ANTHROPIC_API_KEY"],
+    "gemini": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    "openrouter": ["OPENROUTER_API_KEY", "OPENROUTER_KEY"],
+    "nvidia": ["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY", "NV_API_KEY", "NIM_API_KEY"],
+    "opencode": ["OPENCODE_API_KEY", "OPENCODE_ZEN_API_KEY"],
+    "groq": ["GROQ_API_KEY"],
+    "deepseek": ["DEEPSEEK_API_KEY"],
+    "mistral": ["MISTRAL_API_KEY"],
+    "xai": ["XAI_API_KEY", "GROK_API_KEY"],
+    "together": ["TOGETHER_API_KEY", "TOGETHERAI_API_KEY"],
+    "fireworks": ["FIREWORKS_API_KEY"],
+    "cohere": ["CO_API_KEY", "COHERE_API_KEY"],
+    "perplexity": ["PERPLEXITY_API_KEY", "PPLX_API_KEY"],
 }
 
 def mask_key(key: Optional[str]) -> str:
@@ -77,10 +77,12 @@ class HarnessConfig:
         # 1. Config explicit override
         if prov in self.api_keys and self.api_keys[prov]:
             return self.api_keys[prov]
-        # 2. Standard mapped environment variable
-        env_var = ENV_KEY_MAPPINGS.get(prov)
-        if env_var and os.environ.get(env_var):
-            return os.environ.get(env_var)
+        # 2. Standard mapped environment variables with aliases
+        env_vars = ENV_KEY_MAPPINGS.get(prov, [])
+        for ev in env_vars:
+            val = os.environ.get(ev)
+            if val:
+                return val
         # 3. Fallback generic ENV format
         generic_env = f"{prov.upper()}_API_KEY"
         return os.environ.get(generic_env)
@@ -105,8 +107,14 @@ class HarnessConfig:
             if prov_id == "mock":
                 continue
             cfg_key = self.api_keys.get(prov_id)
-            env_var = ENV_KEY_MAPPINGS.get(prov_id, f"{prov_id.upper()}_API_KEY")
-            env_val = os.environ.get(env_var)
+            env_vars = ENV_KEY_MAPPINGS.get(prov_id, [f"{prov_id.upper()}_API_KEY"])
+            env_val = None
+            active_env_var = env_vars[0] if env_vars else f"{prov_id.upper()}_API_KEY"
+            for ev in env_vars:
+                if os.environ.get(ev):
+                    env_val = os.environ.get(ev)
+                    active_env_var = ev
+                    break
 
             effective_key = cfg_key or env_val
             source = "config" if cfg_key else ("env" if env_val else "none")
@@ -117,7 +125,7 @@ class HarnessConfig:
                 "status": "configured" if effective_key else "missing",
                 "masked": mask_key(effective_key),
                 "source": source,
-                "env_var": env_var,
+                "env_var": active_env_var,
             })
         return res
 
@@ -185,8 +193,19 @@ def load_config() -> HarnessConfig:
     return config
 
 def save_config(config: HarnessConfig, global_only: bool = True) -> None:
-    """Save configuration to disk."""
+    """Save configuration to disk while safely preserving all configured API keys."""
     target_path = USER_CONFIG_PATH if global_only else WORKSPACE_CONFIG_PATH
     target_path.parent.mkdir(parents=True, exist_ok=True)
+    data = config.to_dict()
+    if target_path.exists():
+        try:
+            with open(target_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            disk_keys = existing.get("api_keys", {})
+            for k, v in disk_keys.items():
+                if k not in data["api_keys"] or not data["api_keys"][k]:
+                    data["api_keys"][k] = v
+        except Exception:
+            pass
     with open(target_path, "w", encoding="utf-8") as f:
-        json.dump(config.to_dict(), f, indent=2)
+        json.dump(data, f, indent=2)

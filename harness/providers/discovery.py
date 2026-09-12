@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Optional
 from harness.providers.detector import inspect_model, ModelSpec
 
 CACHE_FILE = Path.home() / ".harness" / "models_cache.json"
+UNIVERSAL_CACHE_FILE = Path.home() / ".harness" / "universal_models.json"
 CACHE_TTL = 86400  # 24 hours
 
 def load_cached_models() -> Dict[str, Any]:
@@ -32,6 +33,34 @@ def save_cached_models(cache_data: Dict[str, Any]) -> None:
             json.dump(cache_data, f, indent=2)
     except Exception:
         pass
+
+def load_universal_models() -> Dict[str, int]:
+    """Load universal catalog of model basenames -> context window length."""
+    if UNIVERSAL_CACHE_FILE.exists():
+        try:
+            with open(UNIVERSAL_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    # Try fetching once if cache is missing
+    try:
+        req = urllib.request.Request("https://openrouter.ai/api/v1/models", headers={"User-Agent": "Harness/1.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            catalog = {}
+            for m in data.get("data", []):
+                mid = m.get("id", "")
+                base = mid.split("/")[-1].split(":")[0].lower()
+                clen = m.get("context_length") or (m.get("top_provider") or {}).get("context_length")
+                if clen and base not in catalog:
+                    catalog[base] = int(clen)
+            UNIVERSAL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(UNIVERSAL_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(catalog, f)
+            return catalog
+    except Exception:
+        return {}
 
 def fetch_remote_models(
     provider_name: str,
@@ -147,7 +176,20 @@ def resolve_model_spec_dynamic(
 
     clean_lower = clean_name.lower()
     clean_base = clean_lower.split(":")[0]
+    base_name = clean_base.split("/")[-1]
 
+    # 1. Check universal dynamic catalog
+    univ_cache = load_universal_models()
+    if base_name in univ_cache:
+        c_len = univ_cache[base_name]
+        if isinstance(c_len, int) and c_len > 0:
+            spec.context_window = c_len
+    elif clean_base in univ_cache:
+        c_len = univ_cache[clean_base]
+        if isinstance(c_len, int) and c_len > 0:
+            spec.context_window = c_len
+
+    # 2. Check provider-specific /models list
     for m in models_list:
         m_id = str(m.get("id", "")).strip()
         m_lower = m_id.lower()

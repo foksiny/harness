@@ -179,7 +179,7 @@ class TerminalRenderer:
 
         elif etype == "text_delta":
             self._finish_thinking()
-            self.console.print(data, end="", highlight=False)
+            self.console.print(data, end="", highlight=True)
 
         elif etype == "tool_call_start":
             self._finish_thinking()
@@ -255,7 +255,7 @@ class TerminalRenderer:
         self.console.print(f"[dim]Switch model: `/model <name>`[/dim]\n")
 
     def print_markdown(self, md_text: str):
-        self.console.print(Markdown(md_text))
+        self.console.print(Markdown(md_text, code_theme=self.theme.code_theme))
 
     def print_diff(self, diff_text: str):
         if not diff_text.strip():
@@ -284,4 +284,8 @@ class TerminalRenderer:
         self.console.print(f"[{self.theme.error}]❌ {msg}[/{self.theme.error}]")
 
     def print_info(self, msg: str):
-        self.console.print(f"[{self.theme.text}]ℹ️  {msg}[/{self.theme.text}]")
+        if any(tok in msg for tok in ("**", "```", "###", "- **", " *", "|")):
+            self.console.print(f"[{self.theme.text}]ℹ️ [/{self.theme.text}]", end=" ")
+            self.console.print(Markdown(msg, code_theme=self.theme.code_theme))
+        else:
+            self.console.print(f"[{self.theme.text}]ℹ️  {msg}[/{self.theme.text}]")

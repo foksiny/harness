@@ -16,8 +16,19 @@ class TestThinkingAndDiscovery(unittest.TestCase):
 
     def test_deepseek_v4_and_nim_models_detection(self):
         spec_v4 = inspect_model('deepseek-ai/deepseek-v4-pro-0813', 'nvidia')
-        self.assertEqual(spec_v4.context_window, 128000)
+        self.assertEqual(spec_v4.context_window, 1048576)
         self.assertFalse(spec_v4.supports_thinking)
+
+        spec_v4_flash = inspect_model('deepseek-ai/deepseek-v4-flash-0731', 'nvidia')
+        self.assertEqual(spec_v4_flash.context_window, 1310720)
+        self.assertFalse(spec_v4_flash.supports_thinking)
+
+        # MockProvider dynamic detection test
+        from harness.providers.mock_provider import MockProvider
+        mock_prov = MockProvider()
+        spec_mock_claude = mock_prov.get_model_spec('claude-3-7-sonnet')
+        self.assertEqual(spec_mock_claude.context_window, 200000)
+        self.assertTrue(spec_mock_claude.supports_thinking)
 
         spec_r1 = inspect_model('deepseek-ai/deepseek-r1', 'nvidia')
         self.assertEqual(spec_r1.context_window, 128000)
