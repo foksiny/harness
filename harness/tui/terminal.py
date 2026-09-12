@@ -13,6 +13,7 @@ from rich.text import Text
 from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.table import Table
+from rich.live import Live
 from harness.themes import Theme, get_theme, THEMES, render_theme_preview
 
 class TerminalRenderer:
@@ -25,6 +26,8 @@ class TerminalRenderer:
         self._is_thinking_visible = False
         self._thinking_start_time: float = 0.0
         self._thinking_line_chars: int = 0
+        self._md_buffer: str = ""
+        self._md_live: Optional[Live] = None
 
     def set_theme(self, theme_name: str):
         self.theme = get_theme(theme_name)
@@ -132,6 +135,10 @@ class TerminalRenderer:
         """Public method to close thinking panel on turn complete or interrupt."""
         self._finish_thinking()
 
+    def finish_markdown(self):
+        """Public method to close Live markdown display on turn complete or interrupt."""
+        self._finish_markdown()
+
     def _finish_thinking(self):
         """Close out the thinking display panel and show timing stats."""
         if not self._is_thinking_visible:
@@ -146,6 +153,13 @@ class TerminalRenderer:
         self.console.print()
         self._is_thinking_visible = False
         self._current_thinking = ""
+
+    def _finish_markdown(self):
+        """Stop the Live markdown display and reset the buffer."""
+        if self._md_live is not None:
+            self._md_live.stop()
+            self._md_live = None
+        self._md_buffer = ""
 
     def render_agent_event(self, ev):
         """Render streaming agent events with live timing."""
@@ -179,9 +193,22 @@ class TerminalRenderer:
 
         elif etype == "text_delta":
             self._finish_thinking()
-            self.console.print(data, end="", highlight=True)
+            self._md_buffer += str(data)
+            if self._md_live is None:
+                self._md_live = Live(
+                    Markdown(self._md_buffer, code_theme=self.theme.code_theme),
+                    console=self.console,
+                    refresh_per_second=15,
+                    vertical_overflow="visible",
+                )
+                self._md_live.start()
+            else:
+                self._md_live.update(
+                    Markdown(self._md_buffer, code_theme=self.theme.code_theme)
+                )
 
         elif etype == "tool_call_start":
+            self._finish_markdown()
             self._finish_thinking()
             tname = data.get("name", "tool")
             args = data.get("arguments", {})
@@ -193,6 +220,7 @@ class TerminalRenderer:
                 self.console.print(f"   [dim]args: {preview}[/dim]")
 
         elif etype == "tool_call_result":
+            self._finish_markdown()
             res = str(data.get("result", ""))
             first_line = res.strip().split("\n")[0] if res.strip() else "(empty)"
             if len(first_line) > 140:
@@ -200,6 +228,7 @@ class TerminalRenderer:
             self.console.print(f"   [{self.theme.success}]✔ Result:[/{self.theme.success}] [dim]{first_line}[/dim]\n")
 
         elif etype == "compaction":
+            self._finish_markdown()
             before = data.get("before_tokens", 0)
             after = data.get("after_tokens", 0)
             saved = data.get("saved_tokens", 0)
@@ -210,6 +239,7 @@ class TerminalRenderer:
             )
 
         elif etype == "step_end" and data.get("complete"):
+            self._finish_markdown()
             self._finish_thinking()
             self.console.print()
 
