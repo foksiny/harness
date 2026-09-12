@@ -276,18 +276,21 @@ class CommandRegistry:
         if pname in provs:
             ctx.agent.set_provider(pname)
             ctx.agent.config.provider = pname
-            ctx.agent.config.model = ctx.agent.session.model
+            current_model = ctx.agent.session.model if ctx.agent.session is not None else ctx.agent.provider.default_model
+            ctx.agent.config.model = current_model
             save_config(ctx.agent.config)
-            ctx.renderer.print_success(f"Switched provider to: {provs[pname]} (Model: {ctx.agent.session.model})")
+            ctx.renderer.print_success(f"Switched provider to: {provs[pname]} (Model: {current_model})")
         else:
             ctx.renderer.print_error(f"Unknown provider '{pname}'. Use /provider to view supported list.")
 
     def _cmd_model(self, ctx: CommandContext):
         if not ctx.args:
-            ctx.renderer.print_info(f"Current model: {ctx.agent.session.model}\nUsage: /model <model_name>")
+            current = ctx.agent.session.model if ctx.agent.session is not None else ctx.agent.config.model
+            ctx.renderer.print_info(f"Current model: {current}\nUsage: /model <model_name>")
             return
         new_model = ctx.args.strip()
-        ctx.agent.session.model = new_model
+        if ctx.agent.session is not None:
+            ctx.agent.session.model = new_model
         ctx.agent.config.model = new_model
         save_config(ctx.agent.config)
         spec = ctx.agent.provider.get_model_spec(new_model)
@@ -352,6 +355,9 @@ class CommandRegistry:
         ctx.renderer.print_markdown(f"**Subagent ({res.agent_type}) Output ({res.execution_time}s):**\n\n{res.output}")
 
     def _cmd_compact(self, ctx: CommandContext):
+        if ctx.agent.session is None:
+            ctx.renderer.print_warning("No active session to compact. Send a message first.")
+            return
         compacted, stats = ctx.agent.compactor.compact(ctx.agent.session.messages)
         ctx.agent.session.messages = compacted
         ctx.renderer.print_success(
@@ -371,11 +377,11 @@ class CommandRegistry:
                 lines.append(f"- `{s['id']}`: {s['title']} ({s['model']}, {s['turns']} turns)")
             ctx.renderer.print_markdown("\n".join(lines))
         elif action == "create":
-            # Create a new empty session
+            # Explicit session creation — allowed even before a first message.
             title = arg.strip() if arg else "New Session"
             new_session = ctx.agent.session_manager.create(
                 provider=ctx.agent.provider.name,
-                model=ctx.agent.session.model,
+                model=ctx.agent.session.model if ctx.agent.session is not None else ctx.agent.config.model,
                 mode=ctx.agent.mode.value,
                 permission=ctx.agent.permission_manager.level.value,
                 thinking_effort=ctx.agent.config.thinking_effort,
@@ -388,7 +394,7 @@ class CommandRegistry:
                 ctx.renderer.print_warning("Usage: /session delete <session_id>")
                 return
             # Don't allow deleting the current session
-            if arg == ctx.agent.session.id:
+            if ctx.agent.session is not None and arg == ctx.agent.session.id:
                 ctx.renderer.print_error("Cannot delete the currently active session. Switch to another session first.")
                 return
             success = ctx.agent.session_manager.delete(arg)
@@ -412,10 +418,13 @@ class CommandRegistry:
                 return
             session.title = new_title
             ctx.agent.session_manager.save(session)
-            if session_id == ctx.agent.session.id:
+            if ctx.agent.session is not None and session_id == ctx.agent.session.id:
                 ctx.agent.session = session
             ctx.renderer.print_success(f"Renamed session `{session_id}` to: `{new_title}`")
         elif action == "fork":
+            if ctx.agent.session is None:
+                ctx.renderer.print_warning("No active session to fork. Send a message first.")
+                return
             forked = ctx.agent.session_manager.fork(ctx.agent.session.id, arg or None)
             if forked:
                 ctx.agent.session = forked
@@ -441,12 +450,12 @@ class CommandRegistry:
             import resource
             ram_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
 
-        tokens = calculate_history_tokens(ctx.agent.session.messages)
+        tokens = calculate_history_tokens(ctx.agent.session.messages) if ctx.agent.session is not None else 0
         c_win = ctx.agent.compactor.context_window
         pct = round((tokens / max(1, c_win)) * 100, 2)
         ctx.renderer.print_info(
             f"Tokens: {tokens:,} / {c_win:,} ({pct}%) | "
-            f"Turns: {len(ctx.agent.session.messages)} | "
+            f"Turns: {len(ctx.agent.session.messages) if ctx.agent.session is not None else 0} | "
             f"RAM Usage: {ram_mb} MB"
         )
 

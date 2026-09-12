@@ -58,15 +58,10 @@ class HarnessAgent:
 
         self.provider: BaseProvider = get_provider(config.provider, config)
         self.session_manager = SessionManager()
-        self.session: Session = session or self.session_manager.create(
-            provider=config.provider,
-            model=config.model,
-            mode=self.mode.value,
-            permission=self.permission_manager.level.value,
-            thinking_effort=config.thinking_effort,
-        )
+        self.session: Optional[Session] = session
 
-        model_spec = self.provider.get_model_spec(self.session.model)
+        initial_model = self.session.model if self.session is not None else config.model
+        model_spec = self.provider.get_model_spec(initial_model)
         self.compactor = Compactor(model_spec.context_window, config.compact_threshold)
         self.event_callback = event_callback
         self.prompt_builder = SystemPromptBuilder(self.mode, self.permission_manager.level)
@@ -76,28 +71,41 @@ class HarnessAgent:
         if self.event_callback:
             self.event_callback(AgentEvent(event_type, data))
 
+    def ensure_session(self) -> Session:
+        """Create the active session on the user's first message."""
+        if self.session is None:
+            self.session = self.session_manager.create(
+                provider=self.config.provider,
+                model=self.config.model,
+                mode=self.mode.value,
+                permission=self.permission_manager.level.value,
+                thinking_effort=self.config.thinking_effort,
+            )
+        return self.session
+
     def set_mode(self, mode: Mode):
         self.mode = mode
         self.prompt_builder.mode = mode
-        self.session.mode = mode.value
+        if self.session is not None:
+            self.session.mode = mode.value
         self.emit("mode_change", mode.value)
 
     def set_permission(self, perm: PermissionLevel):
         self.permission_manager.set_level(perm)
         self.prompt_builder.permission = perm
-        self.session.permission = perm.value
+        if self.session is not None:
+            self.session.permission = perm.value
         self.emit("permission_change", perm.value)
 
     def set_provider(self, provider_name: str, model_name: Optional[str] = None):
         self.provider = get_provider(provider_name, self.config)
-        self.session.provider = provider_name
-        if model_name:
-            self.session.model = model_name
-        else:
-            self.session.model = self.provider.default_model
-        model_spec = self.provider.get_model_spec(self.session.model)
+        new_model = model_name or self.provider.default_model
+        if self.session is not None:
+            self.session.provider = provider_name
+            self.session.model = new_model
+        model_spec = self.provider.get_model_spec(new_model)
         self.compactor.context_window = model_spec.context_window
-        self.emit("provider_change", {"provider": provider_name, "model": self.session.model})
+        self.emit("provider_change", {"provider": provider_name, "model": new_model})
 
     def _run_subagent_task(self, system_prompt: str, prompt: str, allowed_tools: List[str], max_turns: int) -> tuple[str, int]:
         """Subagent runner executing with isolated conversation context."""
@@ -171,6 +179,7 @@ class HarnessAgent:
         self.is_running = True
 
         if user_prompt:
+            self.ensure_session()
             self.session.messages.append({"role": "user", "content": user_prompt})
             self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
 

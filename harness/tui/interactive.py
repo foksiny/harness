@@ -20,7 +20,7 @@ def run_interactive(agent: HarnessAgent):
 
     while True:
         # Render live status HUD
-        tokens = calculate_history_tokens(agent.session.messages)
+        tokens = calculate_history_tokens(agent.session.messages) if agent.session is not None else 0
         c_win = agent.compactor.context_window
         todos_summary = agent.todo_manager.summary()
 
@@ -28,7 +28,7 @@ def run_interactive(agent: HarnessAgent):
             mode=agent.mode.value,
             perm=agent.permission_manager.level.value,
             provider=agent.provider.display_name,
-            model=agent.session.model,
+            model=agent.session.model if agent.session is not None else agent.config.model,
             tokens=tokens,
             context_win=c_win,
             todos_summary=todos_summary,
@@ -45,7 +45,8 @@ def run_interactive(agent: HarnessAgent):
 
         if user_input.lower() in ("/exit", "/quit", "exit", "quit"):
             renderer.print_info("Saving session and shutting down Harness. Goodbye!")
-            agent.session_manager.save(agent.session)
+            if agent.session is not None:
+                agent.session_manager.save(agent.session)
             break
 
         # Check slash command

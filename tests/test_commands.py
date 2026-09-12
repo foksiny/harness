@@ -92,13 +92,13 @@ class TestCommands(unittest.TestCase):
         self.assertEqual(self.agent.provider.name, "openrouter")
         saved = self._saved_config_json()
         self.assertEqual(saved["provider"], "openrouter")
-        self.assertEqual(saved["model"], self.agent.session.model)
+        self.assertEqual(saved["model"], self.agent.config.model)
 
     def test_model_command_persists_to_config(self):
         self.cfg.provider = "mock"
         self.agent.set_provider("mock")
         self.registry.handle("/model custom-test-model", self.agent, self.renderer)
-        self.assertEqual(self.agent.session.model, "custom-test-model")
+        self.assertEqual(self.agent.config.model, "custom-test-model")
         saved = self._saved_config_json()
         self.assertEqual(saved["model"], "custom-test-model")
 
