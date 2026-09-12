@@ -7,6 +7,9 @@ from harness.tools.skill_tools import ListSkillsTool, ReadSkillTool
 from harness.tools import ToolRegistry
 from harness.core.prompt import SystemPromptBuilder
 from harness.core.modes import Mode
+from harness.config import HarnessConfig
+from harness.core.agent import HarnessAgent
+from harness.providers.base import LLMChunk
 
 class TestSkills(unittest.TestCase):
 
@@ -90,6 +93,56 @@ class TestSkills(unittest.TestCase):
         prompt = SystemPromptBuilder().build()
         self.assertNotIn("LOADED SKILLS", prompt)
         self.assertNotIn("skill_creator", prompt)
+
+    def test_step_seeds_list_skills_before_any_work(self):
+        cfg = HarnessConfig()
+        cfg.provider = "mock"
+        agent = HarnessAgent(cfg)
+        events = list(agent.step("what is this project about?"))
+        # Eager list_skills tool + result must be injected into the conversation.
+        seeded = [m for m in agent.session.messages if m.get("role") == "tool" and m.get("name") == "list_skills"]
+        self.assertEqual(len(seeded), 1)
+        self.assertIn("skill_creator", seeded[0]["content"])
+        self.assertTrue(any(ev.type == "tool_call_start" and ev.data.get("name") == "list_skills" for ev in events))
+        # The very first provider request must already include the catalog.
+        first_call = agent.provider.call_history[0]
+        self.assertEqual(first_call["messages"][-1]["role"], "tool")
+        self.assertEqual(first_call["messages"][-1]["name"], "list_skills")
+
+    def test_step_does_not_re_seed_list_skills(self):
+        cfg = HarnessConfig()
+        cfg.provider = "mock"
+        agent = HarnessAgent(cfg)
+        list(agent.step("static analysis task"))
+        list(agent.step("second task"))
+        seeded = [m for m in agent.session.messages if m.get("role") == "tool" and m.get("name") == "list_skills"]
+        self.assertEqual(len(seeded), 1)
+
+    def test_empty_response_retries_then_gives_up(self):
+        cfg = HarnessConfig()
+        cfg.provider = "mock"
+        cfg.thinking_effort = "off"
+        from harness.providers.mock_provider import MockProvider
+        mock = MockProvider(responses=[LLMChunk()])
+        agent = HarnessAgent(cfg)
+        agent.provider = mock
+        events = list(agent.step("respond to me"))
+        nudges = [m for m in agent.session.messages if str(m.get("content", "")).startswith("[SYSTEM]: Your previous response was empty")]
+        self.assertEqual(len(nudges), 2)
+        self.assertTrue(any(ev.type == "text_delta" and "empty response" in str(ev.data) for ev in events))
+
+    def test_provider_receives_list_skills_result(self):
+        from harness.providers.mock_provider import MockProvider
+        mock = MockProvider(responses=[
+            LLMChunk(delta_text="The project is an AI agent harness.", finish_reason="stop"),
+        ])
+        cfg = HarnessConfig()
+        cfg.provider = "mock"
+        agent = HarnessAgent(cfg)
+        agent.provider = mock
+        list(agent.step("task"))
+        seen = [m for m in mock.call_history[0]["messages"] if m.get("name") == "list_skills"]
+        self.assertEqual(len(seen), 1)
 
 if __name__ == "__main__":
     unittest.main()

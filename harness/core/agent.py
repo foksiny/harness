@@ -195,6 +195,34 @@ class HarnessAgent:
             st = self.steer_queue.pop(0)
             self.session.messages.append({"role": "user", "content": f"[STEERING GUIDANCE]: {st}"})
 
+        # Skills-first: eagerly consult the skill catalog via the list_skills tool at the
+        # start of every task so the model always sees available skills before working,
+        # then it can read_skill any skill that matches the user's use case.
+        already_seeded = any(
+            m.get("role") == "tool" and m.get("name") == "list_skills"
+            for m in self.session.messages
+        )
+        if not already_seeded and self.skills_manager.list_skills():
+            skill_result = self.tool_registry.execute("list_skills", {}, self.mode)
+            skill_call_id = f"list_skills_{int(time.time() * 1000)}"
+            self.session.messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": skill_call_id,
+                    "type": "function",
+                    "function": {"name": "list_skills", "arguments": "{}"},
+                }],
+            })
+            self.session.messages.append({
+                "role": "tool",
+                "tool_call_id": skill_call_id,
+                "name": "list_skills",
+                "content": skill_result,
+            })
+            yield AgentEvent("tool_call_start", {"name": "list_skills", "arguments": {}})
+            yield AgentEvent("tool_call_result", {"name": "list_skills", "result": skill_result})
+
         # Auto-compaction check
         sys_prompt = self._build_system_prompt(user_prompt or "")
         if self.config.auto_compact and self.compactor.should_compact(self.session.messages, sys_prompt):
@@ -205,6 +233,8 @@ class HarnessAgent:
         # Loop for tool executions (Super mode allows up to 25 steps, Build up to 10)
         max_loop = 25 if self.mode == Mode.SUPER else 10
         current_loop = 0
+        empty_streak = 0
+        MAX_EMPTY_RETRIES = 2
 
         while current_loop < max_loop and self.is_running:
             current_loop += 1
@@ -243,6 +273,21 @@ class HarnessAgent:
                         tool_calls_accumulator[idx]["name"] = tc.name
                     if tc.arguments_delta:
                         tool_calls_accumulator[idx]["arguments"] += tc.arguments_delta
+
+            # Guard against a model/provider returning a dead-end response (no text, no tool
+            # calls) — common with local reasoning endpoints. Nudge before giving up.
+            if not text_accumulator and not tool_calls_accumulator:
+                empty_streak += 1
+                if empty_streak <= MAX_EMPTY_RETRIES:
+                    self.session.messages.append({
+                        "role": "user",
+                        "content": "[SYSTEM]: Your previous response was empty. Continue and produce a complete answer to the current task now.",
+                    })
+                    yield AgentEvent("step_end", {"step": current_loop, "complete": False})
+                    continue
+                yield AgentEvent("text_delta", "[Harness] The model returned an empty response after retries. Please rephrase your request or try again.")
+                yield AgentEvent("step_end", {"step": current_loop, "complete": True})
+                break
 
             # Append assistant turn to history
             assistant_msg: Dict[str, Any] = {

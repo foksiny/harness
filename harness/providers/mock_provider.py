@@ -31,7 +31,7 @@ class MockProvider(BaseProvider):
         **kwargs,
     ) -> Iterator[LLMChunk]:
         self.call_history.append({
-            "messages": messages,
+            "messages": list(messages),
             "model": model,
             "tools": tools,
             "system_prompt": system_prompt,
