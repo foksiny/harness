@@ -49,9 +49,6 @@
   - `cyberpunk` (default neon), `dracula`, `nord`, `monokai`, `catppuccin`, `matrix`, `minimal`.
 - 📦 **Smart Auto-Compaction**:
   - Automatically summarizes history into structured memory checkpoints at 75% context threshold.
-- 💬 **Out-of-Band `/btw` & Steering `/steer`**:
-  - `/btw`: Ask side-questions to the agent while it works without interrupting the active task.
-  - `/steer`: Inject directional guidance or constraints into the ongoing loop.
 
 ---
 
@@ -95,21 +92,24 @@ cat logs/error.log | harness "Diagnose this stack trace"
 | Command | Description |
 |---|---|
 | `/help` | Display command reference and guide |
-| `/btw <question>` | Ask an out-of-band side question while the agent is working |
-| `/steer <instruction>` | Inject immediate guidance or constraints into active task |
 | `/goal <objective>` | Launch Super Mode autonomous loop toward an explicit goal |
 | `/mode [plan\|build\|super]` | Switch operational mode |
 | `/perm [secure\|default\|full]` | Switch permission security profile |
 | `/provider <name>` | Switch active LLM provider (16+ supported) |
 | `/model <name>` | Change model name for active provider |
+| `/models [provider]` | Browse model catalog for current or specific provider |
+| `/config [list\|get\|set]` | View, get, or set configuration settings |
+| `/keys [list\|set\|remove]` | Manage, mask, and test provider API keys |
+| `/setup` | Launch interactive onboarding setup wizard |
 | `/effort <level>` | Set thinking effort (`off`, `low`, `medium`, `high`, or tokens) |
 | `/theme <name>` | Change visual theme (`cyberpunk`, `dracula`, `nord`, etc.) |
 | `/todo [list\|add\|clear]` | Manage active task items |
-| `/skills` | List or reload registered skills |
+| `/skills [reload]` | List or reload registered skills |
 | `/mcp [list\|add]` | Manage Model Context Protocol (MCP) servers |
 | `/subagent <type> <prompt>` | Dispatch an isolated subagent worker |
 | `/compact` | Trigger manual context compaction |
-| `/session [list\|resume\|fork]` | Full session lifecycle management |
+| `/session [list\|create\|delete\|rename\|fork\|resume]` | Full session lifecycle management |
+| `/checkpoint [list\|create\|undo\|redo]` | Manage checkpoints for undo/redo of file changes, messages, and state |
 | `/tokens` | Display token counts, context percentage, and RAM usage |
 | `/diff` | View uncommitted git diffs |
 | `/clear` | Clear terminal screen |

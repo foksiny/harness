@@ -5,9 +5,10 @@ Supports autocompletion, command history, and graceful prompt_toolkit / readline
 from typing import List, Optional
 
 SLASH_COMMANDS = [
-    "/help", "/btw", "/steer", "/goal", "/mode", "/perm", "/theme",
-    "/provider", "/model", "/effort", "/todo", "/skills", "/mcp",
-    "/subagent", "/compact", "/session", "/tokens", "/diff", "/clear",
+    "/help", "/goal", "/mode", "/perm", "/theme",
+    "/provider", "/model", "/models", "/config", "/keys", "/setup",
+    "/effort", "/todo", "/skills", "/mcp",
+    "/subagent", "/compact", "/session", "/checkpoint", "/tokens", "/diff", "/clear",
     "/exit", "/quit"
 ]
 

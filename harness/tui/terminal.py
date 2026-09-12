@@ -105,7 +105,6 @@ class TerminalRenderer:
             "[bold]/perm[/bold]: Permissions  |  "
             "[bold]/theme[/bold]: Themes  |  "
             "[bold]/models[/bold]: Model Picker  |  "
-            "[bold]/btw[/bold]: Side Note  |  "
             "[bold]/exit[/bold]: Quit[/dim]"
         )
         self.console.print(f" {footer_text}")
@@ -118,16 +117,6 @@ class TerminalRenderer:
             f"[dim]Decomposing tasks, dispatching subagents, and self-verifying until verified...[/dim]",
             border_style="magenta",
             title="⚡ SUPER AGENT LOOP",
-        )
-        self.console.print(p)
-
-    def print_btw_response(self, text: str):
-        """Banner for out-of-band /btw answer."""
-        p = Panel(
-            Markdown(text),
-            title="💡 [bold yellow]By-The-Way Side Note[/bold yellow]",
-            border_style="yellow",
-            padding=(0, 1),
         )
         self.console.print(p)
 

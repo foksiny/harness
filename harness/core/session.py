@@ -36,7 +36,7 @@ class SessionManager:
     """Manages active and historical sessions."""
 
     def __init__(self, storage_dir: Optional[Path] = None):
-        self.storage_dir = storage_dir or (Path.home() / ".harness" / "sessions")
+        self.storage_dir = Path(storage_dir) if storage_dir else (Path.home() / ".harness" / "sessions")
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
     def _file_path(self, session_id: str) -> Path:

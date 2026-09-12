@@ -31,9 +31,6 @@ class DummyRenderer(TerminalRenderer):
     def print_markdown(self, md: str):
         self.messages.append(("markdown", md))
 
-    def print_btw_response(self, text: str):
-        self.messages.append(("btw", text))
-
 class TestCommands(unittest.TestCase):
 
     def setUp(self):
@@ -126,14 +123,6 @@ class TestCommands(unittest.TestCase):
 
         self.registry.handle("/todo clear", self.agent, self.renderer)
         self.assertEqual(len(self.agent.todo_manager.tasks), 0)
-
-    def test_steer_command(self):
-        self.registry.handle("/steer Use snake_case variable naming", self.agent, self.renderer)
-        self.assertIn("Use snake_case variable naming", self.agent.steer_queue)
-
-    def test_btw_command(self):
-        self.registry.handle("/btw How many skills are active?", self.agent, self.renderer)
-        self.assertTrue(any(item[0] == "btw" for item in self.renderer.messages))
 
 if __name__ == "__main__":
     unittest.main()

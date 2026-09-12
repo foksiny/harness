@@ -1,7 +1,7 @@
 """
 Core Agent Engine for Harness.
 Coordinates autonomous reasoning loops, tool invocations, Super Mode iterations,
-side-channel /btw inquiries, and session state persistence.
+and session state persistence.
 """
 import json
 import time
@@ -71,7 +71,6 @@ class HarnessAgent:
         self.event_callback = event_callback
         self.prompt_builder = SystemPromptBuilder(self.mode, self.permission_manager.level)
         self.is_running = False
-        self.steer_queue: List[str] = []
 
     def emit(self, event_type: str, data: Any = None):
         if self.event_callback:
@@ -99,35 +98,6 @@ class HarnessAgent:
         model_spec = self.provider.get_model_spec(self.session.model)
         self.compactor.context_window = model_spec.context_window
         self.emit("provider_change", {"provider": provider_name, "model": self.session.model})
-
-    def steer(self, guidance: str):
-        """Inject steering instructions into ongoing execution loop."""
-        self.steer_queue.append(guidance)
-        self.emit("steer_received", guidance)
-
-    def ask_btw(self, question: str) -> str:
-        """
-        Handle an out-of-band side-channel query while active without
-        derailing the primary task message thread.
-        """
-        side_prompt = (
-            f"The user is asking a quick out-of-band question while the main task proceeds.\n"
-            f"Answer concisely without modifying files or interrupting the active work.\n\n"
-            f"Question: {question}"
-        )
-        side_messages = [{"role": "user", "content": side_prompt}]
-
-        response_text = ""
-        for chunk in self.provider.stream_chat(
-            messages=side_messages,
-            model=self.session.model,
-            thinking_effort="off",
-            system_prompt="You are Harness answering a brief side-question. Keep answers direct and helpful.",
-        ):
-            if chunk.delta_text:
-                response_text += chunk.delta_text
-
-        return response_text or "No response from side-query."
 
     def _run_subagent_task(self, system_prompt: str, prompt: str, allowed_tools: List[str], max_turns: int) -> tuple[str, int]:
         """Subagent runner executing with isolated conversation context."""
@@ -202,12 +172,6 @@ class HarnessAgent:
 
         if user_prompt:
             self.session.messages.append({"role": "user", "content": user_prompt})
-            self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
-
-        # Process any pending steering instructions
-        while self.steer_queue:
-            st = self.steer_queue.pop(0)
-            self.session.messages.append({"role": "user", "content": f"[STEERING GUIDANCE]: {st}"})
             self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
 
         # Skills-first: eagerly consult the skill catalog via the list_skills tool at the
@@ -400,12 +364,6 @@ class HarnessAgent:
                 yield AgentEvent("text_delta", finish_summary)
                 yield AgentEvent("step_end", {"step": current_loop, "complete": True})
                 break
-
-            # Check if user injected steering during tool execution
-            while self.steer_queue:
-                st = self.steer_queue.pop(0)
-                self.session.messages.append({"role": "user", "content": f"[STEERING GUIDANCE]: {st}"})
-                self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
 
             # Save session state
             self.session_manager.save(self.session)

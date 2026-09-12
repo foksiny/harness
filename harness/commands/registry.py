@@ -1,7 +1,8 @@
 """
 Slash Command Registry and Handlers for Harness.
-Handles /btw, /steer, /goal, /mode, /perm, /theme, /models, /config, /keys, /setup, /skills, /mcp, /session.
+Handles /goal, /mode, /perm, /theme, /models, /config, /keys, /setup, /skills, /mcp, /session.
 """
+import time
 from typing import Dict, Any, List, Optional, Callable
 from harness.core.modes import Mode
 from harness.core.permissions import PermissionLevel
@@ -11,6 +12,7 @@ from harness.core.compaction import calculate_history_tokens
 from harness.config import save_config, mask_key
 from harness.commands.config_cmd import display_config_table, display_keys_table, run_setup_wizard
 from harness.providers.detector import KNOWN_MODEL_REGISTRY, inspect_model
+from harness.core.checkpoints import get_checkpoint_manager
 
 class CommandContext:
     def __init__(self, agent: Any, renderer: Any, raw_args: str):
@@ -50,8 +52,6 @@ class CommandRegistry:
 
     def _register_builtins(self):
         self.register("help", self._cmd_help, "Show help directory of all commands and options.")
-        self.register("btw", self._cmd_btw, "Ask a side-question while working without derailing active task.")
-        self.register("steer", self._cmd_steer, "Inject immediate directional guidance or constraints into active task.")
         self.register("goal", self._cmd_goal, "Initiate Super Mode autonomous loop toward an explicit goal.")
         self.register("mode", self._cmd_mode, "Switch operational mode: plan, build, super.")
         self.register("perm", self._cmd_perm, "Switch permission profile: secure, default, full.")
@@ -68,7 +68,8 @@ class CommandRegistry:
         self.register("mcp", self._cmd_mcp, "Manage MCP servers: /mcp list, /mcp add.")
         self.register("subagent", self._cmd_subagent, "Dispatch an isolated subagent: /subagent <type> <prompt>.")
         self.register("compact", self._cmd_compact, "Trigger manual conversation context compaction.")
-        self.register("session", self._cmd_session, "Manage sessions: /session list, resume, save, fork, export.")
+        self.register("session", self._cmd_session, "Manage sessions: /session list, create [title], delete <id>, rename <id> <title>, fork [title], resume <id>.")
+        self.register("checkpoint", self._cmd_checkpoint, "Manage checkpoints: /checkpoint list, create [label], undo, redo.")
         self.register("tokens", self._cmd_tokens, "Display live token metrics, context window ratio, and RAM.")
         self.register("diff", self._cmd_diff, "Show uncommitted git changes.")
         self.register("clear", self._cmd_clear, "Clear the terminal screen.")
@@ -77,21 +78,6 @@ class CommandRegistry:
 
     def _cmd_help(self, ctx: CommandContext):
         ctx.renderer.print_help(self.descriptions)
-
-    def _cmd_btw(self, ctx: CommandContext):
-        if not ctx.args:
-            ctx.renderer.print_warning("Usage: /btw <your side question>")
-            return
-        ctx.renderer.print_info(f"Asking side question: '{ctx.args}'...")
-        ans = ctx.agent.ask_btw(ctx.args)
-        ctx.renderer.print_btw_response(ans)
-
-    def _cmd_steer(self, ctx: CommandContext):
-        if not ctx.args:
-            ctx.renderer.print_warning("Usage: /steer <instructions for active task>")
-            return
-        ctx.agent.steer(ctx.args)
-        ctx.renderer.print_success(f"Steering guidance queued: '{ctx.args}'")
 
     def _cmd_goal(self, ctx: CommandContext):
         if not ctx.args:
@@ -384,6 +370,51 @@ class CommandRegistry:
             for s in sessions[:15]:
                 lines.append(f"- `{s['id']}`: {s['title']} ({s['model']}, {s['turns']} turns)")
             ctx.renderer.print_markdown("\n".join(lines))
+        elif action == "create":
+            # Create a new empty session
+            title = arg.strip() if arg else "New Session"
+            new_session = ctx.agent.session_manager.create(
+                provider=ctx.agent.provider.name,
+                model=ctx.agent.session.model,
+                mode=ctx.agent.mode.value,
+                permission=ctx.agent.permission_manager.level.value,
+                thinking_effort=ctx.agent.config.thinking_effort,
+                title=title,
+            )
+            ctx.agent.session = new_session
+            ctx.renderer.print_success(f"Created new session: `{new_session.id}` ({new_session.title})")
+        elif action == "delete":
+            if not arg:
+                ctx.renderer.print_warning("Usage: /session delete <session_id>")
+                return
+            # Don't allow deleting the current session
+            if arg == ctx.agent.session.id:
+                ctx.renderer.print_error("Cannot delete the currently active session. Switch to another session first.")
+                return
+            success = ctx.agent.session_manager.delete(arg)
+            if success:
+                ctx.renderer.print_success(f"Deleted session: `{arg}`")
+            else:
+                ctx.renderer.print_error(f"Session '{arg}' not found.")
+        elif action == "rename":
+            if not arg:
+                ctx.renderer.print_warning("Usage: /session rename <session_id> <new_title>")
+                return
+            rename_parts = arg.split(" ", 1)
+            session_id = rename_parts[0]
+            new_title = rename_parts[1] if len(rename_parts) > 1 else ""
+            if not new_title:
+                ctx.renderer.print_warning("Usage: /session rename <session_id> <new_title>")
+                return
+            session = ctx.agent.session_manager.load(session_id)
+            if not session:
+                ctx.renderer.print_error(f"Session '{session_id}' not found.")
+                return
+            session.title = new_title
+            ctx.agent.session_manager.save(session)
+            if session_id == ctx.agent.session.id:
+                ctx.agent.session = session
+            ctx.renderer.print_success(f"Renamed session `{session_id}` to: `{new_title}`")
         elif action == "fork":
             forked = ctx.agent.session_manager.fork(ctx.agent.session.id, arg or None)
             if forked:
@@ -397,7 +428,7 @@ class CommandRegistry:
             else:
                 ctx.renderer.print_error(f"Session '{arg}' not found.")
         else:
-            ctx.renderer.print_info("Usage: /session [list|resume <id>|fork [title]|save]")
+            ctx.renderer.print_info("Usage: /session [list|create [title]|delete <id>|rename <id> <title>|fork [title]|resume <id>]")
 
     def _cmd_tokens(self, ctx: CommandContext):
         ram_mb = 0.0
@@ -418,6 +449,54 @@ class CommandRegistry:
             f"Turns: {len(ctx.agent.session.messages)} | "
             f"RAM Usage: {ram_mb} MB"
         )
+
+    def _cmd_checkpoint(self, ctx: CommandContext):
+        parts = ctx.args.split(" ", 1)
+        action = parts[0].lower() if parts else "list"
+        arg = parts[1] if len(parts) > 1 else ""
+
+        cp_manager = ctx.agent.checkpoint_manager
+
+        if action in ("", "list"):
+            checkpoints = cp_manager.list_checkpoints()
+            if not checkpoints:
+                ctx.renderer.print_info("No checkpoints available.")
+                return
+            lines = ["### Checkpoints:"]
+            for cp in checkpoints:
+                marker = " ▸" if cp["is_current"] else ""
+                ts = time.strftime("%H:%M:%S", time.localtime(cp["timestamp"]))
+                lines.append(f"- `{cp['id']}` [{ts}]: {cp['label']} "
+                             f"(files: {cp['file_changes_count']}, msgs: {cp['message_changes_count']}, "
+                             f"state: {cp['state_changes_count']}){marker}")
+            ctx.renderer.print_markdown("\n".join(lines))
+        elif action == "create":
+            label = arg.strip() if arg else f"Checkpoint {len(cp_manager.checkpoints) + 1}"
+            cp = cp_manager.create_checkpoint(label)
+            if cp:
+                ctx.renderer.print_success(f"Created checkpoint: `{cp.id}` ({cp.label})")
+            else:
+                ctx.renderer.print_info("No pending changes to checkpoint.")
+        elif action == "undo":
+            if not cp_manager.can_undo():
+                ctx.renderer.print_warning("Nothing to undo.")
+                return
+            target = cp_manager.undo()
+            if target:
+                ctx.renderer.print_success(f"Undone to checkpoint: `{target.id}` ({target.label})")
+            else:
+                ctx.renderer.print_success("Undone to initial state (no checkpoints).")
+        elif action == "redo":
+            if not cp_manager.can_redo():
+                ctx.renderer.print_warning("Nothing to redo.")
+                return
+            target = cp_manager.redo()
+            if target:
+                ctx.renderer.print_success(f"Redone to checkpoint: `{target.id}` ({target.label})")
+            else:
+                ctx.renderer.print_error("Redo failed.")
+        else:
+            ctx.renderer.print_info("Usage: /checkpoint [list|create [label]|undo|redo]")
 
     def _cmd_diff(self, ctx: CommandContext):
         res = ctx.agent.tool_registry.execute("git_diff", {}, ctx.agent.mode)

@@ -7,6 +7,7 @@ import glob
 from pathlib import Path
 from typing import Dict, Any, Optional
 from harness.tools.base import Tool
+from harness.core.checkpoints import get_checkpoint_manager
 
 class ViewFileTool(Tool):
     name = "view_file"
@@ -91,6 +92,10 @@ class EditFileTool(Tool):
             new_content = content.replace(target_content, replacement_content, 1)
             with open(p, "w", encoding="utf-8") as f:
                 f.write(new_content)
+            
+            # Record change for checkpoint
+            cp_manager = get_checkpoint_manager()
+            cp_manager.record_file_edit(path, content, new_content)
 
             return f"Successfully updated '{path}' (1 replacement applied)."
         except Exception as ex:
@@ -117,9 +122,22 @@ class WriteFileTool(Tool):
             return f"Error: File '{path}' already exists and overwrite is set to False."
 
         try:
+            old_content = None
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    old_content = f.read()
+            
             p.parent.mkdir(parents=True, exist_ok=True)
             with open(p, "w", encoding="utf-8") as f:
                 f.write(content)
+            
+            # Record change for checkpoint
+            cp_manager = get_checkpoint_manager()
+            if old_content is not None:
+                cp_manager.record_file_edit(path, old_content, content)
+            else:
+                cp_manager.record_file_create(path, content)
+
             return f"Successfully wrote {len(content)} characters to '{path}'."
         except Exception as ex:
             return f"Error writing file '{path}': {str(ex)}"
@@ -203,3 +221,39 @@ class FindFilesTool(Tool):
             rel_paths.append(rel)
 
         return f"Found {len(matches)} match(es):\n" + "\n".join(f"- {p}" for p in rel_paths)
+
+
+class DeleteFileTool(Tool):
+    name = "delete_file"
+    description = "Delete a file."
+    action_type = "delete_file"
+    is_read_only = False
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file to delete."},
+        },
+        "required": ["path"],
+    }
+
+    def execute(self, path: str, **kwargs) -> str:
+        p = Path(path).expanduser().resolve()
+        if not p.exists():
+            return f"Error: File '{path}' does not exist."
+        if p.is_dir():
+            return f"Error: '{path}' is a directory, not a file."
+
+        try:
+            # Read content before deleting for checkpoint
+            with open(p, "r", encoding="utf-8") as f:
+                old_content = f.read()
+            
+            p.unlink()
+            
+            # Record change for checkpoint
+            cp_manager = get_checkpoint_manager()
+            cp_manager.record_file_delete(path, old_content)
+
+            return f"Successfully deleted '{path}'."
+        except Exception as ex:
+            return f"Error deleting file '{path}': {str(ex)}"
