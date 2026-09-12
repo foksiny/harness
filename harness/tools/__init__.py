@@ -12,6 +12,8 @@ from harness.tools.questions import AskUserTool
 from harness.tools.todo_tools import TodoCreateTool, TodoUpdateTool, TodoListTool
 from harness.tools.subagent_tools import SpawnSubagentTool
 from harness.tools.git_tools import GitStatusTool, GitDiffTool
+from harness.tools.skill_tools import ListSkillsTool, ReadSkillTool
+from harness.skills.loader import SkillsManager
 from harness.core.modes import Mode, is_tool_allowed_in_mode
 from harness.core.permissions import PermissionManager
 from harness.core.todo import TodoManager
@@ -25,11 +27,13 @@ class ToolRegistry:
         permission_manager: Optional[PermissionManager] = None,
         todo_manager: Optional[TodoManager] = None,
         subagent_orchestrator: Optional[SubagentOrchestrator] = None,
+        skills_manager: Optional[SkillsManager] = None,
         ask_user_handler: Optional[Any] = None,
     ):
         self.permission_manager = permission_manager or PermissionManager()
         self.todo_manager = todo_manager or TodoManager()
         self.subagent_orchestrator = subagent_orchestrator or SubagentOrchestrator()
+        self.skills_manager = skills_manager or SkillsManager()
         self.tools: Dict[str, Tool] = {}
         self._register_default_tools(ask_user_handler)
 
@@ -63,6 +67,10 @@ class ToolRegistry:
         # Git
         self.register(GitStatusTool())
         self.register(GitDiffTool())
+
+        # Skills
+        self.register(ListSkillsTool(self.skills_manager))
+        self.register(ReadSkillTool(self.skills_manager))
 
     def register(self, tool: Tool) -> None:
         self.tools[tool.name] = tool

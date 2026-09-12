@@ -45,6 +45,7 @@ class HarnessAgent:
             permission_manager=self.permission_manager,
             todo_manager=self.todo_manager,
             subagent_orchestrator=self.subagent_orchestrator,
+            skills_manager=self.skills_manager,
             ask_user_handler=ask_user_handler,
         )
         self.mcp_manager = MCPManager(self.tool_registry)
@@ -304,11 +305,9 @@ class HarnessAgent:
         yield AgentEvent("turn_complete", {"messages_count": len(self.session.messages)})
 
     def _build_system_prompt(self, current_query: str) -> str:
-        skills_summary = self.skills_manager.format_summary()
         mcp_summary = self.mcp_manager.format_summary()
         todos_md = self.todo_manager.format_markdown()
         return self.prompt_builder.build(
-            skills_summary=skills_summary,
             mcp_tools_summary=mcp_summary,
             active_todos=todos_md,
             custom_instructions=self.config.custom_system_prompt,

@@ -15,6 +15,7 @@ SYSTEM_PROMPT_BASE = """You are Harness, the world's most capable, disciplined, 
 Your mission is to solve complex engineering, architecture, and programming tasks with exceptional precision, speed, and safety.
 
 ## PRIME DIRECTIVES:
+0. **Skills-First Investigation**: Before beginning any task, call the `list_skills` tool to review the catalog of available skills. If any listed skill matches the user's use case, call `read_skill` with that skill's name to load its full instructions, and follow them.
 1. **Precision & Investigation First**: Never guess file contents or assumptions about APIs. Always inspect relevant files, search the codebase, and verify context before writing or editing code.
 2. **Minimal, Atomic Changes**: Make clean, targeted, non-breaking modifications. Do not perform indiscriminate full-file rewrites when surgical edits suffice. Maintain existing code conventions, styles, and comments.
 3. **Verify Everything**: After modifying code, proactively run tests, linters, or typecheckers to confirm correctness. Do not declare a task done until you have verified the solution works.
@@ -68,7 +69,6 @@ class SystemPromptBuilder:
     def build(
         self,
         workspace_dir: Optional[str] = None,
-        skills_summary: str = "",
         mcp_tools_summary: str = "",
         active_todos: str = "",
         custom_instructions: Optional[str] = None,
@@ -133,19 +133,15 @@ class SystemPromptBuilder:
         if project_rules:
             sections.append(f"\n## PROJECT SPECIFIC INSTRUCTIONS:\n{project_rules}")
 
-        # 5. Skills
-        if skills_summary:
-            sections.append(f"\n## LOADED SKILLS:\n{skills_summary}")
-
-        # 6. MCP Servers
+        # 5. MCP Servers
         if mcp_tools_summary:
             sections.append(f"\n## MODEL CONTEXT PROTOCOL (MCP) INTEGRATION:\n{mcp_tools_summary}")
 
-        # 7. Active To-Dos
+        # 6. Active To-Dos
         if active_todos:
             sections.append(f"\n## ACTIVE TASK LIST:\n{active_todos}")
 
-        # 8. Custom instructions
+        # 7. Custom instructions
         if custom_instructions:
             sections.append(f"\n## USER OVERRIDE INSTRUCTIONS:\n{custom_instructions}")
 
