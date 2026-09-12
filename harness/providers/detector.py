@@ -18,49 +18,130 @@ class ModelSpec:
     supports_tools: bool = True
     supports_vision: bool = False
 
-# Known baseline catalog for exact matches
+# Known baseline catalog for exact matches — covers all major providers and model families.
+# Future models auto-detected via heuristics; add entries here for precise overrides.
 KNOWN_MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
-    # Anthropic
+    # ─── Anthropic ───────────────────────────────────────────────────────────
+    "claude-sonnet-4-20250514": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
+    "claude-4-sonnet": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
     "claude-3-7-sonnet": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
+    "claude-3-7-sonnet-20250219": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
     "claude-3-5-sonnet": {"context": 200000, "output": 8192, "thinking": False, "thinking_type": None},
+    "claude-3-5-sonnet-20241022": {"context": 200000, "output": 8192, "thinking": False, "thinking_type": None},
     "claude-3-5-haiku": {"context": 200000, "output": 8192, "thinking": False, "thinking_type": None},
+    "claude-3-5-haiku-20241022": {"context": 200000, "output": 8192, "thinking": False, "thinking_type": None},
     "claude-3-opus": {"context": 200000, "output": 4096, "thinking": False, "thinking_type": None},
+    "claude-3-opus-20240229": {"context": 200000, "output": 4096, "thinking": False, "thinking_type": None},
 
-    # OpenAI
+    # ─── OpenAI ──────────────────────────────────────────────────────────────
+    "gpt-4.1": {"context": 1047576, "output": 32768, "thinking": False, "thinking_type": None},
+    "gpt-4.1-mini": {"context": 1047576, "output": 32768, "thinking": False, "thinking_type": None},
+    "gpt-4.1-nano": {"context": 1047576, "output": 32768, "thinking": False, "thinking_type": None},
     "gpt-4o": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
+    "gpt-4o-2024-11-20": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
     "gpt-4o-mini": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
+    "gpt-4-turbo": {"context": 128000, "output": 4096, "thinking": False, "thinking_type": None},
     "o1": {"context": 200000, "output": 100000, "thinking": True, "thinking_type": "reasoning_effort"},
     "o1-preview": {"context": 128000, "output": 32768, "thinking": True, "thinking_type": "reasoning_effort"},
     "o1-mini": {"context": 128000, "output": 65536, "thinking": True, "thinking_type": "reasoning_effort"},
+    "o3": {"context": 200000, "output": 100000, "thinking": True, "thinking_type": "reasoning_effort"},
     "o3-mini": {"context": 200000, "output": 100000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "gpt-4-turbo": {"context": 128000, "output": 4096, "thinking": False, "thinking_type": None},
+    "o3-pro": {"context": 200000, "output": 100000, "thinking": True, "thinking_type": "reasoning_effort"},
+    "o4-mini": {"context": 200000, "output": 100000, "thinking": True, "thinking_type": "reasoning_effort"},
 
-    # Google Gemini
+    # ─── Google Gemini ───────────────────────────────────────────────────────
     "gemini-2.5-pro": {"context": 2097152, "output": 65536, "thinking": True, "thinking_type": "thinking_budget"},
+    "gemini-2.5-pro-latest": {"context": 2097152, "output": 65536, "thinking": True, "thinking_type": "thinking_budget"},
     "gemini-2.5-flash": {"context": 1048576, "output": 65536, "thinking": True, "thinking_type": "thinking_budget"},
+    "gemini-2.5-flash-preview-05-20": {"context": 1048576, "output": 65536, "thinking": True, "thinking_type": "thinking_budget"},
     "gemini-2.0-flash": {"context": 1048576, "output": 8192, "thinking": False, "thinking_type": None},
     "gemini-2.0-flash-thinking-exp": {"context": 1048576, "output": 65536, "thinking": True, "thinking_type": "thinking_budget"},
     "gemini-1.5-pro": {"context": 2097152, "output": 8192, "thinking": False, "thinking_type": None},
     "gemini-1.5-flash": {"context": 1048576, "output": 8192, "thinking": False, "thinking_type": None},
 
-    # DeepSeek
+    # ─── DeepSeek (direct + NIM-hosted + OpenRouter) ─────────────────────────
     "deepseek-chat": {"context": 64000, "output": 8192, "thinking": False, "thinking_type": None},
     "deepseek-reasoner": {"context": 64000, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
+    # DeepSeek V4 family — NOT reasoning models, they use standard chat
+    "deepseek-ai/deepseek-v4-0324": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
+    "deepseek-ai/deepseek-v4-pro-0813": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
+    "deepseek-ai/deepseek-v4-0813": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
+    # DeepSeek V3 family
+    "deepseek-ai/deepseek-v3": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
+    "deepseek-ai/deepseek-v3-0324": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
+    "deepseek-ai/deepseek-v3-0823": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
+    # DeepSeek R1 reasoning family
+    "deepseek-ai/deepseek-r1": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
     "deepseek-ai/DeepSeek-R1": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
+    "deepseek-ai/deepseek-r1-0528": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
+    # DeepSeek V2.5
+    "deepseek-ai/deepseek-v2.5": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
 
-    # Meta Llama (Groq, Together, Fireworks, Ollama, NIM)
+    # ─── Meta Llama (Groq, Together, Fireworks, Ollama, NIM) ─────────────────
     "llama-3.3-70b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
     "meta-llama/llama-3.3-70b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "meta/llama-3.3-70b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
     "llama-3.1-405b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "meta-llama/llama-3.1-405b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "meta/llama-3.1-405b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
     "llama-3.1-70b-versatile": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "llama-3.1-8b-instant": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    # Llama 4 family
+    "meta-llama/llama-4-scout-17b-16e-instruct": {"context": 512000, "output": 16384, "thinking": False, "thinking_type": None},
+    "meta-llama/llama-4-maverick-17b-128e-instruct": {"context": 1048576, "output": 16384, "thinking": False, "thinking_type": None},
+    "meta/llama-4-scout-17b-16e-instruct": {"context": 512000, "output": 16384, "thinking": False, "thinking_type": None},
+    "meta/llama-4-maverick-17b-128e-instruct": {"context": 1048576, "output": 16384, "thinking": False, "thinking_type": None},
 
-    # Mistral
+    # ─── Mistral ─────────────────────────────────────────────────────────────
     "mistral-large": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "codestral": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "mistral-large-latest": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "mistral-large-2": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "mistral-medium": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "mistral-small": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "codestral": {"context": 256000, "output": 8192, "thinking": False, "thinking_type": None},
+    "codestral-latest": {"context": 256000, "output": 8192, "thinking": False, "thinking_type": None},
+    "pixtral-large-latest": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "mistral-nemo": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
 
-    # Qwen
+    # ─── Qwen ────────────────────────────────────────────────────────────────
     "qwen-2.5-coder-32b": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "qwen/qwen-2.5-coder-32b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "qwen-3-235b-a22b": {"context": 128000, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
+    "qwen/qwen-3-235b-a22b": {"context": 128000, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
+    "qwen-3-30b-a3b": {"context": 128000, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
+    "qwq-32b": {"context": 128000, "output": 32768, "thinking": True, "thinking_type": "reasoning_effort"},
     "qwq-32b-preview": {"context": 32768, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
+
+    # ─── xAI Grok ────────────────────────────────────────────────────────────
+    "grok-3": {"context": 131072, "output": 16384, "thinking": False, "thinking_type": None},
+    "grok-3-mini": {"context": 131072, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
+    "grok-3-fast": {"context": 131072, "output": 16384, "thinking": False, "thinking_type": None},
+    "grok-2": {"context": 131072, "output": 8192, "thinking": False, "thinking_type": None},
+    "grok-beta": {"context": 131072, "output": 8192, "thinking": False, "thinking_type": None},
+
+    # ─── Cohere Command ──────────────────────────────────────────────────────
+    "command-a-03-2025": {"context": 256000, "output": 16384, "thinking": False, "thinking_type": None},
+    "command-r-plus": {"context": 128000, "output": 4096, "thinking": False, "thinking_type": None},
+    "command-r": {"context": 128000, "output": 4096, "thinking": False, "thinking_type": None},
+
+    # ─── Perplexity ──────────────────────────────────────────────────────────
+    "sonar-pro": {"context": 200000, "output": 8192, "thinking": False, "thinking_type": None},
+    "sonar": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "sonar-reasoning-pro": {"context": 128000, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
+    "sonar-reasoning": {"context": 128000, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
+
+    # ─── NVIDIA NIM specific model IDs ───────────────────────────────────────
+    "nvidia/llama-3.1-nemotron-70b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "nvidia/llama-3.1-nemotron-ultra-253b-v1": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
+    "nvidia/nemotron-4-340b-instruct": {"context": 4096, "output": 4096, "thinking": False, "thinking_type": None},
+
+    # ─── Together AI popular models ──────────────────────────────────────────
+    "together/deepseek-r1": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
+    "together/qwen-2.5-coder-32b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+
+    # ─── Fireworks popular models ────────────────────────────────────────────
+    "accounts/fireworks/models/deepseek-r1": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
+    "accounts/fireworks/models/deepseek-v3": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
 }
 
 def detect_context_window(model_name: str, provider: str = "") -> int:
@@ -70,10 +151,19 @@ def detect_context_window(model_name: str, provider: str = "") -> int:
     and model family defaults.
     """
     name = (model_name or "").lower().strip()
+    name_base = name.split(":")[0]  # Strip OpenRouter tags like :free, :nitro
 
-    # 1. Exact catalog match
+    # 1. Exact catalog match (bidirectional prefix/suffix)
     for k, v in KNOWN_MODEL_REGISTRY.items():
-        if name == k.lower() or name.endswith(f"/{k.lower()}"):
+        kl = k.lower()
+        if (
+            name == kl
+            or name_base == kl
+            or name.endswith(f"/{kl}")
+            or name_base.endswith(f"/{kl}")
+            or kl.endswith(f"/{name}")
+            or kl.endswith(f"/{name_base}")
+        ):
             return v["context"]
 
     # 2. Extract explicit context tokens from model name suffix/infix
@@ -93,6 +183,9 @@ def detect_context_window(model_name: str, provider: str = "") -> int:
     if "claude" in name:
         # Future Claude models: 200k base
         return 200_000
+
+    if "gpt-4.1" in name or "gpt-4-1" in name:
+        return 1_047_576
 
     if any(p in name for p in ("o1", "o3", "o4", "gpt-5")):
         return 200_000
@@ -116,11 +209,20 @@ def detect_thinking_support(model_name: str, provider: str = "") -> tuple[bool, 
     and what parameter structure it requires.
     """
     name = (model_name or "").lower().strip()
+    name_base = name.split(":")[0]
     prov = (provider or "").lower().strip()
 
-    # 1. Exact registry check
+    # 1. Exact registry check (bidirectional prefix/suffix)
     for k, v in KNOWN_MODEL_REGISTRY.items():
-        if name == k.lower() or name.endswith(f"/{k.lower()}"):
+        kl = k.lower()
+        if (
+            name == kl
+            or name_base == kl
+            or name.endswith(f"/{kl}")
+            or name_base.endswith(f"/{kl}")
+            or kl.endswith(f"/{name}")
+            or kl.endswith(f"/{name_base}")
+        ):
             return v["thinking"], v["thinking_type"]
 
     # 2. Heuristic detection of reasoning patterns in current and future models
@@ -128,7 +230,7 @@ def detect_thinking_support(model_name: str, provider: str = "") -> tuple[bool, 
         "r1", "reasoner", "reasoning", "o1", "o3", "o4", "thinking", "thought", "qwq"
     ))
 
-    if not is_reasoning and "claude-3-7" in name:
+    if not is_reasoning and ("claude-3-7" in name or "claude-4" in name or "claude-sonnet-4" in name):
         is_reasoning = True
 
     if not is_reasoning and ("gemini-2.5" in name or "gemini-3" in name):

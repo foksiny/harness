@@ -35,9 +35,13 @@ class BaseProvider(ABC):
         self.base_url = base_url
 
     def get_model_spec(self, model_name: Optional[str] = None) -> ModelSpec:
-        """Resolve model specifications using model-specific dynamic detection."""
+        """Resolve model specifications using model-specific dynamic detection and discovery."""
         m = model_name or self.default_model
-        return inspect_model(m, self.name)
+        try:
+            from harness.providers.discovery import resolve_model_spec_dynamic
+            return resolve_model_spec_dynamic(m, self.name, self.api_key, self.base_url)
+        except Exception:
+            return inspect_model(m, self.name)
 
     def normalize_thinking_effort(self, model_spec: ModelSpec, effort_setting: str) -> Dict[str, Any]:
         """

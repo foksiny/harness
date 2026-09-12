@@ -154,16 +154,68 @@ class CommandRegistry:
     def _cmd_models(self, ctx: CommandContext):
         target_prov = ctx.args.strip().lower() or ctx.agent.provider.name
         models_data = []
+        seen = set()
 
+        # Include discovered remote models if cached
+        from harness.providers.discovery import load_cached_models
+        cache = load_cached_models()
+        cached_prov = cache.get(target_prov, {}).get("models", [])
+        for rm in cached_prov:
+            mid = rm.get("id")
+            if mid and mid not in seen:
+                seen.add(mid)
+                models_data.append({
+                    "name": mid,
+                    "context": rm.get("context_length") or 128000,
+                    "output": 16384,
+                    "thinking": rm.get("supports_thinking", False),
+                    "thinking_type": rm.get("thinking_type"),
+                })
+
+        # Add known registry models filtered by provider relevance
         for mname, mdata in KNOWN_MODEL_REGISTRY.items():
+            if mname in seen:
+                continue
             spec = inspect_model(mname, target_prov)
-            models_data.append({
-                "name": mname,
-                "context": spec.context_window,
-                "output": spec.max_output_tokens,
-                "thinking": spec.supports_thinking,
-                "thinking_type": spec.thinking_type,
-            })
+            ml = mname.lower()
+
+            include = False
+            if target_prov in ("all", "catalog"):
+                include = True
+            elif target_prov == "anthropic" and "claude" in ml:
+                include = True
+            elif target_prov == "openai" and any(k in ml for k in ("gpt", "o1", "o3", "o4")):
+                include = True
+            elif target_prov == "gemini" and "gemini" in ml:
+                include = True
+            elif target_prov == "deepseek" and "deepseek" in ml:
+                include = True
+            elif target_prov in ("nvidia", "nim") and any(k in ml for k in ("meta", "llama", "deepseek", "nvidia", "qwen", "mistral")):
+                include = True
+            elif target_prov == "groq" and any(k in ml for k in ("llama", "gemma", "mixtral", "qwen")):
+                include = True
+            elif target_prov == "xai" and "grok" in ml:
+                include = True
+            elif target_prov == "cohere" and "command" in ml:
+                include = True
+            elif target_prov == "mistral" and any(k in ml for k in ("mistral", "codestral", "pixtral")):
+                include = True
+            elif target_prov == "perplexity" and "sonar" in ml:
+                include = True
+            elif target_prov in ("openrouter", "together", "fireworks", "ollama", "mock"):
+                include = True
+            elif not models_data:
+                include = True
+
+            if include:
+                seen.add(mname)
+                models_data.append({
+                    "name": mname,
+                    "context": spec.context_window,
+                    "output": spec.max_output_tokens,
+                    "thinking": spec.supports_thinking,
+                    "thinking_type": spec.thinking_type,
+                })
 
         ctx.renderer.print_models_catalog(target_prov, models_data)
 

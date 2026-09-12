@@ -57,8 +57,11 @@ def run_interactive(agent: HarnessAgent):
         try:
             for ev in agent.step(user_input):
                 renderer.render_agent_event(ev)
+            renderer.finish_thinking()
         except KeyboardInterrupt:
+            renderer.finish_thinking()
             renderer.print_warning("\nExecution interrupted by user.")
             agent.is_running = False
         except Exception as ex:
+            renderer.finish_thinking()
             renderer.print_error(f"\nExecution error: {str(ex)}")

@@ -9,6 +9,72 @@ import urllib.error
 from typing import Dict, Any, List, Optional, Iterator
 from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta
 
+class ThinkTagParser:
+    """Parses embedded <think>...</think> tags from text content streams."""
+
+    def __init__(self):
+        self.in_think: bool = False
+        self.tag_buf: str = ""
+
+    def process(self, chunk: str) -> tuple[str, str]:
+        """Process a text chunk and return (text_delta, reasoning_delta)."""
+        if not chunk:
+            return "", ""
+
+        data = self.tag_buf + chunk
+        self.tag_buf = ""
+
+        text_out = []
+        reasoning_out = []
+
+        while data:
+            if not self.in_think:
+                if "<think>" in data:
+                    before, after = data.split("<think>", 1)
+                    if before:
+                        text_out.append(before)
+                    self.in_think = True
+                    data = after
+                elif any("<think>"[:i] == data[-i:] for i in range(1, 7)):
+                    for i in range(min(6, len(data)), 0, -1):
+                        if "<think>"[:i] == data[-i:]:
+                            self.tag_buf = data[-i:]
+                            text_out.append(data[:-i])
+                            data = ""
+                            break
+                else:
+                    text_out.append(data)
+                    data = ""
+            else:
+                if "</think>" in data:
+                    thought, after = data.split("</think>", 1)
+                    if thought:
+                        reasoning_out.append(thought)
+                    self.in_think = False
+                    data = after
+                elif any("</think>"[:i] == data[-i:] for i in range(1, 8)):
+                    for i in range(min(7, len(data)), 0, -1):
+                        if "</think>"[:i] == data[-i:]:
+                            self.tag_buf = data[-i:]
+                            reasoning_out.append(data[:-i])
+                            data = ""
+                            break
+                else:
+                    reasoning_out.append(data)
+                    data = ""
+
+        return "".join(text_out), "".join(reasoning_out)
+
+    def flush(self) -> tuple[str, str]:
+        """Flush any residual buffer at stream completion."""
+        res = self.tag_buf
+        self.tag_buf = ""
+        if not res:
+            return "", ""
+        if self.in_think:
+            return "", res
+        return res, ""
+
 class OpenAICompatibleProvider(BaseProvider):
     """Generic OpenAI-compatible SSE streaming provider."""
 
@@ -56,6 +122,7 @@ class OpenAICompatibleProvider(BaseProvider):
     ) -> Iterator[LLMChunk]:
         active_model = model or self.default_model
         model_spec = self.get_model_spec(active_model)
+        think_parser = ThinkTagParser()
 
         endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
         headers = {
@@ -99,6 +166,9 @@ class OpenAICompatibleProvider(BaseProvider):
                         if line_str.startswith("data: "):
                             data_str = line_str[6:].strip()
                             if data_str == "[DONE]":
+                                rem_text, rem_reasoning = think_parser.flush()
+                                if rem_text or rem_reasoning:
+                                    yield LLMChunk(delta_text=rem_text, delta_reasoning=rem_reasoning)
                                 yield LLMChunk(finish_reason="stop")
                                 return
 
@@ -111,8 +181,17 @@ class OpenAICompatibleProvider(BaseProvider):
                                 delta = choice.get("delta", {})
                                 finish = choice.get("finish_reason")
 
-                                text_delta = delta.get("content") or ""
-                                reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                                raw_text = delta.get("content") or ""
+                                raw_reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+
+                                if raw_reasoning:
+                                    reasoning_delta = raw_reasoning
+                                    text_delta = raw_text
+                                elif raw_text:
+                                    text_delta, reasoning_delta = think_parser.process(raw_text)
+                                else:
+                                    text_delta = ""
+                                    reasoning_delta = ""
 
                                 tool_calls = []
                                 if "tool_calls" in delta:
@@ -125,13 +204,14 @@ class OpenAICompatibleProvider(BaseProvider):
                                             arguments_delta=fn.get("arguments", ""),
                                         ))
 
-                                yield LLMChunk(
-                                    delta_text=text_delta,
-                                    delta_reasoning=reasoning_delta,
-                                    tool_calls=tool_calls,
-                                    finish_reason=finish,
-                                    usage=chunk_json.get("usage"),
-                                )
+                                if text_delta or reasoning_delta or tool_calls or finish:
+                                    yield LLMChunk(
+                                        delta_text=text_delta,
+                                        delta_reasoning=reasoning_delta,
+                                        tool_calls=tool_calls,
+                                        finish_reason=finish,
+                                        usage=chunk_json.get("usage"),
+                                    )
                             except Exception:
                                 continue
 

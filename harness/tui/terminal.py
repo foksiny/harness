@@ -24,6 +24,7 @@ class TerminalRenderer:
         self._current_thinking: str = ""
         self._is_thinking_visible = False
         self._thinking_start_time: float = 0.0
+        self._thinking_line_chars: int = 0
 
     def set_theme(self, theme_name: str):
         self.theme = get_theme(theme_name)
@@ -127,34 +128,61 @@ class TerminalRenderer:
         )
         self.console.print(p)
 
+    def finish_thinking(self):
+        """Public method to close thinking panel on turn complete or interrupt."""
+        self._finish_thinking()
+
+    def _finish_thinking(self):
+        """Close out the thinking display panel and show timing stats."""
+        if not self._is_thinking_visible:
+            return
+        elapsed = round(time.time() - self._thinking_start_time, 1)
+        t_tokens = max(1, len(self._current_thinking) // 4)
+        self.console.print()  # newline after streamed thinking text
+        self.console.print(
+            f"  [{self.theme.muted}]╰─ Finished thinking in {elapsed}s "
+            f"(~{t_tokens:,} tokens)[/{self.theme.muted}]"
+        )
+        self.console.print()
+        self._is_thinking_visible = False
+        self._current_thinking = ""
+
     def render_agent_event(self, ev):
         """Render streaming agent events with live timing."""
         etype = ev.type
         data = ev.data
 
         if etype == "reasoning_delta":
-            self._current_thinking += str(data)
+            text = str(data)
+            self._current_thinking += text
             if not self._is_thinking_visible:
                 self._thinking_start_time = time.time()
-                self.console.print(f"[{self.theme.thinking}]💭 Thinking: [/{self.theme.thinking}]", end="")
+                self.console.print(
+                    f"  [{self.theme.thinking}]╭─ 💭 Thinking ─────────────────────────────[/{self.theme.thinking}]"
+                )
+                self.console.print(f"  [{self.theme.thinking}]│ [/{self.theme.thinking}]", end="")
                 self._is_thinking_visible = True
-            self.console.print(f"[{self.theme.thinking}].", end="", highlight=False)
+                self._thinking_line_chars = 0
+            # Stream actual thinking text, wrapping at ~100 chars for readability
+            for ch in text:
+                if ch == "\n":
+                    self.console.print()
+                    self.console.print(f"  [{self.theme.thinking}]│ [/{self.theme.thinking}]", end="")
+                    self._thinking_line_chars = 0
+                else:
+                    self.console.print(f"[{self.theme.thinking}]{ch}[/{self.theme.thinking}]", end="", highlight=False)
+                    self._thinking_line_chars += 1
+                    if self._thinking_line_chars >= 100 and ch == " ":
+                        self.console.print()
+                        self.console.print(f"  [{self.theme.thinking}]│ [/{self.theme.thinking}]", end="")
+                        self._thinking_line_chars = 0
 
         elif etype == "text_delta":
-            if self._is_thinking_visible:
-                elapsed = round(time.time() - self._thinking_start_time, 1)
-                t_tokens = max(1, len(self._current_thinking) // 4)
-                self.console.print(f" [{self.theme.muted}](Finished in {elapsed}s, ~{t_tokens} tokens)[/{self.theme.muted}]\n")
-                self._is_thinking_visible = False
-                self._current_thinking = ""
+            self._finish_thinking()
             self.console.print(data, end="", highlight=False)
 
         elif etype == "tool_call_start":
-            if self._is_thinking_visible:
-                elapsed = round(time.time() - self._thinking_start_time, 1)
-                self.console.print(f" [{self.theme.muted}](Finished in {elapsed}s)[/{self.theme.muted}]\n")
-                self._is_thinking_visible = False
-                self._current_thinking = ""
+            self._finish_thinking()
             tname = data.get("name", "tool")
             args = data.get("arguments", {})
             self.console.print(f"\n[{self.theme.secondary}]🔧 Invoking Tool: [bold]{tname}[/bold][/{self.theme.secondary}]")
@@ -182,6 +210,7 @@ class TerminalRenderer:
             )
 
         elif etype == "step_end" and data.get("complete"):
+            self._finish_thinking()
             self.console.print()
 
     def print_theme_gallery(self):

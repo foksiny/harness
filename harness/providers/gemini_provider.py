@@ -121,7 +121,9 @@ class GeminiProvider(BaseProvider):
                                 parts = content_part.get("parts", [])
 
                                 for p in parts:
-                                    if "text" in p:
+                                    if p.get("thought"):
+                                        yield LLMChunk(delta_reasoning=p.get("text", ""))
+                                    elif "text" in p:
                                         yield LLMChunk(delta_text=p["text"])
                                     elif "functionCall" in p:
                                         fc = p["functionCall"]
