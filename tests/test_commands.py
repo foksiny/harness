@@ -1,0 +1,76 @@
+"""
+Tests for Slash Commands Engine.
+"""
+import unittest
+from harness.config import HarnessConfig
+from harness.core.agent import HarnessAgent
+from harness.commands.registry import CommandRegistry
+from harness.tui.terminal import TerminalRenderer
+from harness.core.modes import Mode
+from harness.core.permissions import PermissionLevel
+
+class DummyRenderer(TerminalRenderer):
+    def __init__(self):
+        super().__init__("cyberpunk")
+        self.messages = []
+
+    def print_success(self, msg: str):
+        self.messages.append(("success", msg))
+
+    def print_info(self, msg: str):
+        self.messages.append(("info", msg))
+
+    def print_error(self, msg: str):
+        self.messages.append(("error", msg))
+
+    def print_markdown(self, md: str):
+        self.messages.append(("markdown", md))
+
+    def print_btw_response(self, text: str):
+        self.messages.append(("btw", text))
+
+class TestCommands(unittest.TestCase):
+
+    def setUp(self):
+        self.cfg = HarnessConfig()
+        self.cfg.provider = "mock"
+        self.agent = HarnessAgent(self.cfg)
+        self.renderer = DummyRenderer()
+        self.registry = CommandRegistry()
+
+    def test_mode_command(self):
+        self.registry.handle("/mode plan", self.agent, self.renderer)
+        self.assertEqual(self.agent.mode, Mode.PLAN)
+
+        self.registry.handle("/mode build", self.agent, self.renderer)
+        self.assertEqual(self.agent.mode, Mode.BUILD)
+
+    def test_perm_command(self):
+        self.registry.handle("/perm secure", self.agent, self.renderer)
+        self.assertEqual(self.agent.permission_manager.level, PermissionLevel.SECURE)
+
+        self.registry.handle("/perm full", self.agent, self.renderer)
+        self.assertEqual(self.agent.permission_manager.level, PermissionLevel.FULL)
+
+    def test_theme_command(self):
+        self.registry.handle("/theme dracula", self.agent, self.renderer)
+        self.assertEqual(self.renderer.theme.name, "dracula")
+
+    def test_todo_commands(self):
+        self.registry.handle("/todo add Write documentation", self.agent, self.renderer)
+        self.assertEqual(len(self.agent.todo_manager.tasks), 1)
+        self.assertEqual(self.agent.todo_manager.tasks[0].title, "Write documentation")
+
+        self.registry.handle("/todo clear", self.agent, self.renderer)
+        self.assertEqual(len(self.agent.todo_manager.tasks), 0)
+
+    def test_steer_command(self):
+        self.registry.handle("/steer Use snake_case variable naming", self.agent, self.renderer)
+        self.assertIn("Use snake_case variable naming", self.agent.steer_queue)
+
+    def test_btw_command(self):
+        self.registry.handle("/btw How many skills are active?", self.agent, self.renderer)
+        self.assertTrue(any(item[0] == "btw" for item in self.renderer.messages))
+
+if __name__ == "__main__":
+    unittest.main()

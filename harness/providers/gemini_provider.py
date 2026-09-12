@@ -1,0 +1,150 @@
+"""
+Google Gemini Provider for Harness.
+Supports Gemini 2.5 Pro, 2.5 Flash, 2.0 Flash, thinking budget, and function declarations.
+"""
+import json
+import urllib.request
+import urllib.error
+from typing import Dict, Any, List, Optional, Iterator
+from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta
+
+class GeminiProvider(BaseProvider):
+    name = "gemini"
+    display_name = "Google Gemini"
+    default_model = "gemini-2.5-pro"
+
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
+        super().__init__(api_key=api_key, base_url=base_url or "https://generativelanguage.googleapis.com/v1beta")
+
+    def _convert_contents(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        contents = []
+        for msg in messages:
+            role = msg.get("role")
+            if role == "system":
+                continue # Handled via systemInstruction
+
+            content = msg.get("content") or ""
+            parts = []
+
+            if role == "user":
+                parts.append({"text": content})
+                contents.append({"role": "user", "parts": parts})
+            elif role == "assistant":
+                if content:
+                    parts.append({"text": content})
+                if "tool_calls" in msg and msg["tool_calls"]:
+                    for tc in msg["tool_calls"]:
+                        fn = tc.get("function", {})
+                        try:
+                            args = json.loads(fn.get("arguments", "{}"))
+                        except Exception:
+                            args = {}
+                        parts.append({
+                            "functionCall": {
+                                "name": fn.get("name"),
+                                "args": args,
+                            }
+                        })
+                contents.append({"role": "model", "parts": parts})
+            elif role == "tool":
+                parts.append({
+                    "functionResponse": {
+                        "name": msg.get("name", "tool"),
+                        "response": {"output": content},
+                    }
+                })
+                contents.append({"role": "user", "parts": parts})
+        return contents
+
+    def stream_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        thinking_effort: str = "high",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None,
+        **kwargs,
+    ) -> Iterator[LLMChunk]:
+        active_model = model or self.default_model
+        model_spec = self.get_model_spec(active_model)
+
+        endpoint = f"{self.base_url.rstrip('/')}/models/{active_model}:streamGenerateContent?alt=sse&key={self.api_key or ''}"
+        headers = {"Content-Type": "application/json"}
+
+        body: Dict[str, Any] = {
+            "contents": self._convert_contents(messages),
+        }
+
+        if system_prompt:
+            body["systemInstruction"] = {
+                "parts": [{"text": system_prompt}]
+            }
+
+        gen_config: Dict[str, Any] = {}
+        thinking_param = self.normalize_thinking_effort(model_spec, thinking_effort)
+        if thinking_param and "thinking_config" in thinking_param:
+            gen_config["thinkingConfig"] = {
+                "thinkingBudget": thinking_param["thinking_config"]["thinking_budget"]
+            }
+        if gen_config:
+            body["generationConfig"] = gen_config
+
+        if tools:
+            body["tools"] = [{"functionDeclarations": tools}]
+
+        data_bytes = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(endpoint, data=data_bytes, headers=headers, method="POST")
+
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                buffer = ""
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace")
+                    buffer += line
+
+                    while "\n" in buffer:
+                        line_str, buffer = buffer.split("\n", 1)
+                        line_str = line_str.strip()
+
+                        if not line_str or line_str.startswith(":"):
+                            continue
+
+                        if line_str.startswith("data: "):
+                            data_str = line_str[6:].strip()
+                            try:
+                                chunk = json.loads(data_str)
+                                candidates = chunk.get("candidates", [])
+                                if not candidates:
+                                    continue
+                                cand = candidates[0]
+                                content_part = cand.get("content", {})
+                                parts = content_part.get("parts", [])
+
+                                for p in parts:
+                                    if "text" in p:
+                                        yield LLMChunk(delta_text=p["text"])
+                                    elif "functionCall" in p:
+                                        fc = p["functionCall"]
+                                        yield LLMChunk(
+                                            tool_calls=[ToolCallDelta(
+                                                index=0,
+                                                id=f"gemini_call_{fc.get('name')}",
+                                                name=fc.get("name"),
+                                                arguments_delta=json.dumps(fc.get("args", {})),
+                                            )]
+                                        )
+
+                                finish = cand.get("finishReason")
+                                if finish:
+                                    yield LLMChunk(finish_reason=finish)
+
+                            except Exception:
+                                continue
+
+        except urllib.error.HTTPError as he:
+            err_body = he.read().decode("utf-8", errors="ignore")
+            yield LLMChunk(delta_text=f"\n[HTTP Error {he.code} from Gemini: {err_body}]\n", finish_reason="error")
+        except urllib.error.URLError as ue:
+            yield LLMChunk(delta_text=f"\n[Connection Error with Gemini: {str(ue)}]\n", finish_reason="error")
+        except Exception as ex:
+            yield LLMChunk(delta_text=f"\n[Unexpected Error from Gemini: {str(ex)}]\n", finish_reason="error")
