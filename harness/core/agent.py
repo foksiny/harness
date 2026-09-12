@@ -252,8 +252,9 @@ class HarnessAgent:
             )
             yield AgentEvent("compaction", stats)
 
-        # Loop for tool executions (Super mode allows up to 25 steps, Build up to 10)
-        max_loop = 25 if self.mode == Mode.SUPER else 10
+        # Loop for tool executions. There is no hard step budget — iteration
+        # stops when the model delivers a text-only answer, calls the `finish`
+        # tool, or the empty-response guard determines the turn is done.
         current_loop = 0
         empty_streak = 0
         MAX_EMPTY_RETRIES = 2
@@ -261,7 +262,7 @@ class HarnessAgent:
         # Create checkpoint at start of turn
         self.checkpoint_manager.create_checkpoint(f"Turn {len(self.session.messages) // 2 + 1} start")
 
-        while current_loop < max_loop and self.is_running:
+        while self.is_running:
             current_loop += 1
             active_tools = self.tool_registry.get_openai_schemas(self.mode)
 
