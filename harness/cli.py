@@ -19,9 +19,10 @@ from harness.commands.config_cmd import (
     display_keys_table,
     run_setup_wizard,
 )
+from harness.tools.git_tools import check_git_behind, get_git_update_command
 
 def handle_subcommands(args: list) -> bool:
-    """Handle CLI subcommands: config, keys, setup, theme."""
+    """Handle CLI subcommands: config, keys, setup, theme, update."""
     if not args:
         return False
 
@@ -101,7 +102,69 @@ def handle_subcommands(args: list) -> bool:
             renderer.print_info(f"Usage: harness theme [list | preview <name> | <theme_name>]")
         return True
 
+    elif sub == "update":
+        handle_update_command(renderer)
+        return True
+
     return False
+
+
+def handle_update_command(renderer: TerminalRenderer) -> None:
+    """Handle the 'harness update' command to pull latest changes from upstream."""
+    import subprocess
+    
+    try:
+        # Check if we're in a git repo
+        subprocess.check_output(
+            ["git", "rev-parse", "--git-dir"],
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except subprocess.CalledProcessError:
+        renderer.print_error("Not a git repository. Cannot update.")
+        return
+    except Exception as ex:
+        renderer.print_error(f"Git error: {str(ex)}")
+        return
+
+    try:
+        # Fetch latest changes
+        renderer.print_info("Fetching latest changes from upstream...")
+        subprocess.check_output(
+            ["git", "fetch"],
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+        
+        # Check if behind
+        is_behind, commits_behind = check_git_behind()
+        if not is_behind:
+            renderer.print_success("Already up to date!")
+            return
+        
+        renderer.print_info(f"You are {commits_behind} commit{'s' if commits_behind > 1 else ''} behind. Updating...")
+        
+        # Pull changes
+        result = subprocess.run(
+            ["git", "pull"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        
+        if result.returncode == 0:
+            renderer.print_success("Successfully updated to the latest version!")
+            if result.stdout:
+                renderer.print_info(result.stdout.strip())
+        else:
+            renderer.print_error(f"Update failed: {result.stderr.strip()}")
+            
+    except subprocess.TimeoutExpired:
+        renderer.print_error("Git operation timed out.")
+    except subprocess.CalledProcessError as e:
+        renderer.print_error(f"Git error: {e.output.decode('utf-8', errors='ignore') if e.output else str(e)}")
+    except Exception as ex:
+        renderer.print_error(f"Update failed: {str(ex)}")
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -114,6 +177,7 @@ Subcommands:
   config [list|get|set]                 Inspect or update configuration settings
   keys [list|set|remove]                Manage LLM provider API keys
   theme [list|preview]                  Browse or preview visual themes
+  update                                Pull latest changes from upstream repository
 
 Examples:
   harness                               # Launch interactive TUI
@@ -122,6 +186,7 @@ Examples:
   harness --super "Fix all unit tests"  # Autonomous Super Mode loop
   harness keys set openai               # Set API key securely
   harness theme preview dracula         # View visual theme preview card
+  harness update                        # Update to latest version
   cat error.log | harness "Debug error" # Read piped stdin input
         """,
     )
@@ -139,7 +204,7 @@ Examples:
 
 def main():
     # Intercept subcommands first
-    if len(sys.argv) > 1 and sys.argv[1] in ("config", "keys", "setup", "theme"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("config", "keys", "setup", "theme", "update"):
         handle_subcommands(sys.argv[1:])
         return
 
@@ -147,6 +212,16 @@ def main():
     args = parser.parse_args()
 
     config = load_config()
+
+    # Check if user is behind upstream commits and warn them
+    is_behind, commits_behind = check_git_behind()
+    if is_behind:
+        renderer = TerminalRenderer(config.theme)
+        renderer.print_warning(
+            f"You are {commits_behind} commit{'s' if commits_behind > 1 else ''} behind the upstream branch.\n"
+            f"  Tip: Run '{get_git_update_command()}' to update to the latest version."
+        )
+        print()  # Add spacing after warning
 
     # Apply CLI argument overrides
     if args.mode:
