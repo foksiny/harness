@@ -1,23 +1,25 @@
 """
 Configuration manager for Harness CLI.
-Handles user preferences, workspace settings, API keys, and persistence.
+Handles user preferences, workspace settings, API keys, masking, and persistence.
 """
 import os
 import json
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 
 USER_CONFIG_DIR = Path.home() / ".harness"
 USER_CONFIG_PATH = USER_CONFIG_DIR / "config.json"
 USER_SESSIONS_DIR = USER_CONFIG_DIR / "sessions"
 USER_SKILLS_DIR = USER_CONFIG_DIR / "skills"
 USER_MCP_FILE = USER_CONFIG_DIR / "mcp.json"
+USER_THEMES_FILE = USER_CONFIG_DIR / "themes.json"
 
 WORKSPACE_CONFIG_DIR = Path(".harness")
 WORKSPACE_CONFIG_PATH = WORKSPACE_CONFIG_DIR / "config.json"
 WORKSPACE_SKILLS_DIR = WORKSPACE_CONFIG_DIR / "skills"
 WORKSPACE_MCP_FILE = WORKSPACE_CONFIG_DIR / "mcp.json"
+WORKSPACE_THEMES_FILE = WORKSPACE_CONFIG_DIR / "themes.json"
 
 ENV_KEY_MAPPINGS = {
     "openai": "OPENAI_API_KEY",
@@ -35,6 +37,17 @@ ENV_KEY_MAPPINGS = {
     "cohere": "CO_API_KEY",
     "perplexity": "PERPLEXITY_API_KEY",
 }
+
+def mask_key(key: Optional[str]) -> str:
+    """Mask sensitive API key for safe display (e.g. sk-ant-***a1b2)."""
+    if not key:
+        return "(not set)"
+    k = key.strip()
+    if len(k) <= 8:
+        return "***"
+    prefix = k[:6] if len(k) >= 12 else k[:3]
+    suffix = k[-4:]
+    return f"{prefix}***{suffix}"
 
 @dataclass
 class HarnessConfig:
@@ -68,7 +81,7 @@ class HarnessConfig:
         env_var = ENV_KEY_MAPPINGS.get(prov)
         if env_var and os.environ.get(env_var):
             return os.environ.get(env_var)
-        # 3. Fallback generic ENV formats
+        # 3. Fallback generic ENV format
         generic_env = f"{prov.upper()}_API_KEY"
         return os.environ.get(generic_env)
 
@@ -76,9 +89,62 @@ class HarnessConfig:
         """Store API key for a provider."""
         self.api_keys[provider_name.lower().strip()] = key.strip()
 
+    def remove_api_key(self, provider_name: str) -> bool:
+        """Remove API key for a provider."""
+        prov = provider_name.lower().strip()
+        if prov in self.api_keys:
+            del self.api_keys[prov]
+            return True
+        return False
+
+    def list_keys_status(self) -> List[Dict[str, Any]]:
+        """Return status and masked keys for all supported providers."""
+        from harness.providers import PROVIDER_CONFIGS
+        res = []
+        for prov_id, prov_meta in sorted(PROVIDER_CONFIGS.items()):
+            if prov_id == "mock":
+                continue
+            cfg_key = self.api_keys.get(prov_id)
+            env_var = ENV_KEY_MAPPINGS.get(prov_id, f"{prov_id.upper()}_API_KEY")
+            env_val = os.environ.get(env_var)
+
+            effective_key = cfg_key or env_val
+            source = "config" if cfg_key else ("env" if env_val else "none")
+
+            res.append({
+                "provider": prov_id,
+                "display_name": prov_meta["display_name"],
+                "status": "configured" if effective_key else "missing",
+                "masked": mask_key(effective_key),
+                "source": source,
+                "env_var": env_var,
+            })
+        return res
+
     def get_base_url(self, provider_name: str) -> Optional[str]:
-        """Get base URL for provider if configured."""
         return self.base_urls.get(provider_name.lower().strip())
+
+    def set_base_url(self, provider_name: str, url: str) -> None:
+        self.base_urls[provider_name.lower().strip()] = url.strip()
+
+    def set_field(self, key: str, value: str) -> bool:
+        """Update any configuration field with automatic type conversion."""
+        k = key.lower().strip()
+        if not hasattr(self, k):
+            return False
+
+        current_val = getattr(self, k)
+        if isinstance(current_val, bool):
+            setattr(self, k, value.lower() in ("true", "1", "yes", "on"))
+        elif isinstance(current_val, int):
+            setattr(self, k, int(value))
+        elif isinstance(current_val, float):
+            setattr(self, k, float(value))
+        elif isinstance(current_val, str):
+            setattr(self, k, value)
+        else:
+            return False
+        return True
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -93,12 +159,10 @@ def load_config() -> HarnessConfig:
     """Load configuration, cascading from global config to workspace config."""
     config = HarnessConfig()
 
-    # Ensure directories exist
     USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     USER_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     USER_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. Global config
     if USER_CONFIG_PATH.exists():
         try:
             with open(USER_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -107,13 +171,11 @@ def load_config() -> HarnessConfig:
         except Exception:
             pass
 
-    # 2. Local workspace config override
     if WORKSPACE_CONFIG_PATH.exists():
         try:
             with open(WORKSPACE_CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 workspace_config = HarnessConfig.from_dict(data)
-                # Merge non-default values
                 for k, v in asdict(workspace_config).items():
                     if v is not None:
                         setattr(config, k, v)

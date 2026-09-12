@@ -1,13 +1,16 @@
 """
 Slash Command Registry and Handlers for Harness.
-Handles /btw, /steer, /goal, /mode, /perm, /theme, /skills, /mcp, /session, and more.
+Handles /btw, /steer, /goal, /mode, /perm, /theme, /models, /config, /keys, /setup, /skills, /mcp, /session.
 """
 from typing import Dict, Any, List, Optional, Callable
 from harness.core.modes import Mode
 from harness.core.permissions import PermissionLevel
-from harness.themes import THEMES, list_themes
-from harness.providers import list_providers
+from harness.themes import THEMES, list_themes, render_theme_preview
+from harness.providers import list_providers, PROVIDER_CONFIGS
 from harness.core.compaction import calculate_history_tokens
+from harness.config import save_config, mask_key
+from harness.commands.config_cmd import display_config_table, display_keys_table, run_setup_wizard
+from harness.providers.detector import KNOWN_MODEL_REGISTRY, inspect_model
 
 class CommandContext:
     def __init__(self, agent: Any, renderer: Any, raw_args: str):
@@ -28,10 +31,7 @@ class CommandRegistry:
         self.descriptions[name.lower()] = description
 
     def handle(self, input_line: str, agent: Any, renderer: Any) -> bool:
-        """
-        Check if input_line is a slash command.
-        Returns True if handled, False otherwise.
-        """
+        """Check if input_line is a slash command. Returns True if handled."""
         line = input_line.strip()
         if not line.startswith("/"):
             return False
@@ -49,13 +49,17 @@ class CommandRegistry:
             return True
 
     def _register_builtins(self):
-        self.register("help", self._cmd_help, "Show this help directory of all commands and options.")
-        self.register("btw", self._cmd_btw, "Ask a side-question to the agent while working without derailing the main task.")
+        self.register("help", self._cmd_help, "Show help directory of all commands and options.")
+        self.register("btw", self._cmd_btw, "Ask a side-question while working without derailing active task.")
         self.register("steer", self._cmd_steer, "Inject immediate directional guidance or constraints into active task.")
         self.register("goal", self._cmd_goal, "Initiate Super Mode autonomous loop toward an explicit goal.")
         self.register("mode", self._cmd_mode, "Switch operational mode: plan, build, super.")
         self.register("perm", self._cmd_perm, "Switch permission profile: secure, default, full.")
-        self.register("theme", self._cmd_theme, "Change UI theme (cyberpunk, dracula, nord, monokai, catppuccin, matrix, minimal).")
+        self.register("theme", self._cmd_theme, "Theme gallery, preview, and switching (14 themes available).")
+        self.register("models", self._cmd_models, "Browse model catalog for current or specific provider.")
+        self.register("config", self._cmd_config, "View, get, or set configuration settings.")
+        self.register("keys", self._cmd_keys, "Manage, mask, and test provider API keys.")
+        self.register("setup", self._cmd_setup, "Launch interactive onboarding setup wizard.")
         self.register("provider", self._cmd_provider, "Switch active LLM provider (16+ supported).")
         self.register("model", self._cmd_model, "Change model name for the active provider.")
         self.register("effort", self._cmd_effort, "Set thinking effort: off, low, medium, high, or token count.")
@@ -95,7 +99,6 @@ class CommandRegistry:
             return
         ctx.agent.set_mode(Mode.SUPER)
         ctx.renderer.print_super_banner(ctx.args)
-        # Execute goal directly
         for ev in ctx.agent.step(f"AUTONOMOUS GOAL: {ctx.args}"):
             ctx.renderer.render_agent_event(ev)
 
@@ -122,18 +125,95 @@ class CommandRegistry:
             ctx.renderer.print_error("Invalid permission. Choose from: secure, default, full.")
 
     def _cmd_theme(self, ctx: CommandContext):
-        themes = list_themes()
-        if not ctx.args:
-            t_list = ", ".join([f"'{k}' ({v})" for k, v in themes.items()])
-            ctx.renderer.print_info(f"Available themes: {t_list}\nUsage: /theme <name>")
+        args = ctx.args.strip()
+        if not args:
+            ctx.renderer.print_theme_gallery()
             return
-        name = ctx.args.lower().strip()
+
+        parts = args.split(" ", 1)
+        if parts[0] == "preview":
+            target = parts[1].lower().strip() if len(parts) > 1 else ctx.renderer.theme.name
+            if target in THEMES:
+                card = render_theme_preview(target)
+                ctx.renderer.console.print(card)
+            else:
+                ctx.renderer.print_error(f"Unknown theme '{target}'. Use `/theme` to view the 14 available themes.")
+            return
+
+        name = args.lower()
         if name in THEMES:
             ctx.renderer.set_theme(name)
             ctx.agent.config.theme = name
+            save_config(ctx.agent.config)
             ctx.renderer.print_success(f"Theme switched to: {THEMES[name].display_name}")
+            card = render_theme_preview(name)
+            ctx.renderer.console.print(card)
         else:
             ctx.renderer.print_error(f"Unknown theme '{name}'. Available: {', '.join(THEMES.keys())}")
+
+    def _cmd_models(self, ctx: CommandContext):
+        target_prov = ctx.args.strip().lower() or ctx.agent.provider.name
+        models_data = []
+
+        for mname, mdata in KNOWN_MODEL_REGISTRY.items():
+            spec = inspect_model(mname, target_prov)
+            models_data.append({
+                "name": mname,
+                "context": spec.context_window,
+                "output": spec.max_output_tokens,
+                "thinking": spec.supports_thinking,
+                "thinking_type": spec.thinking_type,
+            })
+
+        ctx.renderer.print_models_catalog(target_prov, models_data)
+
+    def _cmd_config(self, ctx: CommandContext):
+        parts = ctx.args.split(" ", 2)
+        action = parts[0].lower() if parts and parts[0] else "list"
+
+        if action == "list":
+            display_config_table(ctx.agent.config, ctx.renderer)
+        elif action == "get" and len(parts) > 1:
+            key = parts[1].lower()
+            val = getattr(ctx.agent.config, key, None)
+            if val is not None:
+                ctx.renderer.print_info(f"{key} = {val}")
+            else:
+                ctx.renderer.print_error(f"Unknown config key '{key}'")
+        elif action == "set" and len(parts) > 2:
+            key, val = parts[1].lower(), parts[2]
+            success = ctx.agent.config.set_field(key, val)
+            if success:
+                save_config(ctx.agent.config)
+                ctx.renderer.print_success(f"Updated config: {key} = {val}")
+            else:
+                ctx.renderer.print_error(f"Failed to set '{key}'. Verify field name and type.")
+        else:
+            ctx.renderer.print_info("Usage: /config, /config get <key>, /config set <key> <val>")
+
+    def _cmd_keys(self, ctx: CommandContext):
+        parts = ctx.args.split(" ", 2)
+        action = parts[0].lower() if parts and parts[0] else "list"
+
+        if action == "list":
+            display_keys_table(ctx.agent.config, ctx.renderer)
+        elif action == "set" and len(parts) > 2:
+            pname, key = parts[1].lower(), parts[2]
+            ctx.agent.config.set_api_key(pname, key)
+            save_config(ctx.agent.config)
+            ctx.renderer.print_success(f"Saved key for {pname} ({mask_key(key)})")
+        elif action == "remove" and len(parts) > 1:
+            pname = parts[1].lower()
+            if ctx.agent.config.remove_api_key(pname):
+                save_config(ctx.agent.config)
+                ctx.renderer.print_success(f"Removed key for {pname}")
+            else:
+                ctx.renderer.print_warning(f"No key was stored for {pname}")
+        else:
+            ctx.renderer.print_info("Usage: /keys, /keys set <provider> <key>, /keys remove <provider>")
+
+    def _cmd_setup(self, ctx: CommandContext):
+        run_setup_wizard(ctx.agent.config, ctx.renderer)
 
     def _cmd_provider(self, ctx: CommandContext):
         provs = list_providers()

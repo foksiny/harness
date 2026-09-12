@@ -1,9 +1,10 @@
 """
 Terminal Renderer & TUI Engine for Harness.
-Renders header HUDs, markdown streams, collapsible thinking, and syntax diffs
-using Rich and active theme styling.
+Renders header HUDs, markdown streams, collapsible thinking, syntax diffs,
+theme galleries, and hotkey footers using Rich and active theme styling.
 """
 import os
+import time
 import resource
 from typing import Dict, Any, List, Optional
 from rich.console import Console
@@ -12,7 +13,7 @@ from rich.text import Text
 from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.table import Table
-from harness.themes import Theme, get_theme
+from harness.themes import Theme, get_theme, THEMES, render_theme_preview
 
 class TerminalRenderer:
     """Renders rich UI elements with custom themes."""
@@ -22,6 +23,7 @@ class TerminalRenderer:
         self.theme: Theme = get_theme(theme_name)
         self._current_thinking: str = ""
         self._is_thinking_visible = False
+        self._thinking_start_time: float = 0.0
 
     def set_theme(self, theme_name: str):
         self.theme = get_theme(theme_name)
@@ -91,6 +93,19 @@ class TerminalRenderer:
 
         self.console.print(Panel(hud_table, border_style=self.theme.border, padding=(0, 1)))
 
+    def print_footer(self):
+        """Display bottom shortcuts bar."""
+        footer_text = (
+            "[dim][bold]/help[/bold]: Help  |  "
+            "[bold]/mode[/bold]: Switch Mode  |  "
+            "[bold]/perm[/bold]: Permissions  |  "
+            "[bold]/theme[/bold]: Themes  |  "
+            "[bold]/models[/bold]: Model Picker  |  "
+            "[bold]/btw[/bold]: Side Note  |  "
+            "[bold]/exit[/bold]: Quit[/dim]"
+        )
+        self.console.print(f" {footer_text}")
+
     def print_super_banner(self, goal: str):
         """Banner for entering Super Mode autonomous execution."""
         p = Panel(
@@ -113,28 +128,33 @@ class TerminalRenderer:
         self.console.print(p)
 
     def render_agent_event(self, ev):
-        """Render streaming agent events."""
+        """Render streaming agent events with live timing."""
         etype = ev.type
         data = ev.data
 
         if etype == "reasoning_delta":
             self._current_thinking += str(data)
             if not self._is_thinking_visible:
+                self._thinking_start_time = time.time()
                 self.console.print(f"[{self.theme.thinking}]💭 Thinking: [/{self.theme.thinking}]", end="")
                 self._is_thinking_visible = True
-            # Stream dots or subtle indicator
             self.console.print(f"[{self.theme.thinking}].", end="", highlight=False)
 
         elif etype == "text_delta":
             if self._is_thinking_visible:
-                self.console.print(f" [{self.theme.muted}](Done thinking)[/{self.theme.muted}]\n")
+                elapsed = round(time.time() - self._thinking_start_time, 1)
+                t_tokens = max(1, len(self._current_thinking) // 4)
+                self.console.print(f" [{self.theme.muted}](Finished in {elapsed}s, ~{t_tokens} tokens)[/{self.theme.muted}]\n")
                 self._is_thinking_visible = False
+                self._current_thinking = ""
             self.console.print(data, end="", highlight=False)
 
         elif etype == "tool_call_start":
             if self._is_thinking_visible:
-                self.console.print(f" [{self.theme.muted}](Done thinking)[/{self.theme.muted}]\n")
+                elapsed = round(time.time() - self._thinking_start_time, 1)
+                self.console.print(f" [{self.theme.muted}](Finished in {elapsed}s)[/{self.theme.muted}]\n")
                 self._is_thinking_visible = False
+                self._current_thinking = ""
             tname = data.get("name", "tool")
             args = data.get("arguments", {})
             self.console.print(f"\n[{self.theme.secondary}]🔧 Invoking Tool: [bold]{tname}[/bold][/{self.theme.secondary}]")
@@ -163,6 +183,47 @@ class TerminalRenderer:
 
         elif etype == "step_end" and data.get("complete"):
             self.console.print()
+
+    def print_theme_gallery(self):
+        """Display interactive gallery of all available themes with color swatches."""
+        table = Table(title="🎨 Harness Theme Palette Gallery (14 Themes)", border_style=self.theme.border)
+        table.add_column("Theme ID", style="bold white")
+        table.add_column("Display Name", style="white")
+        table.add_column("Palette Swatches")
+        table.add_column("Syntax Style", style="dim")
+
+        for k, t in THEMES.items():
+            swatches = (
+                f"[{t.primary}]■[/{t.primary}] "
+                f"[{t.secondary}]■[/{t.secondary}] "
+                f"[{t.accent}]■[/{t.accent}] "
+                f"[{t.success}]■[/{t.success}] "
+                f"[{t.warning}]■[/{t.warning}] "
+                f"[{t.error}]■[/{t.error}] "
+                f"[{t.thinking}]■[/{t.thinking}]"
+            )
+            table.add_row(k, t.display_name, swatches, t.code_theme)
+
+        self.console.print(table)
+        self.console.print("[dim]Switch theme: `/theme <id>`  |  Preview card: `/theme preview <id>`[/dim]\n")
+
+    def print_models_catalog(self, provider_name: str, models_data: List[Dict[str, Any]]):
+        """Display catalog of available models for provider."""
+        table = Table(title=f"🤖 Models for Provider: {provider_name.upper()}", border_style=self.theme.border)
+        table.add_column("Model Name", style=f"bold {self.theme.primary}")
+        table.add_column("Context Window", justify="right")
+        table.add_column("Max Output", justify="right")
+        table.add_column("Thinking Support", justify="center")
+        table.add_column("Reasoning Format", style="dim")
+
+        for m in models_data:
+            c_win = f"{m['context']:,} tokens"
+            th_badge = "[bold green]✔ Yes[/bold green]" if m["thinking"] else "[dim]No[/dim]"
+            ttype = m["thinking_type"] or "-"
+            table.add_row(m["name"], c_win, f"{m['output']:,}", th_badge, ttype)
+
+        self.console.print(table)
+        self.console.print(f"[dim]Switch model: `/model <name>`[/dim]\n")
 
     def print_markdown(self, md_text: str):
         self.console.print(Markdown(md_text))

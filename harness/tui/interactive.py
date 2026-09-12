@@ -33,6 +33,7 @@ def run_interactive(agent: HarnessAgent):
             context_win=c_win,
             todos_summary=todos_summary,
         )
+        renderer.print_footer()
 
         prompt_str = f"[{renderer.theme.primary}]Harness ({agent.mode.value})>[/{renderer.theme.primary}] "
         # Format clean prompt for readline / input
