@@ -97,6 +97,7 @@ class TestSkills(unittest.TestCase):
     def test_step_seeds_list_skills_before_any_work(self):
         cfg = HarnessConfig()
         cfg.provider = "mock"
+        cfg.learning_enabled = False
         agent = HarnessAgent(cfg)
         events = list(agent.step("what is this project about?"))
         # Eager list_skills tool + result must be injected into the conversation.
@@ -112,6 +113,7 @@ class TestSkills(unittest.TestCase):
     def test_step_does_not_re_seed_list_skills(self):
         cfg = HarnessConfig()
         cfg.provider = "mock"
+        cfg.learning_enabled = False
         agent = HarnessAgent(cfg)
         list(agent.step("static analysis task"))
         list(agent.step("second task"))
@@ -122,6 +124,7 @@ class TestSkills(unittest.TestCase):
         cfg = HarnessConfig()
         cfg.provider = "mock"
         cfg.thinking_effort = "off"
+        cfg.learning_enabled = False
         from harness.providers.mock_provider import MockProvider
         mock = MockProvider(responses=[LLMChunk()])
         agent = HarnessAgent(cfg)
@@ -138,6 +141,7 @@ class TestSkills(unittest.TestCase):
         ])
         cfg = HarnessConfig()
         cfg.provider = "mock"
+        cfg.learning_enabled = False
         agent = HarnessAgent(cfg)
         agent.provider = mock
         list(agent.step("task"))

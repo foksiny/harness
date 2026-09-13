@@ -49,6 +49,16 @@ def mask_key(key: Optional[str]) -> str:
     suffix = k[-4:]
     return f"{prefix}***{suffix}"
 
+def normalize_provider_base_url(provider_name: str, url: Optional[str]) -> Optional[str]:
+    """Normalize legacy/incorrect base URLs for a provider."""
+    prov = (provider_name or "").lower().strip()
+    if url and prov == "opencode":
+        clean = url.strip().rstrip("/")
+        for legacy in ("https://api.opencode.ai", "http://api.opencode.ai", "api.opencode.ai"):
+            if clean == legacy or clean == legacy + "/v1":
+                return "https://opencode.ai/zen/v1"
+    return url
+
 @dataclass
 class HarnessConfig:
     provider: str = "anthropic"
@@ -58,14 +68,21 @@ class HarnessConfig:
     thinking_effort: str = "high"    # off, low, medium, high, or token count
     theme: str = "cyberpunk"
     auto_compact: bool = True
-    compact_threshold: float = 0.75  # Compact at 75% of context window
+    compact_threshold: float = 0.75  # Arm compaction at 75% of context window
+    compact_target_ratio: float = 0.60  # Compact down to 60% of the window
+    compact_cap_ratio: float = 0.95  # Hard cap; mid-turn emergency trim above this
+    compact_max_message_tokens: int = 0  # 0 => auto (15% of context window)
+    compact_preserve_turns: int = 4  # Never summarize the most recent N turns
+    compact_summary: str = "auto"  # auto | llm | heuristic
+    learning_enabled: bool = True    # Persistent cross-session lessons (learn_record/recall/promote)
     max_subagents: int = 4
     timeout_seconds: int = 120
+    swarm_enabled: bool = False      # Enable agent swarms (always active in SUPER mode)
     api_keys: Dict[str, str] = field(default_factory=dict)
     base_urls: Dict[str, str] = field(default_factory=lambda: {
         "ollama": "http://localhost:11434",
         "nvidia": "https://integrate.api.nvidia.com/v1",
-        "opencode": "https://api.opencode.ai/v1",
+        "opencode": "https://opencode.ai/zen/v1",
         "openrouter": "https://openrouter.ai/api/v1",
     })
     custom_system_prompt: Optional[str] = None
@@ -130,10 +147,11 @@ class HarnessConfig:
         return res
 
     def get_base_url(self, provider_name: str) -> Optional[str]:
-        return self.base_urls.get(provider_name.lower().strip())
+        url = self.base_urls.get(provider_name.lower().strip())
+        return normalize_provider_base_url(provider_name, url)
 
     def set_base_url(self, provider_name: str, url: str) -> None:
-        self.base_urls[provider_name.lower().strip()] = url.strip()
+        self.base_urls[provider_name.lower().strip()] = normalize_provider_base_url(provider_name, url.strip())
 
     def set_field(self, key: str, value: str) -> bool:
         """Update any configuration field with automatic type conversion."""

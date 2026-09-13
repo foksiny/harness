@@ -72,11 +72,9 @@ class RunCommandTool(Tool):
             if not out and not err:
                 res.append("(No output produced)")
 
-            full_res = "\n".join(res)
-            # Truncate if excessively large
-            if len(full_res) > 15000:
-                full_res = full_res[:15000] + f"\n... [Output truncated. Total chars: {len(full_res)}]"
-            return full_res
+            # Full output is delivered to the agent untouched — display-level
+            # truncation happens only in the TUI renderer.
+            return "\n".join(res)
 
         except subprocess.TimeoutExpired:
             return f"Error: Command timed out after {t_limit} seconds: `{cmd}`"

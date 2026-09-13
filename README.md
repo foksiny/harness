@@ -21,7 +21,7 @@
   - Dynamically measures context window limits and reasoning parameters for **any current or future model** via heuristic token extraction (`-1m`, `-2m`, `-128k`, `-256k`), model family registries, and provider specs.
   - Native support for Claude 3.7 budget tokens, OpenAI / NIM / OpenRouter / Groq / DeepSeek reasoning effort (`low`/`medium`/`high`), and Gemini thinking budget.
 - 🌐 **16+ First-Class Providers**:
-  - Anthropic, OpenAI, Google Gemini, OpenRouter, NVIDIA NIM, OpenCode Zen / Go, Groq, DeepSeek, Mistral AI, xAI (Grok), Ollama (Local), Together AI, Fireworks AI, Cohere, Perplexity Sonar, and an Offline Mock Engine.
+  - Anthropic, OpenAI, Google Gemini, OpenRouter, NVIDIA NIM, OpenCode Zen, Groq, DeepSeek, Mistral AI, xAI (Grok), Ollama (Local), Together AI, Fireworks AI, Cohere, Perplexity Sonar, and an Offline Mock Engine.
 - 🛡️ **Three Permission Profiles**:
   - `Secure`: Full interlock — every modification, Python execution, or shell command prompts the user with diffs.
   - `Default`: Balanced — safe read/write operations auto-approved; destructive commands require approval.
@@ -32,6 +32,23 @@
   - `Super`: Autonomous multi-turn goal execution loop with self-verification and automatic error correction.
 - 🤖 **Subagent Orchestration**:
   - Dispatch specialized worker subagents (`researcher`, `planner`, `coder`, `tester`, `reviewer`) with isolated context windows to keep the parent context pristine.
+- 🐝 **Agent Swarms (`spawn_swarm`)**:
+  - Concurrent, coordinated multi-agent execution. The parent "main thread" hosts a shared message bus; subagents run in parallel threads and talk to each other through `swarm_send_message` / `swarm_read_messages`, then return a combined report with the full mailbox transcript.
+  - Enable with `harness config set swarm_enabled true` (always active in Super Mode; read-only research swarms allowed in Plan Mode).
+
+**👀 Watching subagents in real time:**
+
+While any subagent or swarm is running, every worker's activity is streamed live into the terminal (each line is prefixed with its agent id): 🐝 spawn, ▸ spoken output, 🔧 tool calls (with first-line results), 📨 swarm messages, and ⚡ completion with status + turn count.
+
+| Action | What it shows |
+|---|---|
+| Just watch | Live inline feed of what each subagent does as it happens |
+| **F2** (or **Ctrl+G**) | Open the **Agent Swarm Board** — overview table of every spawned agent (id, type, status, turns, last tool, task) |
+| `/agents` | Same as F2: open the board |
+| `/agent <id>` | Full drill-down panel for one agent: task, swarm messages, spoken output, every tool call + result, and its final report (including the `[Actions performed by this agent]` action log) |
+| **ESC** (or `/back`) | Return to the parent conversation view |
+
+When a delegation finishes, the report you receive already includes each agent's `[Actions performed by this agent]` log, so you see exactly what was done even if its final reply was terse.
 - ❓ **Model-Driven User Questions (`ask_user`)**:
   - When encountering architectural decisions or ambiguities, the model proactively prompts the user with formatted choices, recommended options, or write-ins.
 - 🐍 **Python Code Execution with AST Safety Inspection (`execute_python`)**:
@@ -43,12 +60,15 @@
 - 🧩 **Extensible Skills & 10 Built-in Skills**:
   - Discovers skills from `~/.harness/skills/` and `.harness/skills/`.
   - Includes specialized **`skill_creator`** (generates and installs new skills on user request) and **`mcp_integrator`** (connects and configures MCP servers on user request).
+- 🧠 **Continuous Learning & Self-Improvement**:
+  - The agent transparently learns across sessions: `learn_record` / `learn_recall` / `learn_promote` let it (and you, via `/learn`) persist reusable lessons, inject top matches into every system prompt, and promote matured lessons into real skills.
 - 🔌 **Model Context Protocol (MCP) Client**:
   - Supports `stdio` and `sse` JSON-RPC 2.0 servers configured in `mcp.json`.
 - 🎨 **7 Handcrafted Visual Themes**:
   - `cyberpunk` (default neon), `dracula`, `nord`, `monokai`, `catppuccin`, `matrix`, `minimal`.
 - 📦 **Smart Auto-Compaction**:
-  - Automatically summarizes history into structured memory checkpoints at 75% context threshold.
+  - Budget-driven, graduated context compaction. When usage crosses the warning threshold (default 75%), the sampler dials back pressure in three sweeps: oversized verbatim tool payloads are collapsed to head/tail digests, the oldest turn-groups are condensed into structured memory checkpoints down to the target budget (default 60%), and a single global checkpoint is emitted if the window is still hot. Recently-used turns stay verbatim, and undo/redo (`/checkpoint`) can restore the pre-compaction history.
+  - Uses the LLM itself to summarize when a provider is live (`compact_summary`), falling back to a heuristic extractor otherwise. A peak-hold hysteresis guard prevents re-firing every turn, and a mid-turn emergency trim collapses old blobs (never current-turn text) if usage races past the hard cap (~95%). Inspect everything with `/compact` and `/tokens`.
 
 ---
 
@@ -105,12 +125,13 @@ cat logs/error.log | harness "Diagnose this stack trace"
 | `/theme <name>` | Change visual theme (`cyberpunk`, `dracula`, `nord`, etc.) |
 | `/todo [list\|add\|clear]` | Manage active task items |
 | `/skills [reload]` | List or reload registered skills |
+| `/learn [list\|record\|forget\|promote\|on\|off]` | Manage persistent learned memories; promote proven lessons into skills |
 | `/mcp [list\|add]` | Manage Model Context Protocol (MCP) servers |
 | `/subagent <type> <prompt>` | Dispatch an isolated subagent worker |
-| `/compact` | Trigger manual context compaction |
+| `/compact` | Trigger manual context compaction; shows tactics used (payload truncations, groups summarized, checkpoint) plus ledger history |
 | `/session [list\|create\|delete\|rename\|fork\|resume]` | Full session lifecycle management |
 | `/checkpoint [list\|create\|undo\|redo]` | Manage checkpoints for undo/redo of file changes, messages, and state |
-| `/tokens` | Display token counts, context percentage, and RAM usage |
+| `/tokens` | Display token counts broken down by role (system/user/assistant/reasoning/tool), context percentage versus the target/cap budget, and RAM usage |
 | `/diff` | View uncommitted git diffs |
 | `/clear` | Clear terminal screen |
 | `/exit` | Exit Harness |
@@ -144,6 +165,12 @@ cat logs/error.log | harness "Diagnose this stack trace"
   "theme": "cyberpunk",
   "auto_compact": true,
   "compact_threshold": 0.75,
+  "compact_target_ratio": 0.6,
+  "compact_cap_ratio": 0.95,
+  "compact_max_message_tokens": 0,
+  "compact_preserve_turns": 4,
+  "compact_summary": "auto",
+  "swarm_enabled": false,
   "api_keys": {
     "anthropic": "sk-ant-...",
     "openai": "sk-proj-...",

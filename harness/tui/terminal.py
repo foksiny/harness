@@ -28,6 +28,7 @@ class TerminalRenderer:
         self._thinking_line_chars: int = 0
         self._md_buffer: str = ""
         self._md_live: Optional[Live] = None
+        self._subagent_open: Optional[str] = None
 
     def set_theme(self, theme_name: str):
         self.theme = get_theme(theme_name)
@@ -105,6 +106,7 @@ class TerminalRenderer:
             "[bold]/perm[/bold]: Permissions  |  "
             "[bold]/theme[/bold]: Themes  |  "
             "[bold]/models[/bold]: Model Picker  |  "
+            "[bold]F2[/bold]: Agents  |  "
             "[bold]/exit[/bold]: Quit[/dim]"
         )
         self.console.print(f" {footer_text}")
@@ -168,10 +170,146 @@ class TerminalRenderer:
             return self._md_buffer
         return "".join(lines[-limit:])
 
+    def _sub_id(self, agent_id: str) -> str:
+        return f"[bold {self.theme.secondary}]{agent_id}[/bold {self.theme.secondary}]"
+
+    def _truncate(self, text: str, limit: int = 160) -> str:
+        text = str(text)
+        return text if len(text) <= limit else text[:limit - 1] + "…"
+
+    def print_subagent_event(self, etype: str, data):
+        """Render a live subagent activity event, clearly scoped to its agent."""
+        if etype == "subagent_start":
+            self._finish_markdown()
+            self._finish_thinking()
+            self._subagent_open = data.get("agent_id")
+            aid = self._sub_id(data.get("agent_id", "?"))
+            task = self._truncate(data.get("task", ""), 120)
+            self.console.print(
+                f"\n🐝 Subagent {aid} ([dim]{data.get('agent_type', 'general')}[/dim]) spawned"
+                + (f" — [dim]{task}[/dim]" if task else "")
+            )
+
+        elif etype == "subagent_text_delta":
+            aid = self._sub_id(data.get("agent_id", "?"))
+            for line in str(data.get("text", "")).rstrip().split("\n"):
+                stripped = line.strip()
+                if not stripped:
+                    self.console.print()
+                    continue
+                if stripped.startswith("```") or stripped.startswith("#"):
+                    self.console.print(f"   {aid} [dim]▸[/dim] [bold]{self._truncate(stripped, 200)}[/bold]")
+                else:
+                    self.console.print(f"   {aid} [dim]▸[/dim] {self._truncate(stripped, 500)}")
+
+        elif etype == "subagent_tool":
+            aid = self._sub_id(data.get("agent_id", "?"))
+            tname = data.get("tool", "tool")
+            args = self._truncate(str(data.get("args", "")), 100)
+            result = self._truncate(str(data.get("result", "")), 120)
+            self.console.print(f"   {aid} [dim]└─[/dim] 🔧 [bold]{tname}[/bold] [dim]{args}[/dim]")
+            if result:
+                first = result.split("\n")[0]
+                self.console.print(f"   {aid} [dim]   ✔[/dim] [dim]{first}[/dim]")
+
+        elif etype == "subagent_message":
+            aid = self._sub_id(data.get("agent_id", "?"))
+            sender = data.get("sender", data.get("agent_id", "?"))
+            recipient = data.get("recipient", "all")
+            target = "ALL" if recipient == "all" else f"→ {recipient}"
+            body = self._truncate(str(data.get("message", "")), 200)
+            self.console.print(f"   {aid} [dim]└─[/dim] 📨 {sender} {target}: [bold]{body}[/bold]")
+
+        elif etype == "subagent_end":
+            aid = self._sub_id(data.get("agent_id", "?"))
+            status = data.get("status", "completed")
+            turns = data.get("turns", 0)
+            status_color = "green" if status == "completed" else "red"
+            out = self._truncate(str(data.get("output", "")), 300)
+            self.console.print(f"   {aid} ⚡ [bold {status_color}]{status.upper()}[/bold {status_color}] in [bold]{turns}[/bold] turns")
+            if out:
+                after_actions = out.split("[Actions performed by this agent]")
+                body = after_actions[0].strip()
+                if body:
+                    for line in body.split("\n")[:8]:
+                        self.console.print(f"   {aid} [dim]↓[/dim] [dim]{self._truncate(line, 300)}[/dim]")
+                if len(after_actions) > 1 and after_actions[1].strip():
+                    self.console.print(f"   {aid} [dim]↳ [/dim][bold]action log:[/bold] {self._truncate(after_actions[1].strip(), 400)}")
+            self._subagent_open = None
+            self.console.print()
+
+    def print_subagent_board(self, records):
+        """Render an overview table of all subagents/spawned agents."""
+        if not records:
+            self.console.print(f"[{self.theme.muted}]No subagents have been spawned yet.[/{self.theme.muted}]")
+            self.console.print("[dim]Run a task that delegates work, or use /subagent <type> <prompt>, or press F2.[/dim]\n")
+            return
+        table = Table(title="🐝 Agent Swarm Board", border_style=self.theme.border)
+        table.add_column("ID", style=f"bold {self.theme.secondary}")
+        table.add_column("Type", style="white")
+        table.add_column("Status", justify="center")
+        table.add_column("Turns", justify="right")
+        table.add_column("Last Tool", style="dim")
+        table.add_column("Task", style="dim")
+
+        for r in records:
+            status_color = "green" if r.status == "completed" else ("red" if r.status in ("failed", "timeout") else "yellow")
+            table.add_row(
+                r.agent_id,
+                r.agent_type,
+                f"[{status_color}]{r.status.upper()}[/{status_color}]",
+                str(r.turns),
+                r.last_tool() or "-",
+                self._truncate(r.task[:80], 80),
+            )
+        self.console.print(table)
+        self.console.print("[dim]Detail: /agent <id>  |  Return to parent: ESC (or /back)[/dim]\n")
+
+    def print_subagent_detail(self, record):
+        """Render the full activity log for a single subagent."""
+        if record is None:
+            self.console.print(f"[{self.theme.error}]Unknown agent id.[/{self.theme.error}]")
+            return
+        lines = [
+            f"🐝 [bold {self.theme.secondary}]{record.agent_id}[/bold {self.theme.secondary}] "
+            f"([dim]{record.agent_type}[/dim]) — [bold]{record.status.upper()}[/bold] · {record.turns} turns",
+            f"[dim]Task: {self._truncate(record.task, 300)}[/dim]",
+        ]
+        if record.messages:
+            lines.append("")
+            lines.append("[bold]Swarm messages:[/bold]")
+            for m in record.messages:
+                target = "ALL" if m.get("recipient") == "all" else f"→ {m.get('recipient')}"
+                lines.append(f"  📨 {m.get('sender')} {target}: {self._truncate(m.get('body', ''), 300)}")
+        if record.text_log:
+            lines.append("")
+            lines.append("[bold]Spoken output:[/bold]")
+            for t in record.text_log:
+                text = str(t).strip()
+                if text:
+                    lines.append(f"  ▸ {self._truncate(text, 600)}")
+        if record.tool_calls:
+            lines.append("")
+            lines.append("[bold]Tool calls:[/bold]")
+            for tc in record.tool_calls:
+                lines.append(f"  🔧 [bold]{tc.get('tool')}[/bold] [dim]{self._truncate(tc.get('args', ''), 120)}[/dim]")
+                if tc.get("result"):
+                    first = str(tc.get("result", "")).split("\n")[0]
+                    lines.append(f"     ✔ [dim]{self._truncate(first, 200)}[/dim]")
+        if record.output:
+            lines.append("")
+            lines.append("[bold]Final report:[/bold]")
+            lines.append(record.output[:4000])
+        self.console.print(Panel("\n".join(lines), border_style=self.theme.border, title=f"Agent {record.agent_id}", expand=False))
+
     def render_agent_event(self, ev):
         """Render streaming agent events with live timing."""
         etype = ev.type
         data = ev.data
+
+        if etype in ("subagent_start", "subagent_text_delta", "subagent_tool", "subagent_message", "subagent_end"):
+            self.print_subagent_event(etype, data)
+            return
 
         if etype == "reasoning_delta":
             text = str(data)
@@ -240,9 +378,19 @@ class TerminalRenderer:
             after = data.get("after_tokens", 0)
             saved = data.get("saved_tokens", 0)
             pct = data.get("reduction_pct", 0)
+            tactics = data.get("tactics", {}) or {}
+            trigger = data.get("trigger", "turn boundary")
+            parts = []
+            if tactics.get("payloads_truncated"):
+                parts.append(f"collapsed {tactics['payloads_truncated']} oversized payloads")
+            if tactics.get("groups_summarized"):
+                parts.append(f"summarized {tactics['groups_summarized']} old turns")
+            if tactics.get("checkpointed"):
+                parts.append("consolidated checkpoint")
+            tactic_str = " · ".join(parts) or "no compression needed"
             self.console.print(
-                f"\n[{self.theme.accent}]📦 Context Auto-Compacted:[/{self.theme.accent}] "
-                f"{before:,} -> {after:,} tokens ([bold green]-{saved:,} tokens / {pct}%[/bold green])\n"
+                f"\n[{self.theme.accent}]📦 Context Auto-Compacted ([{self.theme.secondary}]{trigger}[/{self.theme.secondary}]):[/{self.theme.accent}] "
+                f"{before:,} -> {after:,} tokens ([bold green]-{saved:,} tokens / {pct}%[/bold green]) · {tactic_str}\n"
             )
 
         elif etype == "step_end" and data.get("complete"):

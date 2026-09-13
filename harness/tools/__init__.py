@@ -11,14 +11,17 @@ from harness.tools.web_search import ExaSearchTool
 from harness.tools.questions import AskUserTool
 from harness.tools.todo_tools import TodoCreateTool, TodoUpdateTool, TodoListTool
 from harness.tools.subagent_tools import SpawnSubagentTool
+from harness.tools.swarm_tools import SpawnSwarmTool, SwarmSendMessageTool, SwarmReadMessagesTool
 from harness.tools.git_tools import GitStatusTool, GitDiffTool
 from harness.tools.skill_tools import ListSkillsTool, ReadSkillTool
 from harness.tools.finish import FinishTool
+from harness.tools.learning_tools import LearnRecordTool, LearnRecallTool, LearnPromoteTool
 from harness.skills.loader import SkillsManager
 from harness.core.modes import Mode, is_tool_allowed_in_mode
 from harness.core.permissions import PermissionManager
 from harness.core.todo import TodoManager
 from harness.core.subagents import SubagentOrchestrator
+from harness.core.learning import LearningManager
 
 class ToolRegistry:
     """Manages available tools, schema serialization, and safe invocation."""
@@ -30,11 +33,15 @@ class ToolRegistry:
         subagent_orchestrator: Optional[SubagentOrchestrator] = None,
         skills_manager: Optional[SkillsManager] = None,
         ask_user_handler: Optional[Any] = None,
+        learning_manager: Optional[LearningManager] = None,
+        learning_enabled: bool = True,
     ):
         self.permission_manager = permission_manager or PermissionManager()
         self.todo_manager = todo_manager or TodoManager()
         self.subagent_orchestrator = subagent_orchestrator or SubagentOrchestrator()
         self.skills_manager = skills_manager or SkillsManager()
+        self.learning_manager = learning_manager or LearningManager()
+        self.learning_enabled = learning_enabled
         self.tools: Dict[str, Tool] = {}
         self._register_default_tools(ask_user_handler)
 
@@ -65,6 +72,11 @@ class ToolRegistry:
         # Subagents
         self.register(SpawnSubagentTool(self.subagent_orchestrator))
 
+        # Agent swarms (concurrent coordinated subagents)
+        self.register(SpawnSwarmTool(self.subagent_orchestrator))
+        self.register(SwarmSendMessageTool(self.subagent_orchestrator))
+        self.register(SwarmReadMessagesTool(self.subagent_orchestrator))
+
         # Git
         self.register(GitStatusTool())
         self.register(GitDiffTool())
@@ -75,6 +87,12 @@ class ToolRegistry:
 
         # Task control
         self.register(FinishTool())
+
+        # Learning / self-improvement (lazy: manager loads memory from disk on first use)
+        if self.learning_enabled:
+            self.register(LearnRecordTool(self.learning_manager))
+            self.register(LearnRecallTool(self.learning_manager))
+            self.register(LearnPromoteTool(self.learning_manager))
 
     def register(self, tool: Tool) -> None:
         self.tools[tool.name] = tool

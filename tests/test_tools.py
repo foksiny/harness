@@ -83,6 +83,19 @@ class TestTools(unittest.TestCase):
         self.assertIn("Harness Testing", res)
         self.assertIn("code 0", res)
 
+    def test_run_command_delivers_full_output_without_truncation(self):
+        # Agent-facing results must NOT be truncated in the tool layer — display
+        # truncation happens only in the TUI renderer.
+        pm = PermissionManager(PermissionLevel.FULL)
+        cmd_tool = RunCommandTool(pm)
+        res = cmd_tool.execute(
+            "for i in $(seq 1 5000); do printf 'L%05d_abcdefghij\\n' $i; done"
+        )
+        # Old cap was 15000 chars; full output must be preserved for the agent.
+        self.assertGreater(len(res), 15000)
+        self.assertIn("L00001_abcdefghij", res)
+        self.assertIn("L05000_abcdefghij", res)
+
     def test_todo_lifecycle(self):
         mgr = TodoManager()
         c_tool = TodoCreateTool(mgr)

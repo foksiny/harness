@@ -56,6 +56,7 @@ class TestFinishTool(unittest.TestCase):
     def test_finish_stops_iteration_and_delivers_summary(self):
         cfg = HarnessConfig()
         cfg.provider = "mock"
+        cfg.learning_enabled = False
         script = [[
             LLMChunk(tool_calls=[ToolCallDelta(
                 index=0,
@@ -89,6 +90,7 @@ class TestFinishTool(unittest.TestCase):
     def test_empty_after_work_recovers_final_text_gracefully(self):
         cfg = HarnessConfig()
         cfg.provider = "mock"
+        cfg.learning_enabled = False
         script = [
             [
                 LLMChunk(delta_text="Progress note: implementation complete.", finish_reason="stop"),

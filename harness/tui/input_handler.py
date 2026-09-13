@@ -1,16 +1,29 @@
 """
 Input Handler for Harness TUI.
-Supports autocompletion, command history, and graceful prompt_toolkit / readline fallback.
+Supports autocompletion, command history, view keybinds (F2 opens the agents
+board, ESC returns to the parent view), and graceful prompt_toolkit / readline fallback.
+When prompt_toolkit is not installed the fallback uses a raw terminal line reader so
+keybinds still work instead of leaking escape sequences into the buffer.
 """
+import sys
 from typing import List, Optional
 
 SLASH_COMMANDS = [
     "/help", "/goal", "/mode", "/perm", "/theme",
     "/provider", "/model", "/models", "/config", "/keys", "/setup",
     "/effort", "/todo", "/skills", "/mcp",
-    "/subagent", "/compact", "/session", "/checkpoint", "/tokens", "/diff", "/clear",
-    "/exit", "/quit"
+    "/subagent", "/agents", "/agent", "/back",
+    "/compact", "/session", "/checkpoint", "/tokens", "/diff", "/clear",
+    "/learn", "/exit", "/quit"
 ]
+
+VIEW_PARENT = "parent"
+VIEW_AGENTS = "agents"
+
+# Sentinel values returned by get_input() when a keybind is pressed.
+SENTINEL_OPEN_AGENTS = "\x00__OPEN_AGENTS__"
+SENTINEL_BACK = "\x00__BACK__"
+
 
 class InputHandler:
     """Provides interactive prompt with auto-completion and command history."""
@@ -18,14 +31,17 @@ class InputHandler:
     def __init__(self):
         self._has_prompt_toolkit = False
         self._pt_session = None
+        self._pt_history = None
+        self._pt_completer = None
 
         try:
             from prompt_toolkit import PromptSession
             from prompt_toolkit.completion import WordCompleter
             from prompt_toolkit.history import InMemoryHistory
 
-            completer = WordCompleter(SLASH_COMMANDS, sentence=True)
-            self._pt_session = PromptSession(completer=completer, history=InMemoryHistory())
+            self._pt_completer = WordCompleter(SLASH_COMMANDS, sentence=True)
+            self._pt_history = InMemoryHistory()
+            self._pt_session = PromptSession(completer=self._pt_completer, history=self._pt_history)
             self._has_prompt_toolkit = True
         except ImportError:
             # Setup standard readline autocompletion
@@ -40,16 +56,160 @@ class InputHandler:
             except Exception:
                 pass
 
-    def get_input(self, prompt_text: str = "Harness> ") -> str:
-        """Read a line of input from user."""
-        if self._has_prompt_toolkit and self._pt_session:
-            try:
-                return self._pt_session.prompt(prompt_text).strip()
-            except (EOFError, KeyboardInterrupt):
-                return "/exit"
+    def _create_session(self, view: str):
+        """Build a PromptSession with the keybindings appropriate to the active view."""
+        from prompt_toolkit import PromptSession, keys
+        from prompt_toolkit.key_binding import KeyBindings
 
-        # Standard fallback
+        kb = KeyBindings()
+        if view == VIEW_PARENT:
+            @kb.add(keys.Keys.F2)
+            def _open_agents(event):
+                event.app.exit(result=SENTINEL_OPEN_AGENTS)
+
+            @kb.add("c-g")
+            def _open_agents_alt(event):
+                event.app.exit(result=SENTINEL_OPEN_AGENTS)
+        else:
+            @kb.add(keys.Keys.Escape)
+            def _back(event):
+                event.app.exit(result=SENTINEL_BACK)
+
+        return PromptSession(
+            completer=self._pt_completer,
+            history=self._pt_history,
+            key_bindings=kb,
+        )
+
+    def get_input(self, prompt_text: str = "Harness> ", view: str = VIEW_PARENT) -> str:
+        """Read a line of input from user.
+
+        In the agent-swarm board view, ESC returns to the parent view; in the
+        parent view, F2 (or Ctrl+G) opens the agents board.
+        """
+        if self._has_prompt_toolkit:
+            try:
+                session = self._create_session(view)
+                result = session.prompt(prompt_text).strip()
+                if result in (SENTINEL_OPEN_AGENTS, SENTINEL_BACK):
+                    return result
+                return result
+            except (EOFError, KeyboardInterrupt):
+                return SENTINEL_BACK if view == VIEW_AGENTS else "/exit"
+
+        # Fallback without prompt_toolkit: raw terminal reader so keybinds work,
+        # falling back to plain input() when stdin is not an interactive TTY.
         try:
+            if sys.stdin.isatty():
+                try:
+                    return self._raw_line(prompt_text, view)
+                except (EOFError, KeyboardInterrupt):
+                    return SENTINEL_BACK if view == VIEW_AGENTS else "/exit"
             return input(prompt_text).strip()
         except (EOFError, KeyboardInterrupt):
-            return "/exit"
+            return SENTINEL_BACK if view == VIEW_AGENTS else "/exit"
+
+    def classify_keypress(self, raw: bytes, view: str = VIEW_PARENT) -> Optional[str]:
+        """Classify a partial/complete keypress buffer.
+
+        Returns:
+          - a sentinel string when the keypress is a complete keybind,
+          - "" when the keypress is complete but not a keybind (swallow it),
+          - None when more bytes are needed.
+        """
+        if raw == b"\x07":
+            return SENTINEL_OPEN_AGENTS
+        if raw == b"\x03":
+            raise KeyboardInterrupt
+        if raw == b"\x04":
+            raise EOFError
+        if raw.startswith(b"\x1b"):
+            return self._classify_escape(raw)
+        return None
+
+    def _classify_escape(self, seq: bytes) -> Optional[str]:
+        """Classify an escape sequence; '' swallows a complete non-keybind sequence."""
+        if seq == b"\x1b":
+            return None
+        if seq in (b"\x1b[12~", b"\x1bOQ", b"\x1b[1;2Q"):
+            return SENTINEL_OPEN_AGENTS
+        if seq.startswith(b"\x1b["):
+            if len(seq) == 2:
+                return None
+            tail = seq[2:]
+            if tail.isdigit() or tail.endswith(b";"):
+                return None
+            if tail[-1] in range(0x40, 0x7F):
+                return ""
+            return None
+        if seq.startswith(b"\x1bO"):
+            return None if len(seq) == 2 else ""
+        if len(seq) > 6:
+            return ""
+        return None
+
+    def _raw_line(self, prompt_text: str, view: str) -> str:
+        """Read one line from a raw-mode TTY so keybinds never leak into the buffer."""
+        import os
+        import select
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+        except termios.error:
+            termios.tcsetattr(fd, termios.TCSAFLUSH, old)
+            return input(prompt_text).strip()
+
+        out = sys.stdout.fileno()
+        os.write(out, f"\r\x1b[K{prompt_text}".encode())
+
+        buf = ""
+        seq = b""
+        try:
+            while True:
+                if seq:
+                    r, _, _ = select.select([fd], [], [], 0.05)
+                    if not r:
+                        seq = b""
+                        if view == VIEW_AGENTS:
+                            os.write(out, b"\r\n")
+                            return SENTINEL_BACK
+                        continue
+                    seq += os.read(fd, 1)
+                    decision = self.classify_keypress(seq, view)
+                    if decision == SENTINEL_OPEN_AGENTS:
+                        os.write(out, b"\r\n")
+                        return SENTINEL_OPEN_AGENTS
+                    if decision == "":
+                        seq = b""
+                    continue
+
+                b = os.read(fd, 1)
+                if b == b"\x1b":
+                    seq = b"\x1b"
+                    continue
+                if b == b"\x07":
+                    os.write(out, b"\r\n")
+                    return SENTINEL_OPEN_AGENTS
+                if b == b"\x03":
+                    raise KeyboardInterrupt
+                if b == b"\x04":
+                    raise EOFError
+                if b in (b"\r", b"\n"):
+                    os.write(out, b"\r\n")
+                    return buf
+                if b in (b"\x7f", b"\x08"):
+                    if buf:
+                        buf = buf[:-1]
+                        os.write(out, b"\b \b")
+                    continue
+                if b < b"\x20" or b >= b"\x80":
+                    continue
+                ch = b.decode("utf-8", errors="ignore")
+                buf += ch
+                os.write(out, ch.encode())
+        finally:
+            termios.tcsetattr(fd, termios.TCSAFLUSH, old)

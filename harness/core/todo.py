@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import List, Optional, Dict, Any
 import time
+import threading
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
@@ -41,52 +42,82 @@ class TodoManager:
     def __init__(self):
         self.tasks: List[TaskItem] = []
         self._next_id: int = 1
+        self._lock = threading.Lock()  # Guards mutations from concurrent swarm workers
 
     def add_task(self, title: str, notes: Optional[str] = None) -> TaskItem:
-        task = TaskItem(id=self._next_id, title=title.strip(), notes=notes)
-        self._next_id += 1
-        self.tasks.append(task)
-        return task
+        with self._lock:
+            task = TaskItem(id=self._next_id, title=title.strip(), notes=notes)
+            self._next_id += 1
+            self.tasks.append(task)
+            return task
 
     def update_task(self, task_id: int, status: TaskStatus, notes: Optional[str] = None) -> Optional[TaskItem]:
-        for task in self.tasks:
-            if task.id == task_id:
-                task.status = status
-                task.updated_at = time.time()
-                if notes:
-                    task.notes = notes
-                return task
-        return None
+        with self._lock:
+            for task in self.tasks:
+                if task.id == task_id:
+                    task.status = status
+                    task.updated_at = time.time()
+                    if notes:
+                        task.notes = notes
+                    return task
+            return None
 
     def get_task(self, task_id: int) -> Optional[TaskItem]:
-        for task in self.tasks:
-            if task.id == task_id:
-                return task
-        return None
+        with self._lock:
+            for task in self.tasks:
+                if task.id == task_id:
+                    return task
+            return None
+
+    def remove_task(self, task_id: int) -> Optional[TaskItem]:
+        """Remove and return the task with the given id (used by checkpoint undo/redo)."""
+        with self._lock:
+            for i, task in enumerate(self.tasks):
+                if task.id == task_id:
+                    return self.tasks.pop(i)
+            return None
+
+    def restore_task(self, task: TaskItem) -> None:
+        """Restore/replace a task by id (used by checkpoint undo/redo)."""
+        with self._lock:
+            for i, t in enumerate(self.tasks):
+                if t.id == task.id:
+                    self.tasks[i] = task
+                    if task.id >= self._next_id:
+                        self._next_id = task.id + 1
+                    return
+            self.tasks.append(task)
+            if task.id >= self._next_id:
+                self._next_id = task.id + 1
 
     def list_tasks(self) -> List[TaskItem]:
-        return list(self.tasks)
+        with self._lock:
+            return list(self.tasks)
 
     def clear(self) -> None:
-        self.tasks.clear()
-        self._next_id = 1
+        with self._lock:
+            self.tasks.clear()
+            self._next_id = 1
 
     def summary(self) -> str:
         """One-line summary for status bar."""
-        if not self.tasks:
-            return "No tasks"
-        completed = sum(1 for t in self.tasks if t.status == TaskStatus.COMPLETED)
-        in_prog = sum(1 for t in self.tasks if t.status == TaskStatus.IN_PROGRESS)
-        total = len(self.tasks)
+        with self._lock:
+            if not self.tasks:
+                return "No tasks"
+            completed = sum(1 for t in self.tasks if t.status == TaskStatus.COMPLETED)
+            in_prog = sum(1 for t in self.tasks if t.status == TaskStatus.IN_PROGRESS)
+            total = len(self.tasks)
         pct = int((completed / total) * 100) if total > 0 else 0
         return f"{completed}/{total} done ({pct}%)" + (f" | ⚙️ {in_prog} running" if in_prog > 0 else "")
 
     def format_markdown(self) -> str:
         """Formatted markdown task list for prompts and inspection."""
-        if not self.tasks:
+        with self._lock:
+            tasks = list(self.tasks)
+        if not tasks:
             return "No active tasks recorded."
         lines = ["### Active Tasks:"]
-        for t in self.tasks:
+        for t in tasks:
             icon = {
                 TaskStatus.PENDING: "[ ]",
                 TaskStatus.IN_PROGRESS: "[>]",
@@ -101,11 +132,13 @@ class TodoManager:
         return "\n".join(lines)
 
     def to_list(self) -> List[Dict[str, Any]]:
-        return [t.to_dict() for t in self.tasks]
+        with self._lock:
+            return [t.to_dict() for t in self.tasks]
 
     def load_list(self, data: List[Dict[str, Any]]) -> None:
-        self.tasks = [TaskItem.from_dict(d) for d in data]
-        if self.tasks:
-            self._next_id = max(t.id for t in self.tasks) + 1
-        else:
-            self._next_id = 1
+        with self._lock:
+            self.tasks = [TaskItem.from_dict(d) for d in data]
+            if self.tasks:
+                self._next_id = max(t.id for t in self.tasks) + 1
+            else:
+                self._next_id = 1

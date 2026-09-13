@@ -10,10 +10,11 @@ from harness.core.modes import Mode
 from harness.core.permissions import PermissionManager, PermissionLevel
 from harness.core.prompt import SystemPromptBuilder
 from harness.core.compaction import Compactor, TokenStats
-from harness.core.todo import TodoManager
+from harness.core.todo import TodoManager, TaskItem
 from harness.core.session import Session, SessionManager
 from harness.core.checkpoints import CheckpointManager, get_checkpoint_manager, set_checkpoint_manager
 from harness.core.subagents import SubagentOrchestrator
+from harness.core.learning import LearningManager
 from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta
 from harness.providers import get_provider
 from harness.tools import ToolRegistry
@@ -35,6 +36,7 @@ class HarnessAgent:
         session: Optional[Session] = None,
         event_callback: Optional[Callable[[AgentEvent], None]] = None,
         ask_user_handler: Optional[Callable] = None,
+        learning_manager: Optional[LearningManager] = None,
     ):
         self.config = config
         self.mode = Mode.from_string(config.mode)
@@ -42,19 +44,34 @@ class HarnessAgent:
         self.todo_manager = TodoManager()
         self.subagent_orchestrator = SubagentOrchestrator(self._run_subagent_task)
         self.skills_manager = SkillsManager()
+        self.learning_manager = learning_manager if learning_manager is not None else LearningManager()
+        # Keep promoted lessons immediately visible to the skill catalog.
+        self.learning_manager.set_reload_hook(self.skills_manager.reload)
         self.tool_registry = ToolRegistry(
             permission_manager=self.permission_manager,
             todo_manager=self.todo_manager,
             subagent_orchestrator=self.subagent_orchestrator,
             skills_manager=self.skills_manager,
             ask_user_handler=ask_user_handler,
+            learning_manager=self.learning_manager,
+            learning_enabled=config.learning_enabled,
         )
+        # Debounce heuristic auto-learning so at most one learned lesson is
+        # captured per session.
+        self._auto_learned_session = None
         self.mcp_manager = MCPManager(self.tool_registry)
         self.mcp_manager.load_and_connect()
 
         # Initialize checkpoint manager
         self.checkpoint_manager = get_checkpoint_manager()
         set_checkpoint_manager(self.checkpoint_manager)
+        # Wire undo/redo application so /checkpoint undo|redo materializes the
+        # recorded changes against the live session, todos, and filesystem.
+        self.checkpoint_manager.set_applicators(
+            apply_file_change=self._checkpoint_apply_file,
+            apply_message_change=self._checkpoint_apply_message,
+            apply_state_change=self._checkpoint_apply_state,
+        )
 
         self.provider: BaseProvider = get_provider(config.provider, config)
         self.session_manager = SessionManager()
@@ -62,10 +79,29 @@ class HarnessAgent:
 
         initial_model = self.session.model if self.session is not None else config.model
         model_spec = self.provider.get_model_spec(initial_model)
-        self.compactor = Compactor(model_spec.context_window, config.compact_threshold)
+        self.compactor = Compactor(
+            context_window=model_spec.context_window,
+            threshold_ratio=config.compact_threshold,
+            target_ratio=config.compact_target_ratio,
+            cap_ratio=config.compact_cap_ratio,
+            preserve_min_turns=config.compact_preserve_turns,
+            max_message_tokens=config.compact_max_message_tokens,
+            summarize_fn=self._summarize_block,
+            summary_mode=config.compact_summary,
+        )
         self.event_callback = event_callback
         self.prompt_builder = SystemPromptBuilder(self.mode, self.permission_manager.level)
         self.is_running = False
+
+        # Wire concurrent swarm workers: each worker thread builds its own provider
+        # for the currently selected provider/model, propagates the parent's mode so
+        # plan-mode restrictions are enforced, and never blocks on approval prompts.
+        self.subagent_orchestrator.set_swarm_runtime(
+            provider_factory=lambda: get_provider(self.provider.name, self.config),
+            model=initial_model,
+            parent_mode=self.mode,
+            interactive_deny_fn=lambda deny: setattr(self.permission_manager, "interactive_deny", deny),
+        )
 
     def emit(self, event_type: str, data: Any = None):
         if self.event_callback:
@@ -88,6 +124,7 @@ class HarnessAgent:
         self.prompt_builder.mode = mode
         if self.session is not None:
             self.session.mode = mode.value
+        self.subagent_orchestrator.parent_mode = mode
         self.emit("mode_change", mode.value)
 
     def set_permission(self, perm: PermissionLevel):
@@ -103,15 +140,50 @@ class HarnessAgent:
         if self.session is not None:
             self.session.provider = provider_name
             self.session.model = new_model
+        self.subagent_orchestrator.model = new_model
         model_spec = self.provider.get_model_spec(new_model)
         self.compactor.context_window = model_spec.context_window
+        if self.config.compact_max_message_tokens == 0:
+            self.compactor.max_message_tokens = int(model_spec.context_window * 0.15)
         self.emit("provider_change", {"provider": provider_name, "model": new_model})
 
-    def _run_subagent_task(self, system_prompt: str, prompt: str, allowed_tools: List[str], max_turns: int) -> tuple[str, int]:
-        """Subagent runner executing with isolated conversation context."""
+    def _run_subagent_task(
+        self,
+        system_prompt: str,
+        prompt: str,
+        allowed_tools: List[str],
+        max_turns: int,
+        provider_factory: Optional[Callable[[], BaseProvider]] = None,
+        model: Optional[str] = None,
+        mode: Optional[Mode] = None,
+        agent_id: Optional[str] = None,
+        agent_type: Optional[str] = None,
+    ) -> tuple[str, int]:
+        """Subagent runner executing with isolated conversation context.
+
+        When dispatched by a swarm worker thread, ``provider_factory`` supplies a
+        fresh provider instance so concurrent threads never share stream state, and
+        ``mode`` propagates the parent's operational restrictions into worker tools.
+
+        Every step is recorded on the orchestrator (for live TUI visibility) and the
+        returned report always includes a compact action log, so the parent thread
+        can see exactly what the worker did even when its final reply was terse.
+        """
+        aid = agent_id or f"{agent_type or 'general'}_1"
         sub_messages = [{"role": "user", "content": prompt}]
         accumulated_output = ""
+        action_log: List[str] = []
         turns = 0
+
+        provider = provider_factory() if provider_factory else self.provider
+        effective_model = model or (self.session.model if self.session is not None else self.config.model)
+        exec_mode = mode if mode is not None else Mode.BUILD
+
+        def _finish_report(summary: str) -> tuple[str, int]:
+            report = summary.strip()
+            if action_log:
+                report += "\n\n[Actions performed by this agent]\n" + "\n".join(action_log)
+            return report, turns
 
         for _ in range(max_turns):
             turns += 1
@@ -125,9 +197,9 @@ class HarnessAgent:
                 if t:
                     schemas.append(t.to_openai_schema())
 
-            for chunk in self.provider.stream_chat(
+            for chunk in provider.stream_chat(
                 messages=sub_messages,
-                model=self.session.model,
+                model=effective_model,
                 thinking_effort="low",
                 tools=schemas if schemas else None,
                 system_prompt=system_prompt,
@@ -144,6 +216,7 @@ class HarnessAgent:
                         tool_calls_acc[idx]["arguments"] += tc.arguments_delta
 
             if text_acc:
+                self.subagent_orchestrator.subagent_text(aid, text_acc)
                 accumulated_output += text_acc + "\n"
 
             if not tool_calls_acc:
@@ -164,15 +237,133 @@ class HarnessAgent:
                         fargs = {}
                     summary = str(fargs.get("summary", "")).strip() or "Task complete."
                     accumulated_output += summary + "\n"
-                    return accumulated_output.strip(), turns
+                    return _finish_report(summary)
                 try:
                     args = json.loads(v["arguments"]) if v["arguments"] else {}
                 except Exception:
                     args = {}
-                res = self.tool_registry.execute(tname, args, Mode.BUILD)
+                res = self.tool_registry.execute(tname, args, exec_mode)
+
+                # Live visibility + durable record of everything the worker does.
+                if tname == "swarm_send_message":
+                    self.subagent_orchestrator.subagent_message(
+                        aid, aid, str(args.get("recipient", "all")), str(args.get("message", ""))
+                    )
+                self.subagent_orchestrator.subagent_tool(aid, tname, str(args)[:200], str(res)[:200])
+                first_line = (str(res).strip().split("\n")[0] if str(res).strip() else "")[:200]
+                action_log.append(f"- {tname} {str(args)[:160]}" + (f" => {first_line}" if first_line else ""))
+
                 sub_messages.append({"role": "tool", "tool_call_id": v["id"], "name": tname, "content": res})
 
-        return accumulated_output.strip(), turns
+        return _finish_report(accumulated_output)
+
+    def _checkpoint_apply_file(self, fc, undo: bool) -> bool:
+        """Materialize a file change against the filesystem (undo/redo)."""
+        from pathlib import Path
+        try:
+            p = Path(fc.path)
+            if undo:
+                if fc.action == "create":
+                    # Reverse of create is delete
+                    if p.exists():
+                        p.unlink()
+                        return True
+                    return False
+                if fc.action == "edit":
+                    # Reverse of edit is restore previous content
+                    p.write_text(fc.old_content or "", encoding="utf-8")
+                    return True
+                if fc.action == "delete":
+                    # Reverse of delete is recreate the file
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(fc.old_content or "", encoding="utf-8")
+                    return True
+            else:
+                if fc.action == "create":
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(fc.new_content or "", encoding="utf-8")
+                    return True
+                if fc.action == "edit":
+                    p.write_text(fc.new_content or "", encoding="utf-8")
+                    return True
+                if fc.action == "delete":
+                    if p.exists():
+                        p.unlink()
+                        return True
+                    return False
+        except Exception:
+            return False
+        return False
+
+    def _checkpoint_apply_message(self, mc, undo: bool) -> bool:
+        """Materialize a message history change against the live session (undo/redo)."""
+        if self.session is None:
+            return False
+        msgs = self.session.messages
+        try:
+            if mc.action == "append":
+                if undo:
+                    idx = mc.index
+                    if idx < 0 or idx >= len(msgs) or msgs[idx] != mc.new_message:
+                        return False
+                    del msgs[idx]
+                    return True
+                msgs.insert(min(mc.index, len(msgs)), mc.new_message)
+                return True
+            if mc.action == "truncate":
+                if undo:
+                    # Restore the compacted messages back into the history.
+                    idx = min(mc.index, len(msgs))
+                    msgs[idx:idx] = list(mc.removed_messages)
+                    return True
+                if mc.index + mc.count > len(msgs):
+                    return False
+                del msgs[mc.index:mc.index + mc.count]
+                return True
+            if mc.action == "replace":
+                if mc.index < 0 or mc.index >= len(msgs):
+                    return False
+                msgs[mc.index] = mc.old_message if undo else mc.new_message
+                return True
+            if mc.action == "span_replace":
+                # Swap a whole contiguous span (graduated compaction / emergency trim).
+                # Undo starts from the applied (new) span; redo starts from the old one.
+                expected = mc.new_messages if undo else mc.old_messages
+                replaced = mc.old_messages if undo else mc.new_messages
+                if msgs[mc.index:mc.index + len(expected)] != expected:
+                    return False
+                msgs[mc.index:mc.index + len(expected)] = list(replaced)
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _record_message_span_change(self, old_messages: List[Dict[str, Any]], new_messages: List[Dict[str, Any]]):
+        """Record a graduated compaction / emergency-trim as one atomic, undoable span swap."""
+        self.checkpoint_manager.record_message_replace_span(0, old_messages, new_messages)
+
+    def _checkpoint_apply_state(self, sc, undo: bool) -> bool:
+        """Materialize a state change (e.g. todos) against live agent state (undo/redo)."""
+        if not sc.key.startswith("todo."):
+            # Unknown state keys — nothing to materialize; treat as applied.
+            return True
+        try:
+            task_id = int(sc.key.split(".", 1)[1])
+        except (ValueError, IndexError):
+            return False
+        value = sc.old_value if undo else sc.new_value
+
+        # Reverting a todo create removes the task; reverting a delete re-creates it.
+        if undo and sc.action == "create":
+            self.todo_manager.remove_task(task_id)
+            return True
+        if value is None:
+            self.todo_manager.remove_task(task_id)
+            return True
+        data = dict(value or {})
+        data["id"] = task_id
+        self.todo_manager.restore_task(TaskItem.from_dict(data))
+        return True
 
     def step(self, user_prompt: Optional[str] = None) -> Generator[AgentEvent, None, None]:
         """Execute a single or multi-step agent turn, yielding live events."""
@@ -211,19 +402,15 @@ class HarnessAgent:
             yield AgentEvent("tool_call_start", {"name": "list_skills", "arguments": {}})
             yield AgentEvent("tool_call_result", {"name": "list_skills", "result": skill_result})
 
-        # Auto-compaction check
+        # Auto-compaction check (turn boundary)
         sys_prompt = self._build_system_prompt(user_prompt or "")
         if self.config.auto_compact and self.compactor.should_compact(self.session.messages, sys_prompt):
             old_messages = list(self.session.messages)
-            compacted_msgs, stats = self.compactor.compact(self.session.messages)
-            self.session.messages = compacted_msgs
-            
-            # Record message changes for checkpoint
-            self.checkpoint_manager.record_message_truncate(
-                0, len(old_messages) - len(compacted_msgs), 
-                old_messages[:len(old_messages) - len(compacted_msgs)]
-            )
-            yield AgentEvent("compaction", stats)
+            compacted_msgs, stats = self.compactor.compact(self.session.messages, sys_prompt)
+            if stats.get("compacted") and compacted_msgs != old_messages:
+                self._record_message_span_change(old_messages, compacted_msgs)
+                self.session.messages = compacted_msgs
+                yield AgentEvent("compaction", stats)
 
         # Loop for tool executions. There is no hard step budget — iteration
         # stops when the model delivers a text-only answer, calls the `finish`
@@ -242,6 +429,7 @@ class HarnessAgent:
             text_accumulator = ""
             reasoning_accumulator = ""
             tool_calls_accumulator: Dict[int, Dict[str, Any]] = {}
+            error_accumulator = ""
 
             yield AgentEvent("step_start", {"step": current_loop, "mode": self.mode.value})
 
@@ -252,6 +440,11 @@ class HarnessAgent:
                 tools=active_tools,
                 system_prompt=sys_prompt,
             ):
+                if chunk.finish_reason == "error":
+                    error_accumulator += chunk.delta_text or ""
+                    yield AgentEvent("text_delta", chunk.delta_text or f"\n[Error from {self.provider.display_name}: unknown provider error]\n")
+                    continue
+
                 if chunk.delta_reasoning:
                     reasoning_accumulator += chunk.delta_reasoning
                     yield AgentEvent("reasoning_delta", chunk.delta_reasoning)
@@ -274,8 +467,13 @@ class HarnessAgent:
                         tool_calls_accumulator[idx]["arguments"] += tc.arguments_delta
 
             # Guard against a model/provider returning a dead-end response (no text, no tool
-            # calls) — common with local reasoning endpoints. Nudge before giving up.
+            # calls) — common with local reasoning endpoints. Nudge before giving up. If the
+            # provider itself surfaced an error, show it and finish the turn instead.
             if not text_accumulator and not tool_calls_accumulator:
+                if error_accumulator:
+                    yield AgentEvent("text_delta", f"\n[Harness] {self.provider.display_name} returned an error; ending this turn.\n")
+                    yield AgentEvent("step_end", {"step": current_loop, "complete": True})
+                    break
                 empty_streak += 1
                 if empty_streak <= MAX_EMPTY_RETRIES:
                     self.session.messages.append({
@@ -319,6 +517,7 @@ class HarnessAgent:
                     for v in tool_calls_accumulator.values()
                 ]
 
+            turn_start_index = len(self.session.messages)
             self.session.messages.append(assistant_msg)
             self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, assistant_msg)
 
@@ -356,6 +555,11 @@ class HarnessAgent:
 
                 result = self.tool_registry.execute(tool_name, args, self.mode)
 
+                # Replay any subagent/swarm activity that occurred during this tool
+                # call from the main thread so the renderer stays single-threaded.
+                for etype, edata in self.subagent_orchestrator.drain_events():
+                    yield AgentEvent(etype, edata)
+
                 yield AgentEvent("tool_call_result", {"name": tool_name, "result": result})
 
                 # Append tool result to history
@@ -367,6 +571,19 @@ class HarnessAgent:
                 }
                 self.session.messages.append(tool_result_msg)
                 self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, tool_result_msg)
+
+                # Mid-turn safety net: if a big tool result blew the hard cap,
+                # collapse only oversized *old* payloads safely behind the current
+                # turn. The freshly produced result is never touched.
+                if self.config.auto_compact and self.compactor.is_over_cap(self.session.messages, sys_prompt):
+                    old_msgs = list(self.session.messages)
+                    trimmed, estats = self.compactor.emergency_trim(
+                        self.session.messages, sys_prompt, before_index=turn_start_index
+                    )
+                    if estats and trimmed != old_msgs:
+                        self._record_message_span_change(old_msgs, trimmed)
+                        self.session.messages = trimmed
+                        yield AgentEvent("compaction", estats)
 
             if stop_requested:
                 yield AgentEvent("tool_call_result", {"name": "finish", "result": finish_summary})
@@ -380,6 +597,7 @@ class HarnessAgent:
 
         self.is_running = False
         self.session_manager.save(self.session)
+        self._maybe_auto_learn(user_prompt)
         yield AgentEvent("turn_complete", {"messages_count": len(self.session.messages)})
 
     def _last_assistant_text(self) -> str:
@@ -389,11 +607,116 @@ class HarnessAgent:
                 return str(m["content"]).strip()
         return ""
 
+    def _maybe_auto_learn(self, user_prompt: Optional[str]) -> None:
+        """Cheap, deterministic heuristic capture: no extra provider call.
+
+        After a turn, if any tool result this turn looked like an error but the agent
+        still produced a final answer, record one debounced lesson so the next session
+        verifies before acting. Skips when the agent already called learn_record itself.
+        """
+        if not self.config.learning_enabled or self.session is None:
+            return
+        session_id = self.session.id
+        if self._auto_learned_session == session_id:
+            return
+
+        start = 0
+        if user_prompt:
+            for i, m in enumerate(self.session.messages):
+                if m.get("role") == "user" and m.get("content") == user_prompt:
+                    start = i
+                    break
+
+        failed_tools = []
+        first_error = ""
+        used_learn_record = False
+        for m in self.session.messages[start:]:
+            if m.get("role") == "tool":
+                name = m.get("name", "")
+                if name == "learn_record":
+                    used_learn_record = True
+                content = str(m.get("content") or "")
+                lowered = content.lower()
+                if any(tok in lowered for tok in ("error", "traceback", "failed", "failure", "not found", "exception")):
+                    if name not in failed_tools:
+                        failed_tools.append(name)
+                    if not first_error:
+                        first_error = content.strip().split("\n")[0][:200]
+
+        if used_learn_record or not failed_tools:
+            return
+
+        summary = (
+            "Encountered "
+            + " / ".join(f"`{t}`" for t in failed_tools[:3])
+            + " failure(s) this turn; double-check paths, arguments, and commands before executing, and verify results."
+        )
+        lesson_id = self.learning_manager.record(
+            summary=summary,
+            tags=["verify"] + [t.replace("_", " ") for t in failed_tools[:2]],
+            evidence=first_error,
+            source_session=session_id,
+        )
+        if lesson_id:
+            self._auto_learned_session = session_id
+
     def _build_system_prompt(self, current_query: str) -> str:
         mcp_summary = self.mcp_manager.format_summary()
         todos_md = self.todo_manager.format_markdown()
+        swarm_enabled = self.config.swarm_enabled or self.mode == Mode.SUPER
+        learned_lessons = self.learning_manager.format_top(current_query or "") if self.config.learning_enabled else ""
         return self.prompt_builder.build(
             mcp_tools_summary=mcp_summary,
             active_todos=todos_md,
             custom_instructions=self.config.custom_system_prompt,
+            swarm_enabled=swarm_enabled,
+            learned_lessons=learned_lessons,
         )
+
+    def _summarize_block(self, messages: List[Dict[str, Any]]) -> Optional[str]:
+        """Condense an old block of conversation into a dense, loss-conscious
+        digest using the active provider. Returns None on any failure so the
+        caller can fall back to the heuristic summarizer."""
+        if not messages:
+            return None
+        try:
+            summary_sys = (
+                "You are a context-compaction engine. Condense the conversation block below "
+                "into a concise but information-dense markdown digest. Preserve: the user's "
+                "instructions and constraints, every file path touched, every tool invocation "
+                "and its outcome, any decisions or conclusions, and any pending/blocked work. "
+                "Drop repetition and reasoning noise. Keep it under 1200 characters."
+            )
+            rendered = []
+            for m in messages:
+                role = m.get("role")
+                content = str(m.get("content") or "")
+                if m.get("tool_calls"):
+                    for tc in m["tool_calls"]:
+                        fn = tc.get("function", {})
+                        rendered.append(f"[tool_call] {fn.get('name', '?')} {fn.get('arguments', '{}')}")
+                if content.strip():
+                    snippet = content[:4000]
+                    rendered.append(f"[{role}] {snippet[:4000]}")
+            if not rendered:
+                return None
+            body = "\n".join(rendered)
+            user_msg = {"role": "user", "content": f"<block>\n{body}\n</block>\n\nSummarize:"}
+            acc = []
+            for chunk in self.provider.stream_chat(
+                messages=[user_msg],
+                model=self.session.model if self.session is not None else self.config.model,
+                thinking_effort="low",
+                tools=None,
+                system_prompt=summary_sys,
+            ):
+                if chunk.finish_reason == "error":
+                    return None
+                if chunk.delta_text:
+                    acc.append(chunk.delta_text)
+                if sum(len(a) for a in acc) > 1500:
+                    break
+            text = "".join(acc).strip()
+            return text[:1500] or None
+        except Exception:
+            return None

@@ -77,6 +77,9 @@ class PermissionManager:
     def __init__(self, level: PermissionLevel = PermissionLevel.DEFAULT, approver_callback: Optional[Callable[[str, Dict[str, Any]], bool]] = None):
         self.level = level
         self.approver_callback = approver_callback
+        # When True, approval prompts are auto-denied (used by concurrent worker
+        # threads so subagents never block on interactive input).
+        self.interactive_deny = False
 
     def set_level(self, level: PermissionLevel) -> None:
         self.level = level
@@ -130,6 +133,8 @@ class PermissionManager:
         return True
 
     def _request_user_approval(self, message: str, details: Dict[str, Any]) -> bool:
+        if self.interactive_deny:
+            return False
         if self.approver_callback:
             return self.approver_callback(message, details)
         import sys

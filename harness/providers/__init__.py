@@ -44,9 +44,11 @@ PROVIDER_CONFIGS = {
     },
     "opencode": {
         "class": OpenAICompatibleProvider,
-        "display_name": "OpenCode Zen / Go",
-        "default_model": "zen-v1",
-        "base_url": "https://api.opencode.ai/v1",
+        "display_name": "OpenCode Zen",
+        "default_model": "big-pickle",
+        "base_url": "https://opencode.ai/zen/v1",
+        "user_agent": "opencode/1.18.16",
+        "opencode_session": True,
     },
     "groq": {
         "class": OpenAICompatibleProvider,
@@ -124,12 +126,19 @@ def get_provider(provider_name: str, config: Optional[HarnessConfig] = None) -> 
     elif cls is MockProvider:
         return MockProvider()
     else:
+        extra_headers = dict(cfg_entry.get("extra_headers") or {})
+        if cfg_entry.get("opencode_session"):
+            import uuid as _uuid
+            extra_headers.setdefault("x-opencode-client", "cli")
+            extra_headers.setdefault("x-opencode-session", str(_uuid.uuid4()))
         return OpenAICompatibleProvider(
             name=pname,
             display_name=cfg_entry["display_name"],
             default_model=cfg_entry["default_model"],
             base_url=base_url,
             api_key=api_key,
+            user_agent=cfg_entry.get("user_agent"),
+            extra_headers=extra_headers,
         )
 
 def list_providers() -> Dict[str, str]:

@@ -110,8 +110,8 @@ class GitDiffTool(Tool):
             out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=10).decode("utf-8")
             if not out.strip():
                 return "No diff changes detected."
-            if len(out) > 12000:
-                out = out[:12000] + "\n... [Diff truncated. Total length exceeded 12k chars]"
+            # Full diff is delivered to the agent untouched; the TUI renderer
+            # truncates only for display.
             return out
         except Exception as ex:
             return f"Git diff error: {str(ex)}"

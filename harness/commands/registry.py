@@ -8,11 +8,12 @@ from harness.core.modes import Mode
 from harness.core.permissions import PermissionLevel
 from harness.themes import THEMES, list_themes, render_theme_preview
 from harness.providers import list_providers, PROVIDER_CONFIGS
-from harness.core.compaction import calculate_history_tokens
 from harness.config import save_config, mask_key
 from harness.commands.config_cmd import display_config_table, display_keys_table, run_setup_wizard
 from harness.providers.detector import KNOWN_MODEL_REGISTRY, inspect_model
 from harness.core.checkpoints import get_checkpoint_manager
+from harness.core.agent import AgentEvent
+from harness.tui.input_handler import VIEW_AGENTS, VIEW_PARENT
 
 class CommandContext:
     def __init__(self, agent: Any, renderer: Any, raw_args: str):
@@ -44,8 +45,7 @@ class CommandRegistry:
 
         if cmd_name in self.commands:
             ctx = CommandContext(agent, renderer, args)
-            self.commands[cmd_name](ctx)
-            return True
+            return self.commands[cmd_name](ctx)
         else:
             renderer.print_error(f"Unknown command: '/{cmd_name}'. Type '/help' for available commands.")
             return True
@@ -65,8 +65,12 @@ class CommandRegistry:
         self.register("effort", self._cmd_effort, "Set thinking effort: off, low, medium, high, or token count.")
         self.register("todo", self._cmd_todo, "Manage task list: /todo, /todo add <title>, /todo clear.")
         self.register("skills", self._cmd_skills, "List or reload available skills.")
+        self.register("learn", self._cmd_learn, "Manage learned memories: /learn [list], record <summary>, forget <id>, promote <id>, on, off.")
         self.register("mcp", self._cmd_mcp, "Manage MCP servers: /mcp list, /mcp add.")
         self.register("subagent", self._cmd_subagent, "Dispatch an isolated subagent: /subagent <type> <prompt>.")
+        self.register("agents", self._cmd_agents, "Show subagent swarm board (F2).")
+        self.register("agent", self._cmd_agent, "Inspect a subagent: /agent <id>.")
+        self.register("back", self._cmd_back, "Return to the parent agent view (ESC).")
         self.register("compact", self._cmd_compact, "Trigger manual conversation context compaction.")
         self.register("session", self._cmd_session, "Manage sessions: /session list, create [title], delete <id>, rename <id> <title>, fork [title], resume <id>.")
         self.register("checkpoint", self._cmd_checkpoint, "Manage checkpoints: /checkpoint list, create [label], undo, redo.")
@@ -334,6 +338,63 @@ class CommandRegistry:
             lines.append(f"- **{s.name}** ({'Built-in' if s.is_builtin else 'Custom'}): {s.description}")
         ctx.renderer.print_markdown("\n".join(lines))
 
+    def _cmd_learn(self, ctx: CommandContext):
+        lm = ctx.agent.learning_manager
+        args = ctx.args.strip()
+        if not args or args == "list":
+            lessons = sorted(lm.list(), key=lambda l: l.created_at, reverse=True)
+            if not lessons:
+                ctx.renderer.print_info("No learned lessons yet. The agent records them automatically (and via learn_record) when it discovers reusable insights.")
+                return
+            lines = [f"### Learned Lessons ({len(lessons)}):"]
+            for l in lessons:
+                tags = f" [tags: {', '.join(l.tags)}]" if l.tags else ""
+                promoted = " (promoted)" if l.promoted else ""
+                lines.append(f"- `{l.id}`{tags} (hits: {l.hits}){promoted}: {l.summary}")
+            lines.append("")
+            stats = lm.stats()
+            lines.append(f"_Promoted to skills: {stats['promoted']} | Total: {stats['total']}_")
+            ctx.renderer.print_markdown("\n".join(lines))
+        elif args.startswith("record "):
+            summary = args[7:].strip()
+            if not summary:
+                ctx.renderer.print_warning("Usage: /learn record <summary> [--tags tag1,tag2]")
+                return
+            tags = []
+            if "--tags" in summary:
+                summary, _, tag_part = summary.partition(" --tags ")
+                tags = [t.strip() for t in tag_part.split(",") if t.strip()]
+            session_id = ctx.agent.session.id if ctx.agent.session else ""
+            lid = lm.record(summary=summary.strip(), tags=tags, source_session=session_id)
+            if lid:
+                ctx.renderer.print_success(f"Recorded lesson `{lid}`.")
+            else:
+                ctx.renderer.print_error("Failed to record lesson (empty summary).")
+        elif args.startswith("forget "):
+            lid = args[7:].strip()
+            if lm.forget(lid):
+                ctx.renderer.print_success(f"Forgot lesson `{lid}`.")
+            else:
+                ctx.renderer.print_error(f"Lesson `{lid}` not found.")
+        elif args.startswith("promote "):
+            parts = args[8:].split(None, 1)
+            lid = parts[0].strip()
+            name = parts[1].strip() if len(parts) > 1 else None
+            if lm.promote(lid, name=name):
+                ctx.renderer.print_success(f"Promoted lesson `{lid}` into a skill (catalog reloaded).")
+            else:
+                ctx.renderer.print_error(f"Lesson `{lid}` not found or could not be promoted.")
+        elif args == "on":
+            ctx.agent.config.learning_enabled = True
+            save_config(ctx.agent.config)
+            ctx.renderer.print_success("Learning enabled: the agent will record and re-inject past lessons.")
+        elif args == "off":
+            ctx.agent.config.learning_enabled = False
+            save_config(ctx.agent.config)
+            ctx.renderer.print_info("Learning disabled for this and future sessions.")
+        else:
+            ctx.renderer.print_info("Usage: /learn [list|record <summary> [--tags a,b]|forget <id>|promote <id> [name]|on|off]")
+
     def _cmd_mcp(self, ctx: CommandContext):
         servers = ctx.agent.mcp_manager.get_configured_servers()
         if not servers:
@@ -353,17 +414,60 @@ class CommandRegistry:
         ctx.renderer.print_info(f"Spawning subagent [{stype.upper()}]...")
         res = ctx.agent.subagent_orchestrator.spawn(stype, prompt)
         ctx.renderer.print_markdown(f"**Subagent ({res.agent_type}) Output ({res.execution_time}s):**\n\n{res.output}")
+        for etype, edata in ctx.agent.subagent_orchestrator.drain_events():
+            ctx.renderer.render_agent_event(AgentEvent(etype, edata))
+
+    def _cmd_agents(self, ctx: CommandContext):
+        """Return sentinel so the interactive loop switches to the agents view."""
+        return VIEW_AGENTS
+
+    def _cmd_agent(self, ctx: CommandContext):
+        aid = ctx.args.strip()
+        if not aid:
+            ctx.renderer.print_warning("Usage: /agent <id>  (see /agents for ids)")
+            return
+        record = ctx.agent.subagent_orchestrator.get_record(aid)
+        ctx.renderer.print_subagent_detail(record)
+
+    def _cmd_back(self, ctx: CommandContext):
+        """Return sentinel so the interactive loop switches back to the parent view."""
+        return VIEW_PARENT
 
     def _cmd_compact(self, ctx: CommandContext):
         if ctx.agent.session is None:
             ctx.renderer.print_warning("No active session to compact. Send a message first.")
             return
-        compacted, stats = ctx.agent.compactor.compact(ctx.agent.session.messages)
+        sys_prompt = ctx.agent._build_system_prompt("")
+        compacted, stats = ctx.agent.compactor.compact(ctx.agent.session.messages, sys_prompt)
+        if not stats.get("compacted"):
+            ctx.renderer.print_info("Nothing to compact yet — not enough history or below the threshold.")
+            return
+        ctx.agent._record_message_span_change(ctx.agent.session.messages, compacted)
         ctx.agent.session.messages = compacted
+
+        tactics = stats.get("tactics", {})
+        tactic_desc = []
+        if tactics.get("payloads_truncated"):
+            tactic_desc.append(f"{tactics['payloads_truncated']} oversized payload(s) collapsed")
+        if tactics.get("groups_summarized"):
+            tactic_desc.append(f"{tactics['groups_summarized']} old turn-group(s) summarized")
+        if tactics.get("checkpointed"):
+            tactic_desc.append("global checkpoint consolidated")
+        tactic_str = "; ".join(tactic_desc) or "no compression needed"
+
         ctx.renderer.print_success(
             f"Context Compacted! Before: {stats.get('before_tokens', 0):,} tokens -> "
-            f"After: {stats.get('after_tokens', 0):,} tokens (Saved {stats.get('saved_tokens', 0):,} tokens / {stats.get('reduction_pct', 0)}%)"
+            f"After: {stats.get('after_tokens', 0):,} tokens (Saved {stats.get('saved_tokens', 0):,} tokens "
+            f"/ {stats.get('reduction_pct', 0)}%). Tactics: {tactic_str}"
         )
+        ledger = getattr(ctx.agent.compactor, "ledger", [])
+        if len(ledger) > 1:
+            ctx.renderer.print_info(
+                f"Last {min(len(ledger), 5)} compactions (recent first): "
+                + ", ".join(
+                    f"{e['trigger']} -{e['saved_tokens']:,}t" for e in list(reversed(ledger))[:5]
+                )
+            )
 
     def _cmd_session(self, ctx: CommandContext):
         parts = ctx.args.split(" ", 1)
@@ -450,13 +554,32 @@ class CommandRegistry:
             import resource
             ram_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
 
-        tokens = calculate_history_tokens(ctx.agent.session.messages) if ctx.agent.session is not None else 0
-        c_win = ctx.agent.compactor.context_window
-        pct = round((tokens / max(1, c_win)) * 100, 2)
-        ctx.renderer.print_info(
-            f"Tokens: {tokens:,} / {c_win:,} ({pct}%) | "
-            f"Turns: {len(ctx.agent.session.messages) if ctx.agent.session is not None else 0} | "
-            f"RAM Usage: {ram_mb} MB"
+        if ctx.agent.session is None:
+            ctx.renderer.print_info(f"Tokens: 0 | RAM Usage: {ram_mb} MB")
+            return
+
+        sys_prompt = ctx.agent._build_system_prompt("")
+        status = ctx.agent.compactor.check_status(ctx.agent.session.messages, sys_prompt)
+        bd = status.breakdown
+        marker = f"{status.total_tokens:,} / {status.context_window:,} ({status.usage_ratio * 100:.1f}%)"
+        if status.is_warning:
+            marker += " ⚠"
+        ctx.renderer.print_info(f"Tokens: {marker} | Turns: {len(ctx.agent.session.messages)} | RAM: {ram_mb} MB")
+
+        ctx.renderer.print_markdown(
+            "\n".join([
+                "**Token breakdown (est.):**",
+                f"- System prompt: `{bd.get('system_prompt', 0):,}`",
+                f"- User messages: `{bd.get('user', 0):,}`",
+                f"- Assistant text: `{bd.get('assistant', 0):,}`",
+                f"- Reasoning: `{bd.get('reasoning', 0):,}`",
+                f"- Tool results: `{bd.get('tool', 0):,}`",
+                f"- Tool call args: `{bd.get('tool_calls', 0):,}`",
+                "",
+                f"**Budget:** arm @ `{status.threshold_ratio:.0%}`, compact to `{status.target_ratio:.0%}`, cap `{status.cap_ratio:.0%}`",
+                f"Max message before payload truncation: `{ctx.agent.compactor.max_message_tokens:,}` tokens",
+                f"Compactions this session: `{len(ctx.agent.compactor.ledger)}`",
+            ])
         )
 
     def _cmd_checkpoint(self, ctx: CommandContext):
@@ -487,25 +610,62 @@ class CommandRegistry:
             else:
                 ctx.renderer.print_info("No pending changes to checkpoint.")
         elif action == "undo":
+            if arg:
+                self._checkpoint_navigate(ctx, cp_manager, arg)
+                return
             if not cp_manager.can_undo():
                 ctx.renderer.print_warning("Nothing to undo.")
                 return
             target = cp_manager.undo()
             if target:
-                ctx.renderer.print_success(f"Undone to checkpoint: `{target.id}` ({target.label})")
+                ctx.renderer.print_success(
+                    f"Undone to checkpoint: `{target.id}` ({target.label}) — "
+                    f"{self._checkpoint_applied_summary(cp_manager)}"
+                )
             else:
                 ctx.renderer.print_success("Undone to initial state (no checkpoints).")
         elif action == "redo":
+            if arg:
+                self._checkpoint_navigate(ctx, cp_manager, arg)
+                return
             if not cp_manager.can_redo():
                 ctx.renderer.print_warning("Nothing to redo.")
                 return
             target = cp_manager.redo()
             if target:
-                ctx.renderer.print_success(f"Redone to checkpoint: `{target.id}` ({target.label})")
+                ctx.renderer.print_success(
+                    f"Redone to checkpoint: `{target.id}` ({target.label}) — "
+                    f"{self._checkpoint_applied_summary(cp_manager)}"
+                )
             else:
                 ctx.renderer.print_error("Redo failed.")
         else:
-            ctx.renderer.print_info("Usage: /checkpoint [list|create [label]|undo|redo]")
+            ctx.renderer.print_info("Usage: /checkpoint [list|create [label]|undo [id]|redo [id]]")
+
+    @staticmethod
+    def _checkpoint_navigate(ctx: CommandContext, cp_manager, checkpoint_id: str):
+        target, moved = cp_manager.navigate_to(checkpoint_id)
+        if target is None:
+            ctx.renderer.print_error(f"Checkpoint not found: `{checkpoint_id}` (see /checkpoint list)")
+        elif not moved:
+            ctx.renderer.print_info(f"Already at checkpoint: `{target.id}` ({target.label})")
+        else:
+            verb = "Undone" if cp_manager.last_direction() == "undo" else "Redone"
+            ctx.renderer.print_success(
+                f"{verb} to checkpoint: `{target.id}` ({target.label}) — "
+                f"{CommandRegistry._checkpoint_applied_summary(cp_manager)}"
+            )
+
+    @staticmethod
+    def _checkpoint_applied_summary(cp_manager) -> str:
+        """Human-readable summary of what the last undo/redo materialized."""
+        last = cp_manager.last_apply_results()
+        if not last:
+            return "no recorded changes materialized"
+        verb = "reverted" if cp_manager.last_direction() == "undo" else "re-applied"
+        return (f"{verb} {last.get('messages', 0)} message(s), "
+                f"{last.get('states', 0)} state change(s), "
+                f"{last.get('files', 0)} file(s)")
 
     def _cmd_diff(self, ctx: CommandContext):
         res = ctx.agent.tool_registry.execute("git_diff", {}, ctx.agent.mode)

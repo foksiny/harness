@@ -6,7 +6,7 @@ from typing import Optional
 from harness.core.agent import HarnessAgent
 from harness.commands.registry import CommandRegistry
 from harness.tui.terminal import TerminalRenderer
-from harness.tui.input_handler import InputHandler
+from harness.tui.input_handler import InputHandler, SENTINEL_OPEN_AGENTS, SENTINEL_BACK, VIEW_AGENTS, VIEW_PARENT
 from harness.core.compaction import calculate_history_tokens
 
 def run_interactive(agent: HarnessAgent):
@@ -18,28 +18,38 @@ def run_interactive(agent: HarnessAgent):
     renderer.clear_screen()
     renderer.print_banner()
 
+    view = VIEW_PARENT
+
     while True:
-        # Render live status HUD
-        tokens = calculate_history_tokens(agent.session.messages) if agent.session is not None else 0
-        c_win = agent.compactor.context_window
-        todos_summary = agent.todo_manager.summary()
+        if view == VIEW_AGENTS:
+            renderer.print_subagent_board(agent.subagent_orchestrator.list_records())
+            plain_prompt = "Agents> "
+        else:
+            # Render live status HUD
+            tokens = calculate_history_tokens(agent.session.messages) if agent.session is not None else 0
+            c_win = agent.compactor.context_window
+            todos_summary = agent.todo_manager.summary()
 
-        renderer.print_hud(
-            mode=agent.mode.value,
-            perm=agent.permission_manager.level.value,
-            provider=agent.provider.display_name,
-            model=agent.session.model if agent.session is not None else agent.config.model,
-            tokens=tokens,
-            context_win=c_win,
-            todos_summary=todos_summary,
-        )
-        renderer.print_footer()
+            renderer.print_hud(
+                mode=agent.mode.value,
+                perm=agent.permission_manager.level.value,
+                provider=agent.provider.display_name,
+                model=agent.session.model if agent.session is not None else agent.config.model,
+                tokens=tokens,
+                context_win=c_win,
+                todos_summary=todos_summary,
+            )
+            renderer.print_footer()
+            plain_prompt = f"Harness ({agent.mode.value})> "
 
-        prompt_str = f"[{renderer.theme.primary}]Harness ({agent.mode.value})>[/{renderer.theme.primary}] "
-        # Format clean prompt for readline / input
-        plain_prompt = f"Harness ({agent.mode.value})> "
-
-        user_input = input_handler.get_input(plain_prompt)
+        user_input = input_handler.get_input(plain_prompt, view)
+        if user_input == SENTINEL_OPEN_AGENTS:
+            view = VIEW_AGENTS
+            continue
+        if user_input == SENTINEL_BACK:
+            view = VIEW_PARENT
+            renderer.print_info("Returned to parent agent view.")
+            continue
         if not user_input:
             continue
 
@@ -51,7 +61,17 @@ def run_interactive(agent: HarnessAgent):
 
         # Check slash command
         if user_input.startswith("/"):
-            commands.handle(user_input, agent, renderer)
+            command_result = commands.handle(user_input, agent, renderer)
+            if command_result == VIEW_AGENTS:
+                view = VIEW_AGENTS
+            elif command_result == VIEW_PARENT:
+                view = VIEW_PARENT
+            continue
+
+        # In the agents board view only commands, ESC, and /back drive the
+        # session; free text would be misread as a task for the parent agent.
+        if view == VIEW_AGENTS:
+            renderer.print_info("In the agents view. Use /agent <id>, /back, or ESC to return.")
             continue
 
         # Execute agent step
