@@ -111,10 +111,19 @@ class TestFinishTool(unittest.TestCase):
 
         events = list(agent.step("do the work"))
 
+        # The model already executed tool work, so it gets ONE targeted nudge
+        # before the turn is concluded cleanly — never a misleading "went quiet"
+        # message pointing at its pre-tool preamble.
         nudges = [m for m in agent.session.messages if str(m.get("content", "")).startswith("[SYSTEM]: Your previous response was empty")]
-        self.assertEqual(len(nudges), 2)
-        # The recovered final text is surfaced instead of a raw error.
-        self.assertTrue(any(ev.type == "text_delta" and "Progress note" in str(ev.data) for ev in events))
+        self.assertEqual(len(nudges), 1)
+        self.assertIn("tool results above were delivered", nudges[0]["content"])
+        self.assertTrue(any(
+            ev.type == "text_delta" and "completed 1 tool call" in str(ev.data) and "did not return a final message" in str(ev.data)
+            for ev in events
+        ))
+        # No "went quiet" recovery framing is used when tool work happened.
+        self.assertFalse(any(ev.type == "text_delta" and "went quiet" in str(ev.data) for ev in events))
+        self.assertTrue(any(ev.type == "step_end" and ev.data.get("complete") for ev in events))
 
 
 if __name__ == "__main__":

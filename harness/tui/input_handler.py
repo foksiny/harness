@@ -5,8 +5,10 @@ board, ESC returns to the parent view), and graceful prompt_toolkit / readline f
 When prompt_toolkit is not installed the fallback uses a raw terminal line reader so
 keybinds still work instead of leaking escape sequences into the buffer.
 """
+import os
 import sys
-from typing import List, Optional
+from contextlib import contextmanager
+from typing import List, Optional, Iterator
 
 SLASH_COMMANDS = [
     "/help", "/goal", "/mode", "/perm", "/theme",
@@ -23,6 +25,84 @@ VIEW_AGENTS = "agents"
 # Sentinel values returned by get_input() when a keybind is pressed.
 SENTINEL_OPEN_AGENTS = "\x00__OPEN_AGENTS__"
 SENTINEL_BACK = "\x00__BACK__"
+
+
+@contextmanager
+def no_echo_stdin(fd: Optional[int] = None) -> Iterator[None]:
+    """Suppress terminal echo during agent runs.
+
+    While an agent is streaming (tool calls / long responses) the terminal is
+    in its normal echo mode, so every control key the user presses — Ctrl-C,
+    ESC, arrow keys — is echoed by the driver as ``^C`` / ``^[`` noise on the
+    line. This guard turns echo off for the duration of the run and flushes any
+    stray keystrokes on exit, so the buffer never fills with control garbage.
+    ISIG stays enabled, so Ctrl-C still raises KeyboardInterrupt as usual.
+
+    ``fd`` defaults to stdin; pass an explicit fd only in tests.
+    """
+    if fd is None:
+        try:
+            fd = sys.stdin.fileno()
+            if not sys.stdin.isatty():
+                yield
+                return
+        except Exception:
+            yield
+            return
+    try:
+        import termios
+    except Exception:
+        yield
+        return
+
+    try:
+        old = termios.tcgetattr(fd)
+    except Exception:
+        yield
+        return
+
+    try:
+        new = termios.tcgetattr(fd)
+        new[3] &= ~(termios.ECHO | termios.ECHOCTL | termios.ECHOE | termios.ECHOK)
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        yield
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, old)
+            termios.tcflush(fd, termios.TCIFLUSH)
+        except Exception:
+            pass
+
+
+def is_command_input(line: str, known_commands: dict or frozenset) -> bool:
+    """Decide whether a line starting with ``/`` is a slash command or a plain
+    prompt whose first token is a path (e.g. a file pasted/swiped into the buffer).
+
+    Absolute paths, ``~/``, ``./``, ``../``, and ``file://`` prefixes route to the
+    prompt so media attachments can be parsed; known commands and unknown command
+    words (for the helpful "Unknown command" error) stay command routing.
+    """
+    if not line.startswith("/"):
+        return False
+    if line.startswith("//"):
+        return False
+    first = line.split(" ", 1)[0]
+    if first[1:].lower() in known_commands:
+        return True
+    if _is_path_like_token(first):
+        return False
+    return True
+
+
+def _is_path_like_token(token: str) -> bool:
+    if token.startswith(("~/", "./", "../", "file://")):
+        return True
+    if token.startswith("/"):
+        rest = token[1:]
+        if "/" in rest:
+            return True
+        return os.path.isfile(token) or os.path.isdir(token)
+    return False
 
 
 class InputHandler:

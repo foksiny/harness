@@ -8,6 +8,7 @@ import urllib.request
 import urllib.error
 from typing import Dict, Any, List, Optional, Iterator
 from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta
+from harness.core.attachments import b64_payload_for_block
 
 class AnthropicProvider(BaseProvider):
     name = "anthropic"
@@ -16,6 +17,27 @@ class AnthropicProvider(BaseProvider):
 
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
         super().__init__(api_key=api_key, base_url=base_url or "https://api.anthropic.com/v1")
+
+    @staticmethod
+    def _anthropic_user_content(content):
+        """Convert canonical content (str or block list) to Anthropic blocks."""
+        if not isinstance(content, list):
+            return content or ""
+        blocks = []
+        for b in content:
+            t = b.get("type")
+            if t == "text":
+                blocks.append({"type": "text", "text": b.get("text", "")})
+                continue
+            mime, b64 = b64_payload_for_block(b)
+            if mime and b64:
+                blocks.append({
+                    "type": t,
+                    "source": {"type": "base64", "media_type": mime, "data": b64},
+                })
+            else:
+                blocks.append({"type": "text", "text": f"[{t} file unavailable: {b.get('path', '')}]"})
+        return blocks
 
     def _convert_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         anthropic_msgs = []
@@ -26,7 +48,7 @@ class AnthropicProvider(BaseProvider):
 
             content = msg.get("content")
             if role == "user":
-                anthropic_msgs.append({"role": "user", "content": content or ""})
+                anthropic_msgs.append({"role": "user", "content": self._anthropic_user_content(content)})
             elif role == "assistant":
                 blocks = []
                 if content:

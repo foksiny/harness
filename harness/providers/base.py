@@ -46,52 +46,77 @@ class BaseProvider(ABC):
     def normalize_thinking_effort(self, model_spec: ModelSpec, effort_setting: str) -> Dict[str, Any]:
         """
         Convert user effort setting (off, low, medium, high, or integer)
-        into the model's exact parameter format.
+        into the model's exact parameter format (per-provider thinking dialect).
         """
-        if not model_spec.supports_thinking or effort_setting.lower() in ("off", "none", "false"):
+        if not model_spec.supports_thinking:
             return {}
 
-        ttype = model_spec.thinking_type
+        ttype = model_spec.thinking_type or "reasoning_effort"
         eff = effort_setting.lower().strip()
+        off = eff in ("off", "none", "false", "disabled")
 
         if ttype == "budget_tokens":
             # Anthropic style
-            if eff == "low":
-                tokens = 2048
-            elif eff == "medium":
-                tokens = 8192
-            elif eff == "high":
-                tokens = 16384
-            elif eff.isdigit():
-                tokens = int(eff)
-            else:
-                tokens = 8192
+            if off:
+                return {}
+            tokens = max(1024, self._level_tokens(eff, 2048, 8192, 16384))
             return {"thinking": {"type": "enabled", "budget_tokens": tokens}}
 
-        elif ttype == "thinking_budget":
-            # Gemini style
-            if eff == "low":
-                budget = 2048
-            elif eff == "medium":
-                budget = 8192
-            elif eff == "high":
-                budget = 16384
-            elif eff.isdigit():
-                budget = int(eff)
-            else:
-                budget = 8192
-            return {"thinking_config": {"thinking_budget": budget}}
+        if ttype == "thinking_budget":
+            # Gemini style. includeThoughts=true surfaces the thinking blocks.
+            if off:
+                return {}
+            budget = self._level_tokens(eff, 2048, 8192, 16384)
+            return {"thinking_config": {"thinking_budget": budget, "include_thoughts": True}}
 
-        elif ttype == "reasoning_effort":
-            # OpenAI / DeepSeek / NIM / OpenRouter style
-            val = "medium"
-            if eff in ("low", "medium", "high"):
-                val = eff
-            elif eff.isdigit():
-                val = "low" if int(eff) < 4000 else ("medium" if int(eff) < 12000 else "high")
-            return {"reasoning_effort": val}
+        if ttype == "thinking_token_budget":
+            # Cohere style
+            if off:
+                return {"thinking": {"type": "disabled"}}
+            budget = max(1024, self._level_tokens(eff, 2048, 8192, 16384))
+            return {"thinking": {"type": "enabled", "token_budget": budget}}
 
-        return {}
+        if ttype == "reasoning_object":
+            # OpenRouter style
+            if off:
+                return {"reasoning": {"enabled": False}}
+            return {"reasoning": {"effort": self._level_effort(eff)}}
+
+        if ttype == "reasoning_toggle":
+            # Together hybrid models
+            if off:
+                return {"reasoning": {"enabled": False}}
+            return {"reasoning": {"enabled": True}}
+
+        if ttype == "chat_template_kwargs":
+            # NVIDIA NIM (DeepSeek-V4 etc.) — reasoning_effort none|high|max.
+            if off:
+                return {"chat_template_kwargs": {"thinking": False}}
+            return {"chat_template_kwargs": {"thinking": True}, "reasoning_effort": "high"}
+
+        # reasoning_effort / default
+        if off:
+            return {}
+        return {"reasoning_effort": self._level_effort(eff)}
+
+    @staticmethod
+    def _level_tokens(eff: str, low_t: int, med_t: int, high_t: int) -> int:
+        if eff == "low":
+            return low_t
+        if eff == "high":
+            return high_t
+        if eff.isdigit():
+            return int(eff)
+        return med_t
+
+    @staticmethod
+    def _level_effort(eff: str) -> str:
+        if eff in ("low", "medium", "high"):
+            return eff
+        if eff.isdigit():
+            n = int(eff)
+            return "low" if n < 4000 else ("medium" if n < 12000 else "high")
+        return "medium"
 
     @abstractmethod
     def stream_chat(

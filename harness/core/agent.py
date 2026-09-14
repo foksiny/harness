@@ -5,7 +5,7 @@ and session state persistence.
 """
 import json
 import time
-from typing import Dict, Any, List, Optional, Callable, Generator
+from typing import Dict, Any, List, Optional, Callable, Generator, Tuple
 from harness.core.modes import Mode
 from harness.core.permissions import PermissionManager, PermissionLevel
 from harness.core.prompt import SystemPromptBuilder
@@ -15,6 +15,7 @@ from harness.core.session import Session, SessionManager
 from harness.core.checkpoints import CheckpointManager, get_checkpoint_manager, set_checkpoint_manager
 from harness.core.subagents import SubagentOrchestrator
 from harness.core.learning import LearningManager
+from harness.core.attachments import parse_attachments
 from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta
 from harness.providers import get_provider
 from harness.tools import ToolRegistry
@@ -74,6 +75,9 @@ class HarnessAgent:
         )
 
         self.provider: BaseProvider = get_provider(config.provider, config)
+        # Test seam: when set, the vision-fallback provider is used verbatim
+        # instead of re-instantiating one from config.vfb_provider.
+        self._vfb_provider_override: Optional[BaseProvider] = None
         self.session_manager = SessionManager()
         self.session: Optional[Session] = session
 
@@ -365,13 +369,177 @@ class HarnessAgent:
         self.todo_manager.restore_task(TaskItem.from_dict(data))
         return True
 
+    def _get_vfb_provider(self) -> BaseProvider:
+        if self._vfb_provider_override is not None:
+            return self._vfb_provider_override
+        return get_provider(self.config.vfb_provider, self.config)
+
+    def _run_vision_fallback(
+        self, media_blocks: List[Dict[str, Any]]
+    ) -> Generator[AgentEvent, None, Tuple[Optional[str], str]]:
+        """Ask the configured vision-fallback provider/model to describe the given
+        media as text for a non-visual model. Yields UX events, returns a tuple of
+        (description, error) where exactly one is set on completion."""
+        vfb_provider = self._get_vfb_provider()
+        vfb_model = self.config.vfb_model.strip() or vfb_provider.default_model
+        display = getattr(vfb_provider, "display_name", getattr(vfb_provider, "name", "vision fallback"))
+        labels = "/".join(sorted({b["type"] for b in media_blocks}))
+        files = [b.get("path") or b.get("data_uri", "")[:72] for b in media_blocks]
+
+        try:
+            vfb_spec = vfb_provider.get_model_spec(vfb_model)
+        except Exception:
+            vfb_spec = None
+
+        if vfb_spec is None:
+            reason = (
+                f"vision fallback provider '{self.config.vfb_provider.strip()}' could not "
+                f"resolve capabilities for model '{vfb_model}'"
+            )
+            return (None, reason)
+
+        if labels == "video":
+            capable = bool(vfb_spec.supports_video)
+        elif labels == "image":
+            capable = bool(vfb_spec.supports_vision)
+        else:
+            capable = bool(vfb_spec.supports_vision and vfb_spec.supports_video)
+
+        if not capable:
+            reason = f"vision fallback model '{vfb_model}' is not detected as {labels}-capable"
+            return (None, reason)
+
+        yield AgentEvent("vfb_notice", {
+            "provider": display,
+            "model": vfb_model,
+            "labels": labels,
+            "files": files,
+        })
+
+        system_prompt = (
+            "You are a precise vision-description sub-agent. Describe each provided "
+            "file in exhaustive objective detail so that a text-only model which "
+            "cannot see it can fully understand it: subjects, actions, spatial layout, "
+            "colors, quantities, any readable text or labels, diagrams, and notable "
+            "defects. Be literal and complete rather than brief."
+        )
+        content: List[Dict[str, Any]] = [
+            {"type": "text", "text": "Describe each of the following files precisely:"},
+            *media_blocks,
+        ]
+
+        try:
+            parts: List[str] = []
+            failed = False
+            for chunk in vfb_provider.stream_chat(
+                messages=[{"role": "user", "content": content}],
+                model=vfb_model,
+                thinking_effort="off",
+                tools=[],
+                system_prompt=system_prompt,
+            ):
+                if chunk.finish_reason == "error":
+                    failed = True
+                    continue
+                if chunk.delta_text:
+                    parts.append(chunk.delta_text)
+            description = "".join(parts).strip()
+            if failed or not description:
+                return (None, f"{display} ({vfb_model}) returned no usable description")
+        except Exception as exc:
+            return (None, f"{display} ({vfb_model}) failed while describing: {exc}")
+
+        yield AgentEvent("vfb_result", {
+            "provider": display,
+            "model": vfb_model,
+            "labels": labels,
+            "files": files,
+        })
+        return (description, "")
+
     def step(self, user_prompt: Optional[str] = None) -> Generator[AgentEvent, None, None]:
         """Execute a single or multi-step agent turn, yielding live events."""
         self.is_running = True
+        tools_executed_this_turn = 0
 
         if user_prompt:
             self.ensure_session()
-            self.session.messages.append({"role": "user", "content": user_prompt})
+            clean_text, media_blocks, attach_warnings = parse_attachments(user_prompt)
+            model_spec = self.provider.get_model_spec(self.session.model)
+            supported, degraded = [], []
+            for b in media_blocks:
+                if b["type"] == "image":
+                    ok = model_spec.supports_vision or bool(self.config.force_media_attach)
+                else:
+                    ok = model_spec.supports_video
+                (supported if ok else degraded).append(b)
+
+            # Vision fallback (VFB): when a vision-capable auxiliary provider/model
+            # is configured, degraded media are described there and the written
+            # description is embedded as text so the non-vision model understands
+            # the image without actually seeing it. Progress/result events keep the
+            # user informed that the fallback model is being used.
+            vfb_description, vfb_err = None, ""
+            if degraded and self.config.vfb_provider.strip():
+                vfb_gen = self._run_vision_fallback(degraded)
+                try:
+                    while True:
+                        try:
+                            sub_ev = next(vfb_gen)
+                        except StopIteration as stop:
+                            vfb_description, vfb_err = stop.value or (None, "")
+                            break
+                        yield sub_ev
+                except Exception:
+                    vfb_err = "vision fallback crashed unexpectedly"
+
+            if degraded:
+                text = clean_text
+                if vfb_description:
+                    text += "\n\n[Vision fallback description of the attached file(s):\n" + vfb_description + "\n]"
+                else:
+                    for b in degraded:
+                        label = "video" if b["type"] == "video" else "image"
+                        text += f"\n[{label} file attached: {b.get('path') or b.get('data_uri', '')[:72]}]"
+            else:
+                text = clean_text
+
+            if supported:
+                content_parts: List[Dict[str, Any]] = []
+                if text.strip():
+                    content_parts.append({"type": "text", "text": text})
+                for b in supported:
+                    if b.get("path"):
+                        content_parts.append({"type": b["type"], "path": b["path"]})
+                    else:
+                        content_parts.append({"type": b["type"], "data_uri": b["data_uri"]})
+                user_content = content_parts
+                yield AgentEvent("attachment", {"files": [
+                    {"type": b["type"], "path": b.get("path") or b.get("data_uri", "")} for b in supported
+                ]})
+            else:
+                user_content = text if vfb_description else user_prompt
+
+            if attach_warnings or (degraded and not vfb_description):
+                notes = list(attach_warnings)
+                if degraded and not vfb_description:
+                    kinds = "/".join(sorted({b["type"] for b in degraded}))
+                    if vfb_err:
+                        notes.insert(
+                            0,
+                            f"{vfb_err}; file(s) included as a text path reference — "
+                            f"configure a vision-capable vision fallback model or switch to a vision model",
+                        )
+                    else:
+                        notes.insert(
+                            0,
+                            f"model '{self.session.model}' is not detected as {kinds}-capable, so the "
+                            f"file was included as a text path reference — switch to a vision model "
+                            f"if it fails to interpret the image",
+                        )
+                yield AgentEvent("attachment_warning", {"message": "; ".join(notes)})
+
+            self.session.messages.append({"role": "user", "content": user_content})
             self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
 
         # Skills-first: eagerly consult the skill catalog via the list_skills tool at the
@@ -470,31 +638,50 @@ class HarnessAgent:
             # calls) — common with local reasoning endpoints. Nudge before giving up. If the
             # provider itself surfaced an error, show it and finish the turn instead.
             if not text_accumulator and not tool_calls_accumulator:
+                guard_start = len(self.session.messages)
                 if error_accumulator:
                     yield AgentEvent("text_delta", f"\n[Harness] {self.provider.display_name} returned an error; ending this turn.\n")
                     yield AgentEvent("step_end", {"step": current_loop, "complete": True})
                     break
                 empty_streak += 1
-                if empty_streak <= MAX_EMPTY_RETRIES:
-                    self.session.messages.append({
-                        "role": "user",
-                        "content": (
+                # A model that already executed tool work gets at most ONE targeted
+                # nudge before the turn is concluded cleanly — it proved it can
+                # operate, so lingering on a silent endpoint wastes calls.
+                max_retries = 1 if tools_executed_this_turn else MAX_EMPTY_RETRIES
+                if empty_streak <= max_retries:
+                    if tools_executed_this_turn:
+                        nudge = (
+                            "[SYSTEM]: Your previous response was empty. The tool results above were "
+                            "delivered. If your task is complete, immediately write your FINAL ANSWER "
+                            "summary text now; otherwise continue with the next tool call. Do not go silent."
+                        )
+                    else:
+                        nudge = (
                             "[SYSTEM]: Your previous response was empty. Either continue with concrete "
                             "work by calling a tool, or — if the task is complete — immediately produce "
                             "your FINAL ANSWER text now (or call `finish` with your final summary). Do not "
                             "go silent."
-                        ),
+                        )
+                    self.session.messages.append({
+                        "role": "user",
+                        "content": nudge,
                     })
                     yield AgentEvent("step_end", {"step": current_loop, "complete": False})
                     continue
-                # Second consecutive dead-end: recover the model's best final words instead
-                # of surfacing a raw error.
-                last_text = self._last_assistant_text()
-                if last_text:
-                    yield AgentEvent("text_delta", "\n[Harness] The model went quiet — here is its final message:\n")
-                    yield AgentEvent("text_delta", last_text)
+                # Second (first post-work) consecutive dead-end: conclude the turn.
+                if tools_executed_this_turn:
+                    yield AgentEvent("text_delta", (
+                        f"\n[Harness] The model completed {tools_executed_this_turn} tool call"
+                        f"{'s' if tools_executed_this_turn != 1 else ''} but did not return a final "
+                        "message. Turn complete.\n"
+                    ))
                 else:
-                    yield AgentEvent("text_delta", "[Harness] The model returned an empty response after retries. Please rephrase your request or try again.")
+                    last_text = self._last_assistant_text(guard_start)
+                    if last_text:
+                        yield AgentEvent("text_delta", "\n[Harness] The model went quiet — here is its final message:\n")
+                        yield AgentEvent("text_delta", last_text)
+                    else:
+                        yield AgentEvent("text_delta", "[Harness] The model returned an empty response after retries. Please rephrase your request or try again.")
                 yield AgentEvent("step_end", {"step": current_loop, "complete": True})
                 break
 
@@ -554,6 +741,7 @@ class HarnessAgent:
                     break
 
                 result = self.tool_registry.execute(tool_name, args, self.mode)
+                tools_executed_this_turn += 1
 
                 # Replay any subagent/swarm activity that occurred during this tool
                 # call from the main thread so the renderer stays single-threaded.
@@ -600,9 +788,10 @@ class HarnessAgent:
         self._maybe_auto_learn(user_prompt)
         yield AgentEvent("turn_complete", {"messages_count": len(self.session.messages)})
 
-    def _last_assistant_text(self) -> str:
-        """Return the most recent non-empty assistant text as a best-effort final message."""
-        for m in reversed(self.session.messages):
+    def _last_assistant_text(self, start_index: int = 0) -> str:
+        """Return the most recent non-empty assistant text at/after ``start_index``."""
+        for i in range(len(self.session.messages) - 1, max(0, start_index) - 1, -1):
+            m = self.session.messages[i]
             if m.get("role") == "assistant" and m.get("content"):
                 return str(m["content"]).strip()
         return ""

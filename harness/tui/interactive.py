@@ -6,7 +6,7 @@ from typing import Optional
 from harness.core.agent import HarnessAgent
 from harness.commands.registry import CommandRegistry
 from harness.tui.terminal import TerminalRenderer
-from harness.tui.input_handler import InputHandler, SENTINEL_OPEN_AGENTS, SENTINEL_BACK, VIEW_AGENTS, VIEW_PARENT
+from harness.tui.input_handler import InputHandler, SENTINEL_OPEN_AGENTS, SENTINEL_BACK, VIEW_AGENTS, VIEW_PARENT, is_command_input, no_echo_stdin
 from harness.core.compaction import calculate_history_tokens
 
 def run_interactive(agent: HarnessAgent):
@@ -59,8 +59,9 @@ def run_interactive(agent: HarnessAgent):
                 agent.session_manager.save(agent.session)
             break
 
-        # Check slash command
-        if user_input.startswith("/"):
+        # Check slash command — but only for real commands; a prompt whose first
+        # token is a path (pasted/swiped image or video) goes to the agent.
+        if user_input.startswith("/") and is_command_input(user_input, commands.commands):
             command_result = commands.handle(user_input, agent, renderer)
             if command_result == VIEW_AGENTS:
                 view = VIEW_AGENTS
@@ -74,10 +75,12 @@ def run_interactive(agent: HarnessAgent):
             renderer.print_info("In the agents view. Use /agent <id>, /back, or ESC to return.")
             continue
 
-        # Execute agent step
+        # Execute agent step (echo suppressed so keypresses during the run
+        # never leak as ^C / ^[ control garbage into the terminal).
         try:
-            for ev in agent.step(user_input):
-                renderer.render_agent_event(ev)
+            with no_echo_stdin():
+                for ev in agent.step(user_input):
+                    renderer.render_agent_event(ev)
             renderer.finish_markdown()
             renderer.finish_thinking()
         except KeyboardInterrupt:

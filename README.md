@@ -19,9 +19,15 @@
 - 🏎️ **Ultra-Fast & Low Memory**: Starts in <80ms, runs on **~22MB RAM**, zero heavy framework bloat.
 - 🧠 **Dynamic Thinking Effort & Context Window Detection**:
   - Dynamically measures context window limits and reasoning parameters for **any current or future model** via heuristic token extraction (`-1m`, `-2m`, `-128k`, `-256k`), model family registries, and provider specs.
-  - Native support for Claude 3.7 budget tokens, OpenAI / NIM / OpenRouter / Groq / DeepSeek reasoning effort (`low`/`medium`/`high`), and Gemini thinking budget.
+  - Provider-aware **thinking dialects**: Claude budget tokens, Gemini thinking budget (incl. `includeThoughts`), OpenAI/xAI/Mistral/Groq/Perplexity/DeepSeek reasoning effort, OpenRouter `reasoning` object, Together hybrid reasoning toggle, NVIDIA NIM DeepSeek-V4 `chat_template_kwargs`, and Cohere `thinking.token_budget` — with up-to-date context/output limits for the GPT-5, Claude 4.5, Gemini 2.5, Grok 4, DeepSeek V4, and Command-A generations.
 - 🌐 **16+ First-Class Providers**:
   - Anthropic, OpenAI, Google Gemini, OpenRouter, NVIDIA NIM, OpenCode Zen, Groq, DeepSeek, Mistral AI, xAI (Grok), Ollama (Local), Together AI, Fireworks AI, Cohere, Perplexity Sonar, and an Offline Mock Engine.
+- 🖼️ **Visual & Multimodal Models**:
+  - Send image or video files to vision-capable models by typing the path, **swiping/dropping** the file into the terminal, or **pasting** the file path — auto-detected and converted into the model's native format (OpenAI `image_url`, Gemini `inline_data`, Anthropic `image`/`video` blocks, NVIDIA NIM `input_video`, and `data:` URIs).
+  - Model-aware gating: images attach only when the model supports vision, videos only when the provider accepts native video (Gemini, Anthropic, NVIDIA NIM); otherwise the path degrades into a text reference with a clear warning.
+  - `/models` shows a **Vision** column per model. Capabilities come from the provider's own `/models` metadata (OpenRouter/OpenAI/NIM/Groq `input_modalities` / `vision` flags) when advertised, with a name-heuristic fallback (`4o`, `gemini`, `claude`, `pixtral`, `grok-4`, `llama-4`, `qwen-vl`, `llava`, …) so unknown/future models still get a best-effort guess.
+  - **Vision fallback (VFB)**: set `vfb_provider` (and optionally `vfb_model`) via `/config`; when a file is sent to a non-vision model, it is routed to the fallback vision model which writes a precise description that is embedded as text so the text-only model still understands the image — the user is told the fallback model was used (`🕶️ Vision fallback` / `✔ …description embedded`).
+  - Handles spaced filenames, `file://` URIs, trailing punctuation, dedupes repeats, and enforces a 20MB inline cap.
 - 🛡️ **Three Permission Profiles**:
   - `Secure`: Full interlock — every modification, Python execution, or shell command prompts the user with diffs.
   - `Default`: Balanced — safe read/write operations auto-approved; destructive commands require approval.

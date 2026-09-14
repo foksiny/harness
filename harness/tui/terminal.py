@@ -372,6 +372,37 @@ class TerminalRenderer:
                 first_line = first_line[:140] + "..."
             self.console.print(f"   [{self.theme.success}]✔ Result:[/{self.theme.success}] [dim]{first_line}[/dim]\n")
 
+        elif etype == "attachment":
+            for f in data.get("files", []):
+                kind = "🖼️ image" if f.get("type") == "image" else "🎞️ video"
+                self.console.print(
+                    f"  [{self.theme.accent}]{kind} attached: [bold]{f.get('path', '')}[/bold][/{self.theme.accent}]"
+                )
+
+        elif etype == "attachment_warning":
+            self.console.print(f"[{self.theme.warning}]⚠️  {data.get('message', '')}[/{self.theme.warning}]")
+
+        elif etype == "vfb_notice":
+            provider = data.get("provider", "")
+            model = data.get("model", "")
+            labels = data.get("labels", "media")
+            files = data.get("files", [])
+            shown = ", ".join(os.path.basename(f) for f in files[:3])
+            if len(files) > 3:
+                shown += f" (+{len(files) - 3} more)"
+            self.console.print(
+                f"  [{self.theme.accent}]🕶️ Vision fallback: using [bold]{provider} ({model})[/bold] "
+                f"to describe {labels}: [bold]{shown}[/bold][/{self.theme.accent}]"
+            )
+
+        elif etype == "vfb_result":
+            provider = data.get("provider", "")
+            model = data.get("model", "")
+            self.console.print(
+                f"  [{self.theme.success}]✔ {provider} ({model}) description embedded for "
+                f"the text-only model[/{self.theme.success}]"
+            )
+
         elif etype == "compaction":
             self._finish_markdown()
             before = data.get("before_tokens", 0)
@@ -427,14 +458,16 @@ class TerminalRenderer:
         table.add_column("Model Name", style=f"bold {self.theme.primary}")
         table.add_column("Context Window", justify="right")
         table.add_column("Max Output", justify="right")
+        table.add_column("Vision", justify="center")
         table.add_column("Thinking Support", justify="center")
         table.add_column("Reasoning Format", style="dim")
 
         for m in models_data:
             c_win = f"{m['context']:,} tokens"
+            vision_badge = "[bold cyan]👁 Yes[/bold cyan]" if m.get("vision") else "[dim]No[/dim]"
             th_badge = "[bold green]✔ Yes[/bold green]" if m["thinking"] else "[dim]No[/dim]"
             ttype = m["thinking_type"] or "-"
-            table.add_row(m["name"], c_win, f"{m['output']:,}", th_badge, ttype)
+            table.add_row(m["name"], c_win, f"{m['output']:,}", vision_badge, th_badge, ttype)
 
         self.console.print(table)
         self.console.print(f"[dim]Switch model: `/model <name>`[/dim]\n")

@@ -8,8 +8,30 @@ import urllib.request
 import urllib.error
 from typing import Dict, Any, List, Optional, Iterator
 from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta
+from harness.core.attachments import data_url_for_block
 
 DEFAULT_USER_AGENT = "Harness/1.0"
+
+def _openai_content_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Map canonical attachment blocks to OpenAI-style multimodal content."""
+    out = []
+    for b in blocks:
+        t = b.get("type")
+        if t == "text":
+            out.append({"type": "text", "text": b.get("text", "")})
+            continue
+        url = data_url_for_block(b)
+        if not url:
+            out.append({"type": "text", "text": f"[{t} file unavailable: {b.get('path', '')}]"})
+            continue
+        if t == "image":
+            out.append({"type": "image_url", "image_url": {"url": url}})
+        elif t == "video":
+            # NVIDIA NIM / OpenAI-compatible visions accept inline video this way.
+            out.append({"type": "input_video", "video": url})
+        else:
+            out.append({"type": "text", "text": f"[{t} file unavailable: {b.get('path', '')}]"})
+    return out
 
 class ThinkTagParser:
     """Parses embedded <think>...</think> tags from text content streams."""
@@ -105,7 +127,11 @@ class OpenAICompatibleProvider(BaseProvider):
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content")
-            item: Dict[str, Any] = {"role": role, "content": content or ""}
+            item: Dict[str, Any] = {"role": role}
+            if isinstance(content, list):
+                item["content"] = _openai_content_blocks(content)
+            else:
+                item["content"] = content or ""
             if "tool_calls" in msg and msg["tool_calls"]:
                 item["tool_calls"] = msg["tool_calls"]
             if "tool_call_id" in msg and msg["tool_call_id"]:

@@ -10,11 +10,45 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-from harness.providers.detector import inspect_model, ModelSpec
+from harness.providers.detector import (
+    inspect_model,
+    detect_thinking_support,
+    detect_vision_support,
+    _model_supports_video,
+    ModelSpec,
+)
 
 CACHE_FILE = Path.home() / ".harness" / "models_cache.json"
 UNIVERSAL_CACHE_FILE = Path.home() / ".harness" / "universal_models.json"
 CACHE_TTL = 86400  # 24 hours
+
+# Keys scanned for ``input_modalities`` across provider /models schemas
+# (OpenRouter ``architecture``, OpenAI ``lm``/``llm``, OpenAI-compatible ``item``).
+SERVER_MODALITY_KEYS = "architecture", "llm", "lm"
+
+def _extract_media_capabilities(item: Dict[str, Any]) -> tuple[Optional[bool], Optional[bool]]:
+    """Server-reported image/video input capabilities across provider schemas.
+
+    Returns ``(supports_image, supports_video)`` or ``(None, None)`` when the
+    provider does not advertise media modalities (caller falls back to
+    local heuristics).
+    """
+    if not isinstance(item, dict):
+        return None, None
+    layers = [item]
+    for key in SERVER_MODALITY_KEYS:
+        layer = item.get(key)
+        if isinstance(layer, dict):
+            layers.append(layer)
+    for layer in layers:
+        mods = layer.get("input_modalities")
+        if isinstance(mods, list):
+            return "image" in mods, "video" in mods
+    vis = item.get("vision")
+    if isinstance(vis, bool):
+        return vis, None
+    return None, None
+
 
 def load_cached_models() -> Dict[str, Any]:
     if CACHE_FILE.exists():
@@ -123,15 +157,28 @@ def fetch_remote_models(
                 # Thinking / reasoning capability detection
                 th_support, th_type = detect_thinking_support(mid, prov)
                 desc = str(item.get("description", "")).lower()
+                supported = item.get("supported_parameters") or []
                 if not th_support and any(x in desc for x in ("reasoning", "thinking", "thought")):
                     th_support = True
                     th_type = "reasoning_effort"
+                if not th_support and supported and any(
+                    s in (supported if isinstance(supported, list) else []) for s in ("reasoning", "reasoning_effort", "thinking")
+                ):
+                    th_support = True
+                    th_type = "reasoning_effort"
+
+                # Vision / video: prefer server-reported modalities, else heuristics.
+                sv, svd = _extract_media_capabilities(item)
+                supports_vision = sv if sv is not None else detect_vision_support(mid, prov)
+                supports_video = svd if svd is not None else _model_supports_video(mid, prov)
 
                 models_found.append({
                     "id": mid,
                     "context_length": int(c_len) if c_len else 128000,
                     "supports_thinking": th_support,
                     "thinking_type": th_type,
+                    "supports_vision": supports_vision,
+                    "supports_video": supports_video,
                     "raw": item,
                 })
 
@@ -211,6 +258,24 @@ def resolve_model_spec_dynamic(
                 spec.supports_thinking = True
                 if not spec.thinking_type:
                     spec.thinking_type = m.get("thinking_type") or "reasoning_effort"
+            # Server-reported media capabilities override name heuristics.
+            if "supports_vision" in m:
+                spec.supports_vision = bool(m["supports_vision"])
+            if "supports_video" in m:
+                spec.supports_video = bool(m["supports_video"])
+            _set_provider_output(spec, m)
             break
 
     return spec
+
+
+def _set_provider_output(spec: ModelSpec, model_meta: Dict[str, Any]) -> None:
+    """Adopt a provider-reported max output limit when available (OpenRouter
+    reports it under ``top_provider.max_completion_tokens``)."""
+    try:
+        top = model_meta.get("top_provider") or {}
+        out = model_meta.get("max_completion_tokens") or top.get("max_completion_tokens")
+        if out and isinstance(out, int) and out > 0:
+            spec.max_output_tokens = out
+    except Exception:
+        pass

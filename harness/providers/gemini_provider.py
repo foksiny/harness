@@ -7,6 +7,7 @@ import urllib.request
 import urllib.error
 from typing import Dict, Any, List, Optional, Iterator
 from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta
+from harness.core.attachments import b64_payload_for_block
 
 class GeminiProvider(BaseProvider):
     name = "gemini"
@@ -15,6 +16,23 @@ class GeminiProvider(BaseProvider):
 
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
         super().__init__(api_key=api_key, base_url=base_url or "https://generativelanguage.googleapis.com/v1beta")
+
+    def _user_parts(self, content):
+        """Convert canonical content (str or block list) to Gemini parts."""
+        if not isinstance(content, list):
+            return [{"text": content}]
+        parts = []
+        for b in content:
+            t = b.get("type")
+            if t == "text":
+                parts.append({"text": b.get("text", "")})
+                continue
+            mime, b64 = b64_payload_for_block(b)
+            if mime and b64:
+                parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+            else:
+                parts.append({"text": f"[{t} file unavailable: {b.get('path', '')}]"})
+        return parts
 
     def _convert_contents(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         contents = []
@@ -27,7 +45,7 @@ class GeminiProvider(BaseProvider):
             parts = []
 
             if role == "user":
-                parts.append({"text": content})
+                parts = self._user_parts(content)
                 contents.append({"role": "user", "parts": parts})
             elif role == "assistant":
                 if content:
@@ -83,9 +101,13 @@ class GeminiProvider(BaseProvider):
         gen_config: Dict[str, Any] = {}
         thinking_param = self.normalize_thinking_effort(model_spec, thinking_effort)
         if thinking_param and "thinking_config" in thinking_param:
-            gen_config["thinkingConfig"] = {
-                "thinkingBudget": thinking_param["thinking_config"]["thinking_budget"]
+            cfg = thinking_param["thinking_config"]
+            thinking_config: Dict[str, Any] = {
+                "thinkingBudget": cfg.get("thinking_budget", 8192),
             }
+            if cfg.get("include_thoughts"):
+                thinking_config["includeThoughts"] = True
+            gen_config["thinkingConfig"] = thinking_config
         if gen_config:
             body["generationConfig"] = gen_config
 

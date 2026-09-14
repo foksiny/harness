@@ -15,13 +15,13 @@ PROVIDER_CONFIGS = {
     "anthropic": {
         "class": AnthropicProvider,
         "display_name": "Anthropic Claude",
-        "default_model": "claude-3-7-sonnet",
+        "default_model": "claude-sonnet-4-5",
         "base_url": "https://api.anthropic.com/v1",
     },
     "openai": {
         "class": OpenAICompatibleProvider,
         "display_name": "OpenAI",
-        "default_model": "gpt-4o",
+        "default_model": "gpt-5",
         "base_url": "https://api.openai.com/v1",
     },
     "gemini": {
@@ -33,7 +33,7 @@ PROVIDER_CONFIGS = {
     "openrouter": {
         "class": OpenAICompatibleProvider,
         "display_name": "OpenRouter",
-        "default_model": "anthropic/claude-3.7-sonnet",
+        "default_model": "anthropic/claude-sonnet-4.5",
         "base_url": "https://openrouter.ai/api/v1",
     },
     "nvidia": {
@@ -59,7 +59,7 @@ PROVIDER_CONFIGS = {
     "deepseek": {
         "class": OpenAICompatibleProvider,
         "display_name": "DeepSeek",
-        "default_model": "deepseek-chat",
+        "default_model": "deepseek-flash",
         "base_url": "https://api.deepseek.com/v1",
     },
     "mistral": {
@@ -71,7 +71,7 @@ PROVIDER_CONFIGS = {
     "xai": {
         "class": OpenAICompatibleProvider,
         "display_name": "xAI Grok",
-        "default_model": "grok-2",
+        "default_model": "grok-4.6",
         "base_url": "https://api.x.ai/v1",
     },
     "ollama": {
@@ -95,13 +95,13 @@ PROVIDER_CONFIGS = {
     "cohere": {
         "class": OpenAICompatibleProvider,
         "display_name": "Cohere",
-        "default_model": "command-r-plus-08-2024",
+        "default_model": "command-a-03-2025",
         "base_url": "https://api.cohere.com/v2",
     },
     "perplexity": {
         "class": OpenAICompatibleProvider,
         "display_name": "Perplexity Sonar",
-        "default_model": "sonar-reasoning",
+        "default_model": "sonar-pro",
         "base_url": "https://api.perplexity.ai",
     },
     "mock": {

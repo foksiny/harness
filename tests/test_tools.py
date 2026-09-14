@@ -1,6 +1,8 @@
 """
 Unit tests for Harness tools.
 """
+import base64
+import json
 import os
 import tempfile
 import unittest
@@ -125,6 +127,117 @@ class TestTools(unittest.TestCase):
         self.assertEqual(tool.name, "exa_search")
         self.assertTrue(tool.is_read_only)
         self.assertIn("query", tool.parameters["properties"])
+
+    def test_exa_search_engine_chain_falls_through(self):
+        """A dead engine must never abort the search — the chain moves on."""
+        from unittest import mock
+        tool = ExaSearchTool()
+
+        def fail(query, limit):
+            raise RuntimeError("engine dead")
+
+        def win(query, limit):
+            return [{"title": "Python", "url": "https://python.org", "snippet": "Official site"}]
+
+        # Quando the whole chain dies (offline), return a graceful no-result message.
+        for attr in ("_search_ddg_html", "_search_ddg_lite", "_search_wikipedia", "_search_ddg_instant", "_search_bing"):
+            setattr(tool, attr, fail)
+        tool._enrich = lambda items: None
+        tool._query_variants = lambda q: ["variant"]
+        with mock.patch.object(tool, "_run_chain", side_effect=lambda q, l, s, c, t: None):
+            out = tool.execute("python", num_results=2)
+        self.assertIn("No results found", out)
+
+        # First engine dead, second returns — execute must still succeed.
+        for attr in ("_search_ddg_html", "_search_ddg_lite", "_search_ddg_instant", "_search_bing"):
+            setattr(tool, attr, fail)
+        tool._search_wikipedia = win
+        tool._enrich = lambda items: None
+        out = tool.execute("python", num_results=2)
+        self.assertIn("python.org", out)
+        self.assertIn("Exa Web Search Results", out)
+
+    def test_exa_search_reformulates_on_empty_results(self):
+        """Zero results triggers query reformulation instead of giving up."""
+        tool = ExaSearchTool()
+        calls = []
+        tool._enrich = lambda items: None
+        tool._query_variants = lambda q: ["fix a broken test", "broken test"]
+
+        def record(query, limit):
+            calls.append(query)
+            raise RuntimeError("no network in tests")
+
+        for attr in ("_search_ddg_html", "_search_ddg_lite", "_search_wikipedia", "_search_ddg_instant", "_search_bing"):
+            setattr(tool, attr, record)
+        tool.execute("how do I fix a broken test", num_results=1)
+        # Round 1 ran every engine on the original query before any reformulation.
+        self.assertEqual(calls[:5], ["how do I fix a broken test"] * 5)
+
+    def test_exa_query_variants(self):
+        tool = ExaSearchTool()
+        v = tool._query_variants("how do I fix a broken test?")
+        self.assertEqual(v[0], "fix a broken test")
+        self.assertNotIn("how do I fix a broken test", v)
+        w = tool._query_variants("plain compact query")
+        self.assertEqual(w, ["plain compact"])
+
+    def test_exa_parsers_extract_ddg_html(self):
+        from unittest import mock
+        tool = ExaSearchTool()
+        fake_html = """
+        <div class="result results_links_deep web-result">
+          <h2 class="result__title"><a class="result__a" rel="nofollow"
+              href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdoc&rut=1">
+              Example Doc</a></h2>
+          <a class="result__snippet" href="//duckduckgo.com/l/?uddg=...&rut=2">
+             Figuring out <b>how</b> the API works.</a>
+        </div>
+        """
+        with mock.patch.object(tool, "_fetch", return_value=fake_html):
+            out = tool._search_ddg_html("test query", 5)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["title"], "Example Doc")
+        self.assertEqual(out[0]["url"], "https://example.com/doc")
+        self.assertIn("Figuring out how the API works", out[0]["snippet"])
+
+    def test_exa_unpack_bing_redirect(self):
+        tool = ExaSearchTool()
+        target = base64.urlsafe_b64encode(b"https://docs.python.org/3/").decode()
+        # Bing encodes the target as base64url with an 'a1' prefix.
+        bing = f"https://www.bing.com/ck/a?a=1&amp;u=a1{target}&amp;q=python"
+        self.assertEqual(tool._unpack_redirect(bing), "https://docs.python.org/3/")
+        self.assertEqual(tool._unpack_redirect("https://python.org"), "https://python.org")
+        self.assertEqual(tool._unpack_redirect("//example.com/x"), "https://example.com/x")
+        self.assertEqual(
+            tool._unpack_redirect("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdoc&rut=1"),
+            "https://example.com/doc",
+        )
+
+    def test_exa_parsers_extract_wikipedia_and_bing(self):
+        from unittest import mock
+        tool = ExaSearchTool()
+        wiki_json = json.dumps({
+            "query": {"search": [
+                {"title": "Python (programming language)",
+                 "snippet": "<span class='searchmatch'>Python</span> is a high-level language."},
+            ]},
+        })
+        with mock.patch.object(tool, "_fetch", return_value=wiki_json):
+            items = tool._search_wikipedia("python", 5)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["title"], "Python (programming language)")
+        self.assertTrue(items[0]["url"].startswith("https://en.wikipedia.org/wiki/"))
+
+        bing_html = (
+            '<li class="b_algo"><h2><a href="https://docs.python.org/3/">Python Docs</a></h2>'
+            "<p>Reference documentation for Python.</p></li>"
+        )
+        with mock.patch.object(tool, "_fetch", return_value=bing_html):
+            b = tool._search_bing("python", 5)
+        self.assertEqual(len(b), 1)
+        self.assertEqual(b[0]["title"], "Python Docs")
+        self.assertEqual(b[0]["url"], "https://docs.python.org/3/")
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ from harness.providers.discovery import (
     resolve_model_spec_dynamic,
     load_cached_models,
     save_cached_models,
+    _extract_media_capabilities,
 )
 from harness.tui.terminal import TerminalRenderer
 from harness.core.agent import AgentEvent
@@ -17,11 +18,13 @@ class TestThinkingAndDiscovery(unittest.TestCase):
     def test_deepseek_v4_and_nim_models_detection(self):
         spec_v4 = inspect_model('deepseek-ai/deepseek-v4-pro-0813', 'nvidia')
         self.assertEqual(spec_v4.context_window, 1048576)
-        self.assertFalse(spec_v4.supports_thinking)
+        # DeepSeek-V4 on NVIDIA NIM reasons via chat-template kwargs
+        self.assertTrue(spec_v4.supports_thinking)
+        self.assertEqual(spec_v4.thinking_type, 'chat_template_kwargs')
 
         spec_v4_flash = inspect_model('deepseek-ai/deepseek-v4-flash-0731', 'nvidia')
         self.assertEqual(spec_v4_flash.context_window, 1310720)
-        self.assertFalse(spec_v4_flash.supports_thinking)
+        self.assertTrue(spec_v4_flash.supports_thinking)
 
         # MockProvider dynamic detection test
         from harness.providers.mock_provider import MockProvider
@@ -36,7 +39,7 @@ class TestThinkingAndDiscovery(unittest.TestCase):
         self.assertEqual(spec_r1.thinking_type, 'reasoning_effort')
 
         spec_nemo = inspect_model('nvidia/llama-3.1-nemotron-ultra-253b-v1', 'nvidia')
-        self.assertEqual(spec_nemo.context_window, 128000)
+        self.assertEqual(spec_nemo.context_window, 131072)
         self.assertTrue(spec_nemo.supports_thinking)
 
         spec_llama4 = inspect_model('meta-llama/llama-4-maverick-17b-128e-instruct', 'openrouter')
@@ -105,6 +108,57 @@ class TestThinkingAndDiscovery(unittest.TestCase):
         self.assertEqual(spec.context_window, 327680)
         self.assertTrue(spec.supports_thinking)
         self.assertEqual(spec.thinking_type, 'reasoning_effort')
+
+    def test_extract_media_capabilities_schemas(self):
+        # OpenRouter architecture.input_modalities
+        self.assertEqual(
+            _extract_media_capabilities(
+                {"architecture": {"input_modalities": ["text", "image"]}}),
+            (True, False),
+        )
+        self.assertEqual(
+            _extract_media_capabilities(
+                {"architecture": {"input_modalities": ["text", "image", "video"]}}),
+            (True, True),
+        )
+        # OpenAI lm input_modalities
+        self.assertEqual(
+            _extract_media_capabilities({"lm": {"input_modalities": ["text", "image"]}}),
+            (True, False),
+        )
+        # Groq direct vision flag
+        self.assertEqual(_extract_media_capabilities({"vision": True}), (True, None))
+        self.assertEqual(_extract_media_capabilities({"vision": False}), (False, None))
+        # No schema advertised
+        self.assertEqual(_extract_media_capabilities({"id": "deepseek-chat"}), (None, None))
+        self.assertEqual(_extract_media_capabilities(None), (None, None))
+
+    def test_server_reported_vision_overrides_heuristics(self):
+        cache = load_cached_models()
+        # Heuristic flags nemotron as non-vision; server says it accepts images.
+        cache['test_nim_v2'] = {
+            'timestamp': 9999999999,
+            'models': [
+                {'id': 'nvidia/nemotron-check', 'context_length': 128000,
+                 'supports_vision': True, 'supports_video': True}
+            ]
+        }
+        save_cached_models(cache)
+        spec = resolve_model_spec_dynamic('nvidia/nemotron-check', 'test_nim_v2')
+        self.assertTrue(spec.supports_vision)
+        self.assertTrue(spec.supports_video)
+
+        # Server says text-only for a name that heuristic would call multimodal.
+        cache['test_v3'] = {
+            'timestamp': 9999999999,
+            'models': [
+                {'id': 'gpt-4o-textonly', 'context_length': 128000,
+                 'supports_vision': False, 'supports_video': False}
+            ]
+        }
+        save_cached_models(cache)
+        spec2 = resolve_model_spec_dynamic('gpt-4o-textonly', 'test_v3')
+        self.assertFalse(spec2.supports_vision)
 
     def test_terminal_thinking_event_lifecycle(self):
         renderer = TerminalRenderer('cyberpunk')

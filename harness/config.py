@@ -78,6 +78,9 @@ class HarnessConfig:
     max_subagents: int = 4
     timeout_seconds: int = 120
     swarm_enabled: bool = False      # Enable agent swarms (always active in SUPER mode)
+    force_media_attach: bool = False # Force-attach images even when the model isn't flagged vision-capable
+    vfb_provider: str = "" # Vision fallback provider; when set, degraded media get described via this provider
+    vfb_model: str = ""    # Vision fallback model; empty => the provider's default model
     api_keys: Dict[str, str] = field(default_factory=dict)
     base_urls: Dict[str, str] = field(default_factory=lambda: {
         "ollama": "http://localhost:11434",

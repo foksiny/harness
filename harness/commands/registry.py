@@ -13,7 +13,7 @@ from harness.commands.config_cmd import display_config_table, display_keys_table
 from harness.providers.detector import KNOWN_MODEL_REGISTRY, inspect_model
 from harness.core.checkpoints import get_checkpoint_manager
 from harness.core.agent import AgentEvent
-from harness.tui.input_handler import VIEW_AGENTS, VIEW_PARENT
+from harness.tui.input_handler import VIEW_AGENTS, VIEW_PARENT, no_echo_stdin
 
 class CommandContext:
     def __init__(self, agent: Any, renderer: Any, raw_args: str):
@@ -89,8 +89,9 @@ class CommandRegistry:
             return
         ctx.agent.set_mode(Mode.SUPER)
         ctx.renderer.print_super_banner(ctx.args)
-        for ev in ctx.agent.step(f"AUTONOMOUS GOAL: {ctx.args}"):
-            ctx.renderer.render_agent_event(ev)
+        with no_echo_stdin():
+            for ev in ctx.agent.step(f"AUTONOMOUS GOAL: {ctx.args}"):
+                ctx.renderer.render_agent_event(ev)
 
     def _cmd_mode(self, ctx: CommandContext):
         if not ctx.args:
@@ -164,6 +165,7 @@ class CommandRegistry:
                     "output": 16384,
                     "thinking": rm.get("supports_thinking", False),
                     "thinking_type": rm.get("thinking_type"),
+                    "vision": bool(rm.get("supports_vision", inspect_model(mid, target_prov).supports_vision)),
                 })
 
         # Add known registry models filtered by provider relevance
@@ -209,6 +211,7 @@ class CommandRegistry:
                     "output": spec.max_output_tokens,
                     "thinking": spec.supports_thinking,
                     "thinking_type": spec.thinking_type,
+                    "vision": spec.supports_vision,
                 })
 
         ctx.renderer.print_models_catalog(target_prov, models_data)
@@ -412,7 +415,8 @@ class CommandRegistry:
             return
         stype, prompt = parts[0], parts[1]
         ctx.renderer.print_info(f"Spawning subagent [{stype.upper()}]...")
-        res = ctx.agent.subagent_orchestrator.spawn(stype, prompt)
+        with no_echo_stdin():
+            res = ctx.agent.subagent_orchestrator.spawn(stype, prompt)
         ctx.renderer.print_markdown(f"**Subagent ({res.agent_type}) Output ({res.execution_time}s):**\n\n{res.output}")
         for etype, edata in ctx.agent.subagent_orchestrator.drain_events():
             ctx.renderer.render_agent_event(AgentEvent(etype, edata))
