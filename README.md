@@ -37,6 +37,12 @@
   - Optional OS keychain integration via `keyring` (`pip install harness-cli[secure]`): stores keys in macOS Keychain, GNOME Keyring, or Windows Credential Manager.
   - Automatic one-time migration from legacy plaintext `config.json`.
   - Environment variables remain the first-priority source (ideal for CI/CD).
+- 🌐 **Browser Automation (CDP)**:
+  - Full browser control via Chrome DevTools Protocol — works with any Chromium-based browser (Chrome, Edge, Brave, Zen, Opera, Vivaldi) and Firefox.
+  - Visual overlay banner injected into every page shows the user exactly what the agent is doing (navigating, clicking, typing, etc.) with icons and color-coded status.
+  - 11 tools: `browser_launch`, `browser_navigate`, `browser_click`, `browser_type`, `browser_press_key`, `browser_scroll`, `browser_screenshot`, `browser_evaluate`, `browser_get_page_info`, `browser_tab`, `browser_navigation`.
+  - Auto-detects installed browser, supports headless mode, tab management, full-page screenshots, and JavaScript evaluation.
+  - PLAN mode blocks all browser mutations; `browser_screenshot` and `browser_get_page_info` remain read-only and allowed everywhere.
 - 🎯 **Three Operational Modes**:
   - `Plan`: Purely investigatory & architectural mode. Prevents filesystem mutations and destructive commands.
   - `Build`: Full developer mode. Atomic code edits, file creation, command execution, and test runs.

@@ -44,6 +44,7 @@ class ToolRegistry:
         learning_enabled: bool = True,
         computer_controller_factory: Optional[Any] = None,
         vision_describe: Optional[Any] = None,
+        browser_controller_factory: Optional[Any] = None,
     ):
         self.permission_manager = permission_manager or PermissionManager()
         self.todo_manager = todo_manager or TodoManager()
@@ -53,6 +54,7 @@ class ToolRegistry:
         self.learning_enabled = learning_enabled
         self.computer_controller_factory = computer_controller_factory
         self.vision_describe = vision_describe
+        self.browser_controller_factory = browser_controller_factory
         self.tools: Dict[str, Tool] = {}
         self._register_default_tools(ask_user_handler)
 
@@ -111,6 +113,11 @@ class ToolRegistry:
                 vision_describe=self.vision_describe,
                 permission_manager=self.permission_manager,
             )
+
+        # Browser automation: registered when a browser controller factory is injected.
+        if self.browser_controller_factory is not None:
+            from harness.tools.browser import register_browser_tools
+            register_browser_tools(self, controller_factory=self.browser_controller_factory)
 
         # Learning / self-improvement (lazy: manager loads memory from disk on first use)
         if self.learning_enabled:
