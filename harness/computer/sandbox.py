@@ -18,9 +18,15 @@ import time
 import shutil
 import tempfile
 import subprocess
-import resource
 from typing import Dict, Any, Optional, Tuple
 from pathlib import Path
+
+try:
+    import resource
+    HAS_RESOURCE = True
+except ImportError:
+    resource = None
+    HAS_RESOURCE = False
 
 
 class SandboxResult:
@@ -280,7 +286,8 @@ def _execute_restricted(
         }
         
         # Set resource limits in a wrapper script
-        wrapper_code = f'''
+        if HAS_RESOURCE:
+            wrapper_code = f'''
 import resource
 import sys
 import os
@@ -288,28 +295,34 @@ import os
 # Set memory limit
 try:
     resource.setrlimit(resource.RLIMIT_AS, ({memory_limit_mb * 1024 * 1024}, {memory_limit_mb * 1024 * 1024}))
-except (ValueError, resource.error):
+except (ValueError, resource.error, AttributeError):
     pass
 
 # Set CPU time limit
 try:
     resource.setrlimit(resource.RLIMIT_CPU, ({cpu_time_limit}, {cpu_time_limit}))
-except (ValueError, resource.error):
+except (ValueError, resource.error, AttributeError):
     pass
 
 # Set process limit
 try:
     resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
-except (ValueError, resource.error):
+except (ValueError, resource.error, AttributeError):
     pass
 
 # Set file size limit (10MB)
 try:
     resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 1024 * 1024, 10 * 1024 * 1024))
-except (ValueError, resource.error):
+except (ValueError, resource.error, AttributeError):
     pass
 
 # Execute the target script
+exec(compile(open("{tmp_path}").read(), "{tmp_path}", "exec"))
+'''
+        else:
+            # On Windows, resource module is unavailable, skip limits
+            wrapper_code = f'''
+import sys
 exec(compile(open("{tmp_path}").read(), "{tmp_path}", "exec"))
 '''
         
@@ -317,16 +330,22 @@ exec(compile(open("{tmp_path}").read(), "{tmp_path}", "exec"))
         with open(wrapper_path, "w") as f:
             f.write(wrapper_code)
         
+        # Build subprocess run arguments, avoiding preexec_fn on Windows
+        subprocess_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "timeout": timeout,
+            "cwd": working_dir or os.getcwd(),
+            "env": env,
+        }
+        if HAS_RESOURCE:
+            # Only use preexec_fn on Unix where resource and fork are available
+            subprocess_kwargs["preexec_fn"] = lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
         result = subprocess.run(
             [sys.executable, wrapper_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            cwd=working_dir or os.getcwd(),
-            env=env,
-            # Prevent core dumps and other dangerous behaviors
-            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)),
+            **subprocess_kwargs,
         )
         
         elapsed = time.time() - start_time

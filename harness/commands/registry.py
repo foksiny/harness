@@ -555,8 +555,13 @@ class CommandRegistry:
                     if "VmRSS:" in line:
                         ram_mb = round(int(line.split()[1]) / 1024, 1)
         except Exception:
-            import resource
-            ram_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+            pass
+        if ram_mb == 0.0:
+            try:
+                import resource
+                ram_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+            except Exception:
+                ram_mb = 0.0
 
         if ctx.agent.session is None:
             ctx.renderer.print_info(f"Tokens: 0 | RAM Usage: {ram_mb} MB")
