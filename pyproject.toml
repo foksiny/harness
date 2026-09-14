@@ -36,6 +36,9 @@ full = [
     "httpx>=0.25.0",
     "pydantic>=2.0.0",
 ]
+secure = [
+    "keyring>=24.0.0",
+]
 
 [project.scripts]
 harness = "harness.cli:main"

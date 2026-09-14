@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Dict, Any, Optional, List, Tuple
+from harness import secure_store
 
 USER_CONFIG_DIR = Path.home() / ".harness"
 USER_CONFIG_PATH = USER_CONFIG_DIR / "config.json"
@@ -92,32 +93,37 @@ class HarnessConfig:
     telemetry_enabled: bool = False
 
     def get_api_key(self, provider_name: str) -> Optional[str]:
-        """Get API key from config or environment variable."""
+        """Get API key: secure store -> config in-memory -> environment variables."""
         prov = provider_name.lower().strip()
-        # 1. Config explicit override
+        # 1. Secure store (OS keychain or restricted file)
+        stored = secure_store.get_key(prov)
+        if stored:
+            return stored
+        # 2. Config in-memory override (set during this session)
         if prov in self.api_keys and self.api_keys[prov]:
             return self.api_keys[prov]
-        # 2. Standard mapped environment variables with aliases
+        # 3. Standard mapped environment variables with aliases
         env_vars = ENV_KEY_MAPPINGS.get(prov, [])
         for ev in env_vars:
             val = os.environ.get(ev)
             if val:
                 return val
-        # 3. Fallback generic ENV format
+        # 4. Fallback generic ENV format
         generic_env = f"{prov.upper()}_API_KEY"
         return os.environ.get(generic_env)
 
     def set_api_key(self, provider_name: str, key: str) -> None:
-        """Store API key for a provider."""
-        self.api_keys[provider_name.lower().strip()] = key.strip()
+        """Store API key in secure store and in-memory cache."""
+        prov = provider_name.lower().strip()
+        clean = key.strip()
+        self.api_keys[prov] = clean
+        secure_store.set_key(prov, clean)
 
     def remove_api_key(self, provider_name: str) -> bool:
-        """Remove API key for a provider."""
+        """Remove API key from secure store and in-memory cache."""
         prov = provider_name.lower().strip()
-        if prov in self.api_keys:
-            del self.api_keys[prov]
-            return True
-        return False
+        self.api_keys.pop(prov, None)
+        return secure_store.remove_key(prov)
 
     def list_keys_status(self) -> List[Dict[str, Any]]:
         """Return status and masked keys for all supported providers."""
@@ -211,22 +217,26 @@ def load_config() -> HarnessConfig:
         except Exception:
             pass
 
+    # Migrate any plaintext api_keys from config.json into secure store
+    if config.api_keys:
+        secure_store.migrate_plaintext_keys(config.api_keys)
+        # Populate in-memory cache from secure store
+        for prov in list(config.api_keys.keys()):
+            config.api_keys[prov] = secure_store.get_key(prov) or ""
+
+    # Enforce restrictive file permissions on config files
+    secure_store.ensure_file_permissions()
+
     return config
 
 def save_config(config: HarnessConfig, global_only: bool = True) -> None:
-    """Save configuration to disk while safely preserving all configured API keys."""
+    """Save configuration to disk. API keys are stored in secure store, not config.json."""
     target_path = USER_CONFIG_PATH if global_only else WORKSPACE_CONFIG_PATH
     target_path.parent.mkdir(parents=True, exist_ok=True)
     data = config.to_dict()
-    if target_path.exists():
-        try:
-            with open(target_path, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-            disk_keys = existing.get("api_keys", {})
-            for k, v in disk_keys.items():
-                if k not in data["api_keys"] or not data["api_keys"][k]:
-                    data["api_keys"][k] = v
-        except Exception:
-            pass
+    # API keys live in secure store; strip from config.json
+    data.pop("api_keys", None)
     with open(target_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+    # Enforce restrictive permissions
+    secure_store.ensure_file_permissions()

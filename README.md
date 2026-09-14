@@ -32,6 +32,11 @@
   - `Secure`: Full interlock — every modification, Python execution, or shell command prompts the user with diffs.
   - `Default`: Balanced — safe read/write operations auto-approved; destructive commands require approval.
   - `Full Access`: Unrestricted autonomous operation.
+- 🔐 **Secure API Key Storage**:
+  - Keys stored in `~/.harness/api_keys.json` with `0600` permissions (owner read/write only).
+  - Optional OS keychain integration via `keyring` (`pip install harness-cli[secure]`): stores keys in macOS Keychain, GNOME Keyring, or Windows Credential Manager.
+  - Automatic one-time migration from legacy plaintext `config.json`.
+  - Environment variables remain the first-priority source (ideal for CI/CD).
 - 🎯 **Three Operational Modes**:
   - `Plan`: Purely investigatory & architectural mode. Prevents filesystem mutations and destructive commands.
   - `Build`: Full developer mode. Atomic code edits, file creation, command execution, and test runs.
@@ -223,6 +228,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing convention
 ## 🔒 Security Notes
 
 - **`execute_python` is not sandboxed.** AST analysis detects dangerous patterns but cannot prevent runtime escapes (getattr, indirect __import__, string construction). Use `--mode plan --perm secure` for untrusted code, or run in a container/VM.
-- **API keys are stored in plaintext** at `~/.harness/config.json`. The display is masked (`mask_key`), but disk storage is unencrypted. Protect your home directory or use environment variables.
+- **API keys use secure storage.** Keys are stored in `~/.harness/api_keys.json` with `0600` permissions (owner-only). If `keyring` is installed (`pip install harness-cli[secure]`), keys go to your OS keychain (macOS Keychain, GNOME Keyring, Windows Credential Manager). Environment variables remain the recommended approach for CI/CD.
 - **Full Access mode is unrestricted.** All tools execute without approval. Only use in controlled environments with trusted code.
 - **Recommended for untrusted scenarios**: `--mode plan --perm secure`, disposable API keys, and audit commands before approving.
