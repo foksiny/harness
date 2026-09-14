@@ -28,6 +28,11 @@
   - `/models` shows a **Vision** column per model. Capabilities come from the provider's own `/models` metadata (OpenRouter/OpenAI/NIM/Groq `input_modalities` / `vision` flags) when advertised, with a name-heuristic fallback (`4o`, `gemini`, `claude`, `pixtral`, `grok-4`, `llama-4`, `qwen-vl`, `llava`, …) so unknown/future models still get a best-effort guess.
   - **Vision fallback (VFB)**: set `vfb_provider` (and optionally `vfb_model`) via `/config`; when a file is sent to a non-vision model, it is routed to the fallback vision model which writes a precise description that is embedded as text so the text-only model still understands the image — the user is told the fallback model was used (`🕶️ Vision fallback` / `✔ …description embedded`). The VFB description is **guided by your prompt**: your question is injected into both the system prompt and the user message, so the description focuses on what you actually asked about while remaining comprehensive.
   - Handles spaced filenames, `file://` URIs, trailing punctuation, dedupes repeats, and enforces a 20MB inline cap.
+- 📎 **File & Folder Mentions (`@`)**:
+  - Reference any local file or directory in a prompt with `@path/to/file` or `@/absolute/path`. The mention is expanded inline before the model sees it:
+    - **Files**: summary includes line count, character count, and the first 10 lines (rest truncated). Binary files show size and a short byte preview. The model learns from the snippet rather than ingesting the whole file.
+    - **Folders**: a limited directory tree is rendered up to 2 levels deep (80 items per directory). You get a quick structural overview without flooding context.
+  - Mentions resolve relative to the current working directory or absolute paths. Unresolvable mentions emit a warning but leave the original `@…` text intact.
 - 🛡️ **Three Permission Profiles**:
   - `Secure`: Full interlock — every modification, Python execution, or shell command prompts the user with diffs.
   - `Default`: Balanced — safe read/write operations auto-approved; destructive commands require approval.

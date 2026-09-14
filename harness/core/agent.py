@@ -4,6 +4,7 @@ Coordinates autonomous reasoning loops, tool invocations, Super Mode iterations,
 and session state persistence.
 """
 import json
+import os
 import time
 from typing import Dict, Any, List, Optional, Callable, Generator, Tuple
 from harness.core.modes import Mode
@@ -16,6 +17,7 @@ from harness.core.checkpoints import CheckpointManager, get_checkpoint_manager, 
 from harness.core.subagents import SubagentOrchestrator
 from harness.core.learning import LearningManager
 from harness.core.attachments import parse_attachments
+from harness.core.mentions import expand_mentions
 from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta
 from harness.providers import get_provider
 from harness.tools import ToolRegistry
@@ -501,6 +503,10 @@ class HarnessAgent:
         if user_prompt:
             self.ensure_session()
             clean_text, media_blocks, attach_warnings = parse_attachments(user_prompt)
+            # Expand @-mentions after media removal so summaries don't trigger further media detection
+            clean_text, mention_warnings = expand_mentions(clean_text, cwd=os.getcwd())
+            if mention_warnings:
+                attach_warnings.extend(mention_warnings)
             model_spec = self.provider.get_model_spec(self.session.model)
             supported, degraded = [], []
             for b in media_blocks:
