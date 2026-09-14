@@ -57,8 +57,8 @@ While any subagent or swarm is running, every worker's activity is streamed live
 When a delegation finishes, the report you receive already includes each agent's `[Actions performed by this agent]` log, so you see exactly what was done even if its final reply was terse.
 - ❓ **Model-Driven User Questions (`ask_user`)**:
   - When encountering architectural decisions or ambiguities, the model proactively prompts the user with formatted choices, recommended options, or write-ins.
-- 🐍 **Python Code Execution with AST Safety Inspection (`execute_python`)**:
-  - Model can run Python code with syntax tree analysis detecting sensitive system calls and enforcing permission rules.
+- 🐍 **Python Code Execution with Risk Detection (`execute_python`)**:
+  - Model can run Python code via subprocess. AST analysis detects dangerous patterns (os.system, subprocess, ctypes, etc.) and surfaces risk levels; approval is required for HIGH/CRITICAL risk under DEFAULT/SECURE modes. **This is not a sandbox** — it is risk detection + user gating. Code can bypass AST checks via runtime string construction, getattr, or indirect imports. Only run code you trust, in controlled environments.
 - 🔎 **Free Exa Web Search (`exa_search`)**:
   - Built-in real-time web search with zero API key required.
 - 📋 **Integrated To-Do Tracking (`todo_create`, `todo_update`, `todo_list`)**:
@@ -203,3 +203,12 @@ python3 -m unittest discover -s tests -v
 ```
 
 All 38 test suites verify tools, Python safety, model context window detection, provider payloads, compaction, subagent isolation, skills, and slash commands.
+
+---
+
+## 🔒 Security Notes
+
+- **`execute_python` is not sandboxed.** AST analysis detects dangerous patterns but cannot prevent runtime escapes (getattr, indirect __import__, string construction). Use `--mode plan --perm secure` for untrusted code, or run in a container/VM.
+- **API keys are stored in plaintext** at `~/. Harness/config.json`. The display is masked (`mask_key`), but disk storage is unencrypted. Protect your home directory or use environment variables.
+- **Full Access mode is unrestricted.** All tools execute without approval. Only use in controlled environments with trusted code.
+- **Recommended for untrusted scenarios**: `--mode plan --perm secure`, disposable API keys, and audit commands before approving.
