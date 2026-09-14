@@ -3,7 +3,7 @@ Tool Registry and Execution Dispatcher for Harness.
 """
 from typing import Dict, Any, List, Optional
 from harness.tools.base import Tool
-from harness.tools.filesystem import ViewFileTool, EditFileTool, WriteFileTool, ListDirTool, FindFilesTool
+from harness.tools.filesystem import ViewFileTool, EditFileTool, WriteFileTool, ListDirTool, FindFilesTool, DeleteFileTool
 from harness.tools.search import GrepSearchTool
 from harness.tools.execution import RunCommandTool
 from harness.tools.python_exec import ExecutePythonTool
@@ -65,6 +65,7 @@ class ToolRegistry:
         self.register(WriteFileTool())
         self.register(ListDirTool())
         self.register(FindFilesTool())
+        self.register(DeleteFileTool())
 
         # Search
         self.register(GrepSearchTool())

@@ -3,6 +3,10 @@ Subagent Orchestration Engine for Harness.
 Dispatches specialized worker agents with isolated context windows and synthesizes
 results back to the primary agent thread. Supports concurrent agent swarms that
 coordinate through a shared in-memory message bus (the "main thread").
+
+All subagents run in parallel (threaded). The main agent can continue working
+while subagents process in the background. Subagents run until they call
+`finish` or hit a safety limit (200 turns).
 """
 import threading
 import time
@@ -14,6 +18,9 @@ from typing import Dict, Any, List, Optional, Callable
 # the agent runner so that tools (swarm_send_message, swarm_read_messages) resolve
 # the correct message bus and sender identity.
 _SWARM_TLS = threading.local()
+
+# Subagents run until they call `finish` or hit this safety limit.
+MAX_TURNS = 200
 
 
 class SubagentType(str, Enum):
@@ -30,8 +37,6 @@ class SubagentConfig:
     agent_type: SubagentType
     system_prompt: str
     allowed_tools: List[str]
-    max_turns: int = 10
-    timeout_seconds: int = 60
 
 
 SUBAGENT_ROLES: Dict[SubagentType, SubagentConfig] = {
@@ -43,7 +48,6 @@ SUBAGENT_ROLES: Dict[SubagentType, SubagentConfig] = {
             "or run destructive commands. Provide a clear, structured factual summary of your findings."
         ),
         allowed_tools=["view_file", "list_dir", "find_files", "grep_search", "exa_search"],
-        max_turns=12,
     ),
     SubagentType.PLANNER: SubagentConfig(
         agent_type=SubagentType.PLANNER,
@@ -52,7 +56,6 @@ SUBAGENT_ROLES: Dict[SubagentType, SubagentConfig] = {
             "decompose complex goals into sequential atomic tasks, and define verification milestones."
         ),
         allowed_tools=["view_file", "list_dir", "find_files", "grep_search", "todo_create"],
-        max_turns=6,
     ),
     SubagentType.CODER: SubagentConfig(
         agent_type=SubagentType.CODER,
@@ -61,7 +64,6 @@ SUBAGENT_ROLES: Dict[SubagentType, SubagentConfig] = {
             "and atomic code changes. Adhere to existing project conventions and verify changes."
         ),
         allowed_tools=["view_file", "edit_file", "write_file", "list_dir", "find_files", "grep_search", "run_command", "execute_python"],
-        max_turns=15,
     ),
     SubagentType.TESTER: SubagentConfig(
         agent_type=SubagentType.TESTER,
@@ -70,7 +72,6 @@ SUBAGENT_ROLES: Dict[SubagentType, SubagentConfig] = {
             "run test commands, analyze failures, and verify fixes."
         ),
         allowed_tools=["view_file", "write_file", "edit_file", "run_command", "execute_python"],
-        max_turns=10,
     ),
     SubagentType.REVIEWER: SubagentConfig(
         agent_type=SubagentType.REVIEWER,
@@ -79,7 +80,6 @@ SUBAGENT_ROLES: Dict[SubagentType, SubagentConfig] = {
             "edge cases, performance bottlenecks, and regressions."
         ),
         allowed_tools=["view_file", "git_diff", "git_status", "grep_search"],
-        max_turns=6,
     ),
 }
 
@@ -232,12 +232,19 @@ class SubagentRecord:
 
 
 class SubagentOrchestrator:
-    """Spawns and monitors subagents, and coordinates concurrent agent swarms."""
+    """Spawns and monitors subagents, and coordinates concurrent agent swarms.
+
+    All subagents run in parallel via daemon threads. The main agent can continue
+    working while subagents process in the background. Subagents run until they
+    call `finish` or hit MAX_TURNS.
+    """
 
     def __init__(self, agent_runner: Optional[Callable] = None):
         self.agent_runner = agent_runner
         self.active_subagents: List[SubagentResult] = []
         self._spawn_counter: int = 0
+        self._active_threads: List[threading.Thread] = []
+        self._threads_lock = threading.Lock()
         # Persistent "main thread" bus. Worker threads bind a per-run bus via
         # thread-local context; the main agent falls back to this shared bus.
         self.bus = SwarmMessageBus()
@@ -251,6 +258,7 @@ class SubagentOrchestrator:
         self._records_lock = threading.Lock()
         self._event_log: List[tuple] = []
         self._event_lock = threading.Lock()
+        self._results_lock = threading.Lock()
 
     # ---- Subagent activity recording (used by the agent host) ----
 
@@ -339,6 +347,18 @@ class SubagentOrchestrator:
         self.parent_mode = parent_mode
         self.interactive_deny_fn = interactive_deny_fn
 
+    def wait_for_all(self, timeout: Optional[float] = None) -> None:
+        """Block until all active background threads finish."""
+        with self._threads_lock:
+            threads = list(self._active_threads)
+        for t in threads:
+            t.join(timeout=timeout)
+
+    def active_count(self) -> int:
+        """Return the number of currently running background threads."""
+        with self._threads_lock:
+            return sum(1 for t in self._active_threads if t.is_alive())
+
     # ---- Inter-agent messaging (used by the swarm tools) ----
 
     def post_message(self, recipient: str, body: str) -> SwarmMessage:
@@ -355,8 +375,14 @@ class SubagentOrchestrator:
 
     # ---- Subagent scheduling ----
 
-    def spawn(self, agent_type_str: str, prompt: str, runner_override: Optional[Callable] = None) -> SubagentResult:
-        """Spawn an isolated subagent worker."""
+    def spawn(self, agent_type_str: str, prompt: str, runner_override: Optional[Callable] = None,
+              background: bool = True) -> SubagentResult:
+        """Spawn an isolated subagent worker.
+
+        When ``background=True`` (the default), the subagent runs on a daemon
+        thread and returns immediately with a placeholder result. When
+        ``background=False``, the thread is joined before returning.
+        """
         try:
             stype = SubagentType(agent_type_str.lower().strip())
         except ValueError:
@@ -375,52 +401,91 @@ class SubagentOrchestrator:
         start_time = time.time()
         runner = runner_override or self.agent_runner
 
-        if runner:
-            try:
-                output, turns = runner(
-                    cfg.system_prompt, prompt, cfg.allowed_tools, cfg.max_turns,
-                    agent_id=agent_id,
-                    agent_type=stype.value,
-                )
+        # Placeholder result for background mode
+        placeholder = SubagentResult(
+            agent_type=stype.value,
+            task=prompt,
+            status="running",
+            turns_taken=0,
+            output="",
+            execution_time=0,
+        )
+
+        def _worker():
+            nonlocal placeholder
+            if runner:
+                try:
+                    output, turns = runner(
+                        cfg.system_prompt, prompt, cfg.allowed_tools, MAX_TURNS,
+                        agent_id=agent_id,
+                        agent_type=stype.value,
+                    )
+                    status = "completed"
+                except Exception as e:
+                    output = f"Subagent error: {str(e)}"
+                    turns = 0
+                    status = "failed"
+            else:
+                output = f"Subagent ({stype.value}) completed task analysis: {prompt[:100]}..."
+                turns = 1
                 status = "completed"
-            except Exception as e:
-                output = f"Subagent error: {str(e)}"
-                turns = 0
-                status = "failed"
+
+            elapsed = time.time() - start_time
+            self.finish_subagent(agent_id, status, turns, output)
+
+            res = SubagentResult(
+                agent_type=stype.value,
+                task=prompt,
+                status=status,
+                turns_taken=turns,
+                output=output,
+                execution_time=round(elapsed, 2),
+            )
+            with self._results_lock:
+                self.active_subagents.append(res)
+                placeholder = res
+
+        if runner:
+            t = threading.Thread(target=_worker, daemon=True)
+            with self._threads_lock:
+                self._active_threads.append(t)
+            t.start()
+
+            if not background:
+                t.join()
+                with self._results_lock:
+                    return placeholder
+            return placeholder
         else:
             # Fallback simulated response
             output = f"Subagent ({stype.value}) completed task analysis: {prompt[:100]}..."
-            turns = 1
-            status = "completed"
+            elapsed = 0.01
+            self.finish_subagent(agent_id, "completed", 1, output)
+            res = SubagentResult(
+                agent_type=stype.value,
+                task=prompt,
+                status="completed",
+                turns_taken=1,
+                output=output,
+                execution_time=elapsed,
+            )
+            with self._results_lock:
+                self.active_subagents.append(res)
+            return res
 
-        elapsed = time.time() - start_time
-        self.finish_subagent(agent_id, status, turns, output)
-
-        res = SubagentResult(
-            agent_type=stype.value,
-            task=prompt,
-            status=status,
-            turns_taken=turns,
-            output=output,
-            execution_time=round(elapsed, 2),
-        )
-        self.active_subagents.append(res)
-        return res
-
-    def launch_swarm(self, agents: List[Dict[str, Any]]) -> SwarmResult:
+    def launch_swarm(self, agents: List[Dict[str, Any]], background: bool = True) -> SwarmResult:
         """Execute multiple specialized agents concurrently as a swarm.
 
         Each agent runs on its own thread with a unique ``agent_id`` and a shared
-        per-swarm message bus. All threads are joined before returning the combined
-        report so the parent "main thread" receives a fully synthesized outcome.
+        per-swarm message bus. When ``background=True`` (the default), threads are
+        started and a result is returned immediately. When ``background=False``,
+        all threads are joined before returning the combined report.
         """
         run_bus = SwarmMessageBus()
         seed_index = run_bus.length
         results: List[Optional[SubagentResult]] = [None] * len(agents)
         threads: List[threading.Thread] = []
 
-# Worker threads must never block on interactive approval prompts; the parent
-        # agent is blocked in launch_swarm, so toggling is race-free here.
         if self.interactive_deny_fn:
             self.interactive_deny_fn(True)
         try:
@@ -447,10 +512,11 @@ class SubagentOrchestrator:
                 threads.append(t)
                 t.start()
 
-            for t in threads:
-                t.join()
+            if not background:
+                for t in threads:
+                    t.join()
         finally:
-            if self.interactive_deny_fn:
+            if not background and self.interactive_deny_fn:
                 self.interactive_deny_fn(False)
 
         completed = [r for r in results if r is not None]
@@ -477,7 +543,7 @@ class SubagentOrchestrator:
                     run_kwargs["model"] = self.model
                 if self.parent_mode is not None:
                     run_kwargs["mode"] = self.parent_mode
-                output, turns = runner(cfg.system_prompt, prompt, allowed_tools, cfg.max_turns, **run_kwargs)
+                output, turns = runner(cfg.system_prompt, prompt, allowed_tools, MAX_TURNS, **run_kwargs)
                 status = "completed"
             except Exception as e:
                 output = f"Subagent error: {str(e)}"

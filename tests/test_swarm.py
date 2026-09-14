@@ -108,7 +108,7 @@ class TestSwarmOrchestrator(unittest.TestCase):
             return "ok", 1
 
         orch = SubagentOrchestrator(mock_runner)
-        orch.spawn("researcher", "explore")
+        orch.spawn("researcher", "explore", background=False)
         self.assertNotIn("swarm_send_message", calls[0])
         self.assertNotIn("swarm_read_messages", calls[0])
         # Spawned agents get a stable agent id for TUI record tracking.
@@ -139,7 +139,7 @@ class TestSwarmOrchestrator(unittest.TestCase):
             {"agent_type": "researcher", "task": "search auth"},
             {"agent_type": "coder", "task": "implement"},
             {"agent_type": "tester", "task": "write tests"},
-        ])
+        ], background=False)
 
         self.assertEqual(len(result.workers), 3)
         self.assertTrue(all(w.status == "completed" for w in result.workers))
@@ -235,7 +235,7 @@ class TestSwarmTools(unittest.TestCase):
         res = tool.execute(agents=[
             {"agent_type": "researcher", "task": "explore"},
             {"agent_type": "tester", "task": "verify"},
-        ])
+        ], background=False)
         self.assertTrue(res.startswith("=== SWARM EXECUTION REPORT ==="))
         for prompt in ("explore", "verify"):
             self.assertIn(prompt, calls)
@@ -428,7 +428,7 @@ class TestSwarmActivityTracking(unittest.TestCase):
 
         result = agent.subagent_orchestrator.launch_swarm([
             {"agent_type": "researcher", "task": "check the file"},
-        ])
+        ], background=False)
         output = result.workers[0].output
         self.assertTrue(output.startswith("done."))
         self.assertIn("[Actions performed by this agent]", output)

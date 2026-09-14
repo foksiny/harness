@@ -130,6 +130,9 @@ class HarnessAgent:
                 permission=self.permission_manager.level.value,
                 thinking_effort=self.config.thinking_effort,
             )
+        else:
+            # Restore todos from existing session (e.g., on resume)
+            self._restore_todos_from_session()
         return self.session
 
     def set_mode(self, mode: Mode):
@@ -384,11 +387,14 @@ class HarnessAgent:
         return get_provider(self.config.vfb_provider, self.config)
 
     def _run_vision_fallback(
-        self, media_blocks: List[Dict[str, Any]]
+        self, media_blocks: List[Dict[str, Any]], user_prompt: Optional[str] = None
     ) -> Generator[AgentEvent, None, Tuple[Optional[str], str]]:
         """Ask the configured vision-fallback provider/model to describe the given
         media as text for a non-visual model. Yields UX events, returns a tuple of
-        (description, error) where exactly one is set on completion."""
+        (description, error) where exactly one is set on completion.
+
+        When ``user_prompt`` is provided, it is used to guide the VFB description
+        so the model focuses on what the user actually asked about."""
         vfb_provider = self._get_vfb_provider()
         vfb_model = self.config.vfb_model.strip() or vfb_provider.default_model
         display = getattr(vfb_provider, "display_name", getattr(vfb_provider, "name", "vision fallback"))
@@ -425,15 +431,36 @@ class HarnessAgent:
             "files": files,
         })
 
-        system_prompt = (
+        # Build a context-aware system prompt that incorporates the user's question
+        base_system = (
             "You are a precise vision-description sub-agent. Describe each provided "
             "file in exhaustive objective detail so that a text-only model which "
             "cannot see it can fully understand it: subjects, actions, spatial layout, "
             "colors, quantities, any readable text or labels, diagrams, and notable "
             "defects. Be literal and complete rather than brief."
         )
+        if user_prompt and user_prompt.strip():
+            system_prompt = (
+                f"{base_system}\n\n"
+                f"The user's request is: {user_prompt.strip()}\n"
+                f"Focus your description on details relevant to the user's request, "
+                f"but still provide comprehensive coverage of the image content."
+            )
+        else:
+            system_prompt = base_system
+
+        # Build user message - if user has a question, use it to guide the description
+        if user_prompt and user_prompt.strip():
+            user_text = (
+                f"The user asked: {user_prompt.strip()}\n\n"
+                f"Describe the attached image(s) with focus on answering their question "
+                f"while providing full contextual detail."
+            )
+        else:
+            user_text = "Describe each of the following files precisely:"
+
         content: List[Dict[str, Any]] = [
-            {"type": "text", "text": "Describe each of the following files precisely:"},
+            {"type": "text", "text": user_text},
             *media_blocks,
         ]
 
@@ -490,7 +517,7 @@ class HarnessAgent:
             # user informed that the fallback model is being used.
             vfb_description, vfb_err = None, ""
             if degraded and self.config.vfb_provider.strip():
-                vfb_gen = self._run_vision_fallback(degraded)
+                vfb_gen = self._run_vision_fallback(degraded, user_prompt=clean_text)
                 try:
                     while True:
                         try:
@@ -789,10 +816,12 @@ class HarnessAgent:
                 break
 
             # Save session state
+            self._sync_todos_to_session()
             self.session_manager.save(self.session)
             yield AgentEvent("step_end", {"step": current_loop, "complete": False})
 
         self.is_running = False
+        self._sync_todos_to_session()
         self.session_manager.save(self.session)
         self._maybe_auto_learn(user_prompt)
         yield AgentEvent("turn_complete", {"messages_count": len(self.session.messages)})
@@ -804,6 +833,16 @@ class HarnessAgent:
             if m.get("role") == "assistant" and m.get("content"):
                 return str(m["content"]).strip()
         return ""
+
+    def _sync_todos_to_session(self) -> None:
+        """Sync in-memory TodoManager state to the session for persistence."""
+        if self.session is not None:
+            self.session.todos = self.todo_manager.to_list()
+
+    def _restore_todos_from_session(self) -> None:
+        """Restore TodoManager state from session (called on session load)."""
+        if self.session is not None and self.session.todos:
+            self.todo_manager.load_list(self.session.todos)
 
     def _maybe_auto_learn(self, user_prompt: Optional[str]) -> None:
         """Cheap, deterministic heuristic capture: no extra provider call.

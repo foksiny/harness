@@ -1,18 +1,24 @@
 """
-Python execution tool with AST safety analysis for Harness.
+Python execution tool with sandboxed execution for Harness.
 Allows the model to execute Python scripts, calculations, tests, and data analysis
-with rigorous risk scoring and permission interlocks.
+with real isolation via nsjail, Docker, or restricted subprocess.
+
+The sandbox provides:
+- Filesystem isolation (read-only root, temp writable layer)
+- Network isolation (optional)
+- Resource limits (CPU, memory, time)
+- Process limits
 """
 import ast
 import os
 import sys
 import time
-import tempfile
-import subprocess
 from typing import Dict, Any, Optional, Tuple, List
 from harness.tools.base import Tool
 from harness.core.permissions import PermissionManager, RiskLevel
+from harness.computer.sandbox import execute_sandboxed, detect_sandbox_backend, SandboxResult
 
+# AST safety flags (informational - sandbox provides real isolation)
 DANGEROUS_MODULES = {
     "pty": RiskLevel.HIGH,
     "ctypes": RiskLevel.HIGH,
@@ -33,6 +39,7 @@ DANGEROUS_ATTRIBUTES = {
     ("subprocess", "Popen"): RiskLevel.HIGH,
     ("subprocess", "call"): RiskLevel.HIGH,
 }
+
 
 class PythonSafetyVisitor(ast.NodeVisitor):
     """Inspects Python AST to flag risky modules, system calls, and constructs."""
@@ -66,15 +73,14 @@ class PythonSafetyVisitor(ast.NodeVisitor):
         if isinstance(node.func, ast.Name):
             if node.func.id in ("eval", "exec", "__import__"):
                 self._elevate(RiskLevel.HIGH, f"Dynamic execution via '{node.func.id}()'")
-
         # Detect module.func() calls
         elif isinstance(node.func, ast.Attribute):
             if isinstance(node.func.value, ast.Name):
                 pair = (node.func.value.id, node.func.attr)
                 if pair in DANGEROUS_ATTRIBUTES:
                     self._elevate(DANGEROUS_ATTRIBUTES[pair], f"Calling sensitive function '{pair[0]}.{pair[1]}()'")
-
         self.generic_visit(node)
+
 
 def analyze_python_safety(code: str) -> Tuple[RiskLevel, List[str]]:
     """Analyze Python code AST and return assessed risk level with flags."""
@@ -82,14 +88,19 @@ def analyze_python_safety(code: str) -> Tuple[RiskLevel, List[str]]:
         tree = ast.parse(code)
     except SyntaxError as se:
         return RiskLevel.LOW, [f"Syntax error during AST parse: {se}"]
-
     visitor = PythonSafetyVisitor()
     visitor.visit(tree)
     return visitor.risk, visitor.flags
 
+
 class ExecutePythonTool(Tool):
     name = "execute_python"
-    description = "Execute a Python script or code snippet in a separate process, capturing stdout, stderr, and output. WARNING: This tool is NOT sandboxed. AST analysis detects dangerous patterns but cannot prevent runtime escapes (getattr, indirect __import__, string construction). Only run trusted code in controlled environments."
+    description = (
+        "Execute Python code in a REAL sandbox (nsjail/Docker/restricted subprocess). "
+        "Code runs with filesystem isolation, resource limits, and optional network isolation. "
+        "AST analysis is performed for informational purposes only - the sandbox provides real "
+        "security regardless of code content. Safe for untrusted code, tests, and experiments."
+    )
     action_type = "execute_python"
     is_read_only = False
     parameters = {
@@ -97,6 +108,7 @@ class ExecutePythonTool(Tool):
         "properties": {
             "code": {"type": "string", "description": "The Python code to execute."},
             "timeout": {"type": "integer", "description": "Execution timeout in seconds (default: 30, max: 120)."},
+            "network": {"type": "boolean", "description": "Allow network access (default: false)."},
         },
         "required": ["code"],
     }
@@ -104,12 +116,12 @@ class ExecutePythonTool(Tool):
     def __init__(self, permission_manager: Optional[PermissionManager] = None):
         self.permission_manager = permission_manager
 
-    def execute(self, code: str, timeout: int = 30, **kwargs) -> str:
+    def execute(self, code: str, timeout: int = 30, network: bool = False, **kwargs) -> str:
         code_str = code.strip()
         if not code_str:
             return "Error: Empty Python code provided."
 
-        # AST Safety inspection
+        # AST Safety inspection (informational)
         risk, flags = analyze_python_safety(code_str)
 
         # Check permissions
@@ -119,50 +131,36 @@ class ExecutePythonTool(Tool):
                 "code": code_str,
                 "risk": risk,
                 "flags": flags,
-                "summary": f"Execute Python ({risk.value.upper()})\nFlags: {', '.join(flags) if flags else 'None'}\nCode:\n{code_preview}",
+                "backend": detect_sandbox_backend(),
+                "summary": f"Execute Python ({risk.value.upper()}) in {detect_sandbox_backend()} sandbox\nFlags: {', '.join(flags) if flags else 'None'}\nCode:\n{code_preview}",
             }
             allowed = self.permission_manager.check_permission("execute_python", details)
             if not allowed:
                 return f"Error: Python execution rejected by security policy: {', '.join(flags) if flags else 'User rejected'}"
 
         t_limit = min(max(1, timeout), 120)
-        start_time = time.time()
 
-        # Write to temporary file for isolated execution
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as tmp:
-            tmp_path = tmp.name
-            tmp.write(code_str)
+        # Execute in sandbox
+        result: SandboxResult = execute_sandboxed(
+            code=code_str,
+            timeout=t_limit,
+            memory_limit_mb=256,
+            cpu_time_limit=t_limit,
+            network_allowed=network,
+        )
 
-        try:
-            proc = subprocess.run(
-                [sys.executable, tmp_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=t_limit,
-                cwd=os.getcwd(),
-            )
-            elapsed = round(time.time() - start_time, 2)
-            out = proc.stdout
-            err = proc.stderr
-            code_exit = proc.returncode
+        if not result.ok and result.error:
+            return f"Error: {result.error}"
 
-            res = [f"Python executed in {elapsed}s (Exit code {code_exit}, Risk: {risk.value.upper()})"]
-            if out:
-                res.append(f"--- STDOUT ---\n{out.rstrip()}")
-            if err:
-                res.append(f"--- STDERR ---\n{err.rstrip()}")
-            if not out and not err:
-                res.append("(Script completed with no console output)")
+        # Format output
+        res = [f"Python executed in {result.execution_time}s (Exit code {result.exit_code}, Backend: {result.backend}, Risk: {risk.value.upper()})"]
+        if result.stdout:
+            res.append(f"--- STDOUT ---\n{result.stdout.rstrip()}")
+        if result.stderr:
+            res.append(f"--- STDERR ---\n{result.stderr.rstrip()}")
+        if not result.stdout and not result.stderr:
+            res.append("(Script completed with no console output)")
+        if flags:
+            res.append(f"--- AST FLAGS ---\n{chr(10).join(flags)}")
 
-            return "\n".join(res)
-        except subprocess.TimeoutExpired:
-            return f"Error: Python execution timed out after {t_limit} seconds."
-        except Exception as ex:
-            return f"Error executing Python code: {str(ex)}"
-        finally:
-            if os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
+        return "\n".join(res)

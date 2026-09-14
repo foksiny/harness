@@ -67,10 +67,28 @@ def describe_media_blocks(
     if not capable:
         return ("", f"vision fallback model '{model}' is not detected as {labels}-capable")
 
+    # Build context-aware system prompt
+    effective_system = system_prompt or DEFAULT_VFB_SYSTEM_PROMPT
+    if question and question.strip() and not system_prompt:
+        effective_system = (
+            f"{DEFAULT_VFB_SYSTEM_PROMPT}\n\n"
+            f"The user's request is: {question.strip()}\n"
+            f"Focus your description on details relevant to the user's request, "
+            f"but still provide comprehensive coverage of the image content."
+        )
+
+    # Build user message
+    if question and question.strip():
+        user_text = (
+            f"The user asked: {question.strip()}\n\n"
+            f"Describe the attached image(s) with focus on answering their question "
+            f"while providing full contextual detail."
+        )
+    else:
+        user_text = "Describe each of the following files precisely:"
+
     content: List[Dict[str, Any]] = [
-        {"type": "text", "text": (
-            question or "Describe each of the following files precisely:"
-        )},
+        {"type": "text", "text": user_text},
         *media_blocks,
     ]
 
@@ -82,7 +100,7 @@ def describe_media_blocks(
             model=model,
             thinking_effort="off",
             tools=[],
-            system_prompt=system_prompt or DEFAULT_VFB_SYSTEM_PROMPT,
+            system_prompt=effective_system,
         ):
             if chunk.finish_reason == "error":
                 failed = True

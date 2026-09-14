@@ -2,10 +2,13 @@
 Agent Swarm tools for Harness.
 Enables the model to delegate parallel work to concurrently running specialized
 subagents that coordinate through the shared "main thread" message bus.
+Subagents run in background threads. The main agent can continue working
+while the swarm processes in the background.
 """
 from typing import Dict, Any, List, Optional
 from harness.tools.base import Tool
 from harness.core.subagents import SubagentOrchestrator
+
 
 class SpawnSwarmTool(Tool):
     name = "spawn_swarm"
@@ -14,8 +17,9 @@ class SpawnSwarmTool(Tool):
         "through a shared message bus. Each agent receives its own isolated context and a "
         "unique agent_id. Use this when a goal decomposes into independent, parallelizable "
         "subtasks (e.g. research + implementation + testing in parallel). Subagents exchange "
-        "messages via swarm_send_message / swarm_read_messages. Returns a combined report "
-        "including every agent's output and the full mailbox transcript."
+        "messages via swarm_send_message / swarm_read_messages. By default runs in the "
+        "background so you can continue working. Set background=false to block until all "
+        "agents finish and return a combined report."
     )
     action_type = "subagent"
     is_read_only = False
@@ -38,6 +42,10 @@ class SpawnSwarmTool(Tool):
                     "required": ["agent_type", "task"],
                 },
             },
+            "background": {
+                "type": "boolean",
+                "description": "Run in background (default true). Set to false to block until all agents finish.",
+            },
         },
         "required": ["agents"],
     }
@@ -45,10 +53,17 @@ class SpawnSwarmTool(Tool):
     def __init__(self, orchestrator: SubagentOrchestrator):
         self.orchestrator = orchestrator
 
-    def execute(self, agents: List[Dict[str, Any]], **kwargs) -> str:
+    def execute(self, agents: List[Dict[str, Any]], background: bool = True, **kwargs) -> str:
         if not isinstance(agents, list) or not agents:
             return "Error: `agents` must be a non-empty list of {agent_type, task} objects."
-        result = self.orchestrator.launch_swarm(agents)
+        result = self.orchestrator.launch_swarm(agents, background=background)
+        if background:
+            lines = [f"=== SWARM SPAWNED ({len(agents)} agents) ==="]
+            lines.append(f"Status: {result.status} | Running in background")
+            lines.append("The swarm is processing in the background. You can continue working.")
+            lines.append("Use `swarm_read_messages` to check inter-agent communication.")
+            lines.append("=" * 50)
+            return "\n".join(lines)
         return result.format_report()
 
 

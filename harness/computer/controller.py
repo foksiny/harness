@@ -41,6 +41,18 @@ from harness.computer.wayland_utils import (
     cli_input,
 )
 
+# Try pyautogui backend
+try:
+    from harness.computer.pyautogui_backend import (
+        is_available as pyautogui_available,
+        capture_screen as pyautogui_capture,
+        execute_input as pyautogui_input,
+    )
+except ImportError:
+    pyautogui_available = lambda: False
+    pyautogui_capture = None
+    pyautogui_input = None
+
 # ---------------------------------------------------------------------------
 # Environment probe
 # ---------------------------------------------------------------------------
@@ -80,16 +92,25 @@ from io import BytesIO
 
 
 def _default_capture_backend(region: Any, monitor_index: int, out_dir: str) -> Dict[str, Any]:
-    """Real capture path. Uses mss (already installed, zero new deps) as the
-    primary backend; falls back to CLI drivers when mss has no usable display."""
-    try:
-        import mss
-    except Exception:
-        mss = None
-
-    if mss is not None:
+    """Real capture path. Tries pyautogui first (cross-platform), then mss, then CLI drivers."""
+    # Try pyautogui backend first (simplest, most portable)
+    if pyautogui_capture is not None and pyautogui_available():
         try:
-            with mss.mss() as sct:
+            return pyautogui_capture(region=region, monitor_index=monitor_index, out_dir=out_dir)
+        except Exception:
+            pass
+    
+    # Try mss
+    try:
+        import mss as _mss_mod
+    except ImportError:
+        _mss_mod = None
+
+    if _mss_mod is not None:
+        try:
+            # Newer mss versions expose MSS as the primary constructor.
+            factory = getattr(_mss_mod, "MSS", None) or _mss_mod.mss
+            with factory() as sct:
                 monitors = sct.monitors or []
                 if not monitors:
                     return default_result("capture", "no monitors detected by mss")
@@ -113,7 +134,6 @@ def _default_capture_backend(region: Any, monitor_index: int, out_dir: str) -> D
                     except Exception as exc:
                         return default_result("capture", f"could not persist screenshot: {exc}")
         except Exception as exc:
-            mss = None
             mss_err = str(exc)
         else:
             return {
@@ -135,7 +155,7 @@ def _default_capture_backend(region: Any, monitor_index: int, out_dir: str) -> D
     return cli_res or default_result(
         "capture",
         f"no capture backend available ({mss_err}); "
-        "install grim (Wayland) or scrot/ImageMagick import (X11) or ensure mss can open a display",
+        "install pyautogui (pip install pyautogui) or grim/scrot/ImageMagick import",
     )
 
 
@@ -144,8 +164,14 @@ def _stamp_name(ext: str) -> str:
 
 
 def _default_input_exec(action: Dict[str, Any]) -> Dict[str, Any]:
-    """Real input path. Uses ctypes XTEST when libXtst is reachable, else CLI
-    drivers (xdotool / ydotool / wmctrl / xdotool type). Reports install hints."""
+    """Real input path. Tries pyautogui first (cross-platform), then XTEST, then CLI drivers."""
+    # Try pyautogui backend first (simplest, most portable)
+    if pyautogui_input is not None and pyautogui_available():
+        try:
+            return pyautogui_input(action)
+        except Exception:
+            pass
+    
     from harness.computer.xtest import XTestSession
 
     action_type = action.get("action", "")
@@ -167,7 +193,7 @@ def _default_input_exec(action: Dict[str, Any]) -> Dict[str, Any]:
     return default_result(
         "input",
         f"no input backend available for '{name}' ({xtest_err}); "
-        "install xdotool (X11) or ydotool (Wayland) or ensure libXtst/libX11 are present",
+        "install pyautogui (pip install pyautogui) or xdotool/ydotool",
     )
 
 
@@ -260,6 +286,7 @@ class ComputerController:
         self.clipboard_driver = clipboard_driver or self._default_clipboard_driver
         self.screenshot_dir = screenshot_dir or os.path.expanduser("~/.harness/screenshots")
         self.allow_read_only = allow_read_only
+        self._latest_capture_path: Optional[str] = None
 
     # -- env / probe ------------------------------------------------
     def probe(self) -> Dict[str, Any]:
@@ -278,7 +305,14 @@ class ComputerController:
         out_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         out_dir = out_dir or self.screenshot_dir
-        return self.capture_backend(region, monitor_index, out_dir)
+        result = self.capture_backend(region, monitor_index, out_dir)
+        if result.get("ok"):
+            self._latest_capture_path = result.get("image_path") or result.get("path")
+        return result
+
+    def latest_capture(self) -> Optional[str]:
+        """Return the path of the most recent successful screenshot, or None."""
+        return self._latest_capture_path
 
     # -- input ------------------------------------------------------
     def execute_input(self, action: Dict[str, Any]) -> Dict[str, Any]:
@@ -290,8 +324,6 @@ class ComputerController:
             res = self.execute_input(action)
             results.append(res)
             if not res.get("ok"):
-                results.append({"ok": False, "kind": "batch_stopped",
-                                "error": f"batch halted after failed action: {res.get('error')}"})
                 break
         return results
 

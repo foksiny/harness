@@ -222,12 +222,8 @@ class ScreenDescribeViaVfbTool(Tool):
         if self.vision_describe is None:
             return _pp({"ok": False, "error": "no vision describe core configured", "path": path})
 
-        from harness.vision.describe import describe_media_blocks  # inner import: no cycle
-
         try:
-            description, err = describe_media_blocks(
-                provider=req_provider,
-                model=vfb_model,
+            description, err = self.vision_describe(
                 media_blocks=[{"type": "image", "path": path}],
                 question=kwargs.get("question"),
             )

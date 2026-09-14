@@ -26,7 +26,7 @@
   - Send image or video files to vision-capable models by typing the path, **swiping/dropping** the file into the terminal, or **pasting** the file path — auto-detected and converted into the model's native format (OpenAI `image_url`, Gemini `inline_data`, Anthropic `image`/`video` blocks, NVIDIA NIM `input_video`, and `data:` URIs).
   - Model-aware gating: images attach only when the model supports vision, videos only when the provider accepts native video (Gemini, Anthropic, NVIDIA NIM); otherwise the path degrades into a text reference with a clear warning.
   - `/models` shows a **Vision** column per model. Capabilities come from the provider's own `/models` metadata (OpenRouter/OpenAI/NIM/Groq `input_modalities` / `vision` flags) when advertised, with a name-heuristic fallback (`4o`, `gemini`, `claude`, `pixtral`, `grok-4`, `llama-4`, `qwen-vl`, `llava`, …) so unknown/future models still get a best-effort guess.
-  - **Vision fallback (VFB)**: set `vfb_provider` (and optionally `vfb_model`) via `/config`; when a file is sent to a non-vision model, it is routed to the fallback vision model which writes a precise description that is embedded as text so the text-only model still understands the image — the user is told the fallback model was used (`🕶️ Vision fallback` / `✔ …description embedded`).
+  - **Vision fallback (VFB)**: set `vfb_provider` (and optionally `vfb_model`) via `/config`; when a file is sent to a non-vision model, it is routed to the fallback vision model which writes a precise description that is embedded as text so the text-only model still understands the image — the user is told the fallback model was used (`🕶️ Vision fallback` / `✔ …description embedded`). The VFB description is **guided by your prompt**: your question is injected into both the system prompt and the user message, so the description focuses on what you actually asked about while remaining comprehensive.
   - Handles spaced filenames, `file://` URIs, trailing punctuation, dedupes repeats, and enforces a 20MB inline cap.
 - 🛡️ **Three Permission Profiles**:
   - `Secure`: Full interlock — every modification, Python execution, or shell command prompts the user with diffs.
@@ -34,7 +34,7 @@
   - `Full Access`: Unrestricted autonomous operation.
 - 🔐 **Secure API Key Storage**:
   - Keys stored in `~/.harness/api_keys.json` with `0600` permissions (owner read/write only).
-  - Optional OS keychain integration via `keyring` (`pip install harness-cli[secure]`): stores keys in macOS Keychain, GNOME Keyring, or Windows Credential Manager.
+  - OS keychain integration via `keyring` (included by default): stores keys in macOS Keychain, GNOME Keyring, or Windows Credential Manager.
   - Automatic one-time migration from legacy plaintext `config.json`.
   - Environment variables remain the first-priority source (ideal for CI/CD).
 - 🌐 **Browser Automation (CDP)**:
@@ -49,8 +49,11 @@
   - `Super`: Autonomous multi-turn goal execution loop with self-verification and automatic error correction.
 - 🤖 **Subagent Orchestration**:
   - Dispatch specialized worker subagents (`researcher`, `planner`, `coder`, `tester`, `reviewer`) with isolated context windows to keep the parent context pristine.
+  - **Parallel by default**: every `spawn_subagent` runs on a background daemon thread, so the main agent keeps working while the subagent processes. Pass `background: false` to block and wait for the report.
+  - **No turn caps**: subagents run until they call `finish` (with a 200-turn safety limit); no arbitrary per-role turn budgets.
 - 🐝 **Agent Swarms (`spawn_swarm`)**:
-  - Concurrent, coordinated multi-agent execution. The parent "main thread" hosts a shared message bus; subagents run in parallel threads and talk to each other through `swarm_send_message` / `swarm_read_messages`, then return a combined report with the full mailbox transcript.
+  - Concurrent, coordinated multi-agent execution. The parent "main thread" hosts a shared message bus; subagents run in parallel threads and talk to each other through `swarm_send_message` / `swarm_read_messages`.
+  - **Background mode by default**: the swarm launches and returns immediately so the parent keeps working; use `swarm_read_messages` to monitor inter-agent traffic. Pass `background: false` to block until all workers finish and return a combined report with the full mailbox transcript.
   - Enable with `harness config set swarm_enabled true` (always active in Super Mode; read-only research swarms allowed in Plan Mode).
 
 **👀 Watching subagents in real time:**
@@ -68,17 +71,25 @@ While any subagent or swarm is running, every worker's activity is streamed live
 When a delegation finishes, the report you receive already includes each agent's `[Actions performed by this agent]` log, so you see exactly what was done even if its final reply was terse.
 - ❓ **Model-Driven User Questions (`ask_user`)**:
   - When encountering architectural decisions or ambiguities, the model proactively prompts the user with formatted choices, recommended options, or write-ins.
-- 🐍 **Python Code Execution with Risk Detection (`execute_python`)**:
-  - Model can run Python code via subprocess. AST analysis detects dangerous patterns (os.system, subprocess, ctypes, etc.) and surfaces risk levels; approval is required for HIGH/CRITICAL risk under DEFAULT/SECURE modes. **This is NOT a sandbox** — it is risk detection + user gating. Code can bypass AST checks via runtime string construction, getattr, or indirect imports. Only run code you trust, in controlled environments. For untrusted code, use `--mode plan --perm secure` or run in a container/VM.
+- 🐍 **Sandboxed Python Execution (`execute_python`)**:
+  - Code runs in a **real sandbox** — layered backends picked automatically by what's available on the host:
+    1. **nsjail** (strongest): chroot + rlimits + namespace isolation.
+    2. **Docker**: throwaway container with `--read-only` rootfs, tmpfs scratch space, no network by default, memory/pids limits.
+    3. **Restricted subprocess** (always available): enforced `RLIMIT_AS`/`RLIMIT_CPU`/`RLIMIT_NPROC`/`RLIMIT_FSIZE`/`RLIMIT_CORE` limits plus a scrubbed environment.
+  - Filesystem isolation, CPU/memory/process/file-size limits, and optional network isolation (`network: true` to opt in).
+  - AST analysis still runs (os.system, subprocess, ctypes, eval/exec, …) but it's informational metadata on top of the sandbox — the sandbox is the real security boundary, so aggressive tests and hostile snippets are contained.
+  - Permission gating still applies under DEFAULT/SECURE modes.
 - 🔎 **Free Exa Web Search (`exa_search`)**:
   - Built-in real-time web search with zero API key required.
 - 📋 **Integrated To-Do Tracking (`todo_create`, `todo_update`, `todo_list`)**:
   - Real-time task planning and HUD progress reporting (`3/5 completed`).
+  - **Persistent across sessions**: task state is saved into the session file on every save and restored on resume, so long-running projects survive restarts.
 - 🧩 **Extensible Skills & 11 Built-in Skills**:
   - Discovers skills from `~/.harness/skills/` and `.harness/skills/`.
   - Includes specialized **`skill_creator`** (generates and installs new skills on user request) and **`mcp_integrator`** (connects and configures MCP servers on user request).
 - 🖥️ **Computer Use (`screen_capture`, `screen_analyze`, `computer_control`)**:
   - Desktop interaction: screenshot capture, vision-based screen analysis, batched mouse/keyboard/clipboard control.
+  - **PyAutoGUI primary backend**: cross-platform capture + input (X11/Wayland via XWayland) with graceful fallback to mss → ctypes XTEST → CLI drivers (`grim`/`scrot`/`xdotool`/`ydotool`). Imports are crash-proof on headless machines — backend simply reports unavailable with install hints.
   - Hermetic design: all computer tools are hermetic — they never raise, never touch a display unless a controller seam is injected, and return structured results with install hints when backends are unavailable.
   - Vision fallback integration: screen content is described via the VFB core so text-only models can "see" the screen as text; vision-capable models (Anthropic, Gemini) get pixel-attach bonus.
   - Permission-gated: read-only tools (`screen_capture`, `screen_analyze`) auto-approve; input tools (`computer_control`, `computer_clipboard`) require per-action approval under DEFAULT/SECURE mode, auto-approve under FULL, and are blocked in PLAN.
@@ -86,8 +97,8 @@ When a delegation finishes, the report you receive already includes each agent's
   - The agent transparently learns across sessions: `learn_record` / `learn_recall` / `learn_promote` let it (and you, via `/learn`) persist reusable lessons, inject top matches into every system prompt, and promote matured lessons into real skills.
 - 🔌 **Model Context Protocol (MCP) Client**:
   - Supports `stdio` and `sse` JSON-RPC 2.0 servers configured in `mcp.json`.
-- 🎨 **7 Handcrafted Visual Themes**:
-  - `cyberpunk` (default neon), `dracula`, `nord`, `monokai`, `catppuccin`, `matrix`, `minimal`.
+- 🎨 **14 Handcrafted Visual Themes**:
+  - `cyberpunk` (default neon), `dracula`, `nord`, `monokai`, `catppuccin`, `matrix`, `minimal`, `amber_crt`, `gruvbox`, `one_dark`, `rose_pine`, `solarized_dark`, `synthwave`, `tokyo_night`.
 - 📦 **Smart Auto-Compaction**:
   - Budget-driven, graduated context compaction. When usage crosses the warning threshold (default 75%), the sampler dials back pressure in three sweeps: oversized verbatim tool payloads are collapsed to head/tail digests, the oldest turn-groups are condensed into structured memory checkpoints down to the target budget (default 60%), and a single global checkpoint is emitted if the window is still hot. Recently-used turns stay verbatim, and undo/redo (`/checkpoint`) can restore the pre-compaction history.
   - Uses the LLM itself to summarize when a provider is live (`compact_summary`), falling back to a heuristic extractor otherwise. A peak-hold hysteresis guard prevents re-firing every turn, and a mid-turn emergency trim collapses old blobs (never current-turn text) if usage races past the hard cap (~95%). Inspect everything with `/compact` and `/tokens`.
@@ -104,10 +115,12 @@ cd harness
 # Launch interactive TUI directly:
 ./bin/harness
 
-# Or install in editable mode:
+# Or install in editable mode (all features included — no extras needed):
 pip install -e .
 harness
 ```
+
+All dependencies install by default — computer-use (PyAutoGUI, mss, Pillow), keychain storage (keyring), and the full TUI (prompt-toolkit, httpx, pydantic) are core requirements, not optional extras.
 
 ### Command Line Examples
 ```bash
@@ -160,7 +173,7 @@ cat logs/error.log | harness "Diagnose this stack trace"
 
 ---
 
-## 🛠️ Built-in Skills (10 Total)
+## 🛠️ Built-in Skills (11 Total)
 
 1. **`skill_creator`**: Autonomous skill generator — writes and registers new skills on user request.
 2. **`mcp_integrator`**: Autonomous MCP configurator — connects and verifies external MCP servers.
@@ -172,6 +185,7 @@ cat logs/error.log | harness "Diagnose this stack trace"
 8. **`docker_deploy`**: Multi-stage Dockerfiles and container orchestration.
 9. **`performance_profiler`**: Latency, memory leak diagnosis, and caching strategies.
 10. **`documentation_writer`**: Architecture RFCs, user guides, and API references.
+11. **`computer_use`**: Screen control patterns — capture, describe, click, type, and verify desktop workflows.
 
 ---
 
@@ -208,19 +222,19 @@ Environment variables are also detected automatically (`ANTHROPIC_API_KEY`, `OPE
 
 ## 🧪 Testing
 
-Harness comes with an automated unit test suite:
+Harness comes with an automated test suite (265 tests across 21 files):
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m pytest tests/ -v
 ```
 
-All 38 test suites verify tools, Python safety, model context window detection, provider payloads, compaction, subagent isolation, skills, and slash commands.
+The suite verifies tools, sandboxed execution, model context window detection, provider payloads, compaction, subagent/swarm parallelism, checkpoints, computer-use hermeticity, skills, and slash commands.
 
 ### Benchmarks
 
 Run `python3 benchmarks/bench_startup.py` to reproduce. Recent results:
 - Cold start: **88ms**
 - RSS (after imports): **23.8 MB**
-- Tool registration: **1.7ms** (25 tools)
+- Tool registration: **1.7ms** (26 tools)
 - Skill loading: **1.1ms** (12 skills)
 
 ---
@@ -233,7 +247,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing convention
 
 ## 🔒 Security Notes
 
-- **`execute_python` is NOT sandboxed.** AST analysis detects dangerous patterns but cannot prevent runtime escapes (getattr, indirect __import__, string construction, dynamic imports). Use `--mode plan --perm secure` for untrusted code, or run in a container/VM. This is a risk detection + user gating mechanism, not a security boundary.
-- **API keys use secure storage.** Keys are stored in `~/.harness/api_keys.json` with `0600` permissions (owner-only). If `keyring` is installed (`pip install harness-cli[secure]`), keys go to your OS keychain (macOS Keychain, GNOME Keyring, Windows Credential Manager). Environment variables remain the recommended approach for CI/CD.
+- **`execute_python` runs in a real sandbox.** Backends in priority order: nsjail → Docker → restricted subprocess with `rlimit` resource confinement (memory, CPU, process count, file size; no core dumps; scrubbed environment). Network is disabled by default (opt in with `network: true`). AST analysis still flags dangerous patterns for transparency, but the sandbox is the real security boundary. Docker/nsjail give the strongest isolation; the restricted-subprocess fallback limits but does not namespace-isolate the filesystem — prefer running with Docker available for untrusted workloads.
+- **API keys use secure storage.** Keys are stored in `~/.harness/api_keys.json` with `0600` permissions (owner-only) and go to your OS keychain via `keyring` (macOS Keychain, GNOME Keyring, Windows Credential Manager) when available. Environment variables remain the recommended approach for CI/CD.
 - **Full Access mode is unrestricted.** All tools execute without approval. Only use in controlled environments with trusted code.
 - **Recommended for untrusted scenarios**: `--mode plan --perm secure`, disposable API keys, and audit commands before approving.
