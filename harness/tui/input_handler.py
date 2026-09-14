@@ -126,41 +126,88 @@ class InputHandler:
                     self.slash_completer = WordCompleter(slash_commands, sentence=True)
 
                 def get_completions(self, document, complete_event):
-                    word = document.get_word_before_cursor(WORD=True)
-                    if not word:
-                        return
-                    # Slash command completion
+                    text_before = document.text_before_cursor
+                    # Mention path completion has priority: find last @ in text before cursor
+                    # and ensure no whitespace between @ and cursor
+                    if '@' in text_before:
+                        at_index = text_before.rfind('@')
+                        after_at = text_before[at_index+1:]
+                        if not any(c.isspace() for c in after_at):
+                            mention = '@' + after_at
+                            prefix = mention[1:]
+                            if '/' in prefix:
+                                dir_idx = prefix.rfind('/')
+                                dir_part = prefix[:dir_idx]
+                                name_part = prefix[dir_idx+1:]
+                                base_dir = Path(dir_part) if dir_part else Path('.')
+                            else:
+                                dir_part = ''
+                                name_part = prefix
+                                base_dir = Path('.')
+                            if not base_dir.is_absolute():
+                                base_dir = Path.cwd() / base_dir
+                            try:
+                                if base_dir.is_dir():
+                                    for entry in base_dir.iterdir():
+                                        entry_name = entry.name
+                                        if entry_name.startswith(name_part):
+                                            if dir_part:
+                                                display = '@' + dir_part + '/' + entry_name
+                                            else:
+                                                display = '@' + entry_name
+                                            if entry.is_dir():
+                                                display += '/'
+                                            yield Completion(display, start_position=-len(mention))
+                            except Exception:
+                                pass
+                            return
+
+                    # Slash command completion: check if the current token starts with /
+                    word = document.get_word_before_cursor()
                     if word.startswith('/'):
                         yield from self.slash_completer.get_completions(document, complete_event)
                         return
-                    # Mention path completion
-                    if word.startswith('@'):
-                        # Extract partial path after @
-                        prefix = word[1:]
-                        # Determine base directory
-                        if '/' in prefix:
-                            dir_part, name_part = os.path.split(prefix)
-                            base_dir = Path(dir_part) if dir_part else Path('.')
+                        # Find last @ not preceded by whitespace? Simple rfind
+                        at_index = text_before.rfind('@')
+                        # Ensure the @ is part of current token (no whitespace after @)
+                        after_at = text_before[at_index+1:]
+                        if not any(c.isspace() for c in after_at):
+                            # We have a mention in progress
+                            # Extract the partial mention string
+                            mention = '@' + after_at
+                            # Determine base directory and prefix
+                            prefix = mention[1:]  # strip @
+                            if '/' in prefix:
+                                # Path with directory component
+                                # Find last slash
+                                dir_idx = prefix.rfind('/')
+                                dir_part = prefix[:dir_idx]
+                                name_part = prefix[dir_idx+1:]
+                                base_dir = Path(dir_part) if dir_part else Path('.')
+                            else:
+                                dir_part = ''
+                                name_part = prefix
+                                base_dir = Path('.')
                             if not base_dir.is_absolute():
                                 base_dir = Path.cwd() / base_dir
-                        else:
-                            base_dir = Path.cwd()
-                            name_part = prefix
-                        try:
-                            if base_dir.is_dir():
-                                # List candidates
-                                for entry in base_dir.iterdir():
-                                    entry_name = entry.name
-                                    if entry_name.startswith(name_part):
-                                        display = '@' + os.path.join(dir_part, entry_name) if dir_part else '@' + entry_name
-                                        # Add trailing slash for directories to mimic path completion
-                                        if entry.is_dir():
-                                            display += '/'
-                                        yield Completion(display, start_position=-len(word))
-                        except Exception:
-                            pass
-                        return
-                    # Default: slash completion fallback
+                            try:
+                                if base_dir.is_dir():
+                                    for entry in base_dir.iterdir():
+                                        entry_name = entry.name
+                                        if entry_name.startswith(name_part):
+                                            # Build display text
+                                            if dir_part:
+                                                display = '@' + dir_part + '/' + entry_name
+                                            else:
+                                                display = '@' + entry_name
+                                            if entry.is_dir():
+                                                display += '/'
+                                            # Replacement start position is -len(mention)
+                                            yield Completion(display, start_position=-len(mention))
+                            except Exception:
+                                pass
+                            return
+                    # Fallback to slash completer
                     yield from self.slash_completer.get_completions(document, complete_event)
 
             self._pt_completer = SlashAndMentionCompleter(SLASH_COMMANDS)
