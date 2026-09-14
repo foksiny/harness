@@ -63,9 +63,14 @@ When a delegation finishes, the report you receive already includes each agent's
   - Built-in real-time web search with zero API key required.
 - 📋 **Integrated To-Do Tracking (`todo_create`, `todo_update`, `todo_list`)**:
   - Real-time task planning and HUD progress reporting (`3/5 completed`).
-- 🧩 **Extensible Skills & 10 Built-in Skills**:
+- 🧩 **Extensible Skills & 11 Built-in Skills**:
   - Discovers skills from `~/.harness/skills/` and `.harness/skills/`.
   - Includes specialized **`skill_creator`** (generates and installs new skills on user request) and **`mcp_integrator`** (connects and configures MCP servers on user request).
+- 🖥️ **Computer Use (`screen_capture`, `screen_analyze`, `computer_control`)**:
+  - Desktop interaction: screenshot capture, vision-based screen analysis, batched mouse/keyboard/clipboard control.
+  - Hermetic design: all computer tools are hermetic — they never raise, never touch a display unless a controller seam is injected, and return structured results with install hints when backends are unavailable.
+  - Vision fallback integration: screen content is described via the VFB core so text-only models can "see" the screen as text; vision-capable models (Anthropic, Gemini) get pixel-attach bonus.
+  - Permission-gated: read-only tools (`screen_capture`, `screen_analyze`) auto-approve; input tools (`computer_control`, `computer_clipboard`) require per-action approval under DEFAULT/SECURE mode, auto-approve under FULL, and are blocked in PLAN.
 - 🧠 **Continuous Learning & Self-Improvement**:
   - The agent transparently learns across sessions: `learn_record` / `learn_recall` / `learn_promote` let it (and you, via `/learn`) persist reusable lessons, inject top matches into every system prompt, and promote matured lessons into real skills.
 - 🔌 **Model Context Protocol (MCP) Client**:

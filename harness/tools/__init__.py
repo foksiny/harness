@@ -22,6 +22,13 @@ from harness.core.permissions import PermissionManager
 from harness.core.todo import TodoManager
 from harness.core.subagents import SubagentOrchestrator
 from harness.core.learning import LearningManager
+# Hermetic computer-use seam types: type-only references (never instantiated here;
+# hermetic tests provide a hermetic ComputerController + hermetic vision describe,
+# hermetic agents provide the real hermetic controller factory). Type annotations only.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from harness.computer import ComputerController
+    from harness.vision import describe_media_blocks
 
 class ToolRegistry:
     """Manages available tools, schema serialization, and safe invocation."""
@@ -35,6 +42,8 @@ class ToolRegistry:
         ask_user_handler: Optional[Any] = None,
         learning_manager: Optional[LearningManager] = None,
         learning_enabled: bool = True,
+        computer_controller_factory: Optional[Any] = None,
+        vision_describe: Optional[Any] = None,
     ):
         self.permission_manager = permission_manager or PermissionManager()
         self.todo_manager = todo_manager or TodoManager()
@@ -42,6 +51,8 @@ class ToolRegistry:
         self.skills_manager = skills_manager or SkillsManager()
         self.learning_manager = learning_manager or LearningManager()
         self.learning_enabled = learning_enabled
+        self.computer_controller_factory = computer_controller_factory
+        self.vision_describe = vision_describe
         self.tools: Dict[str, Tool] = {}
         self._register_default_tools(ask_user_handler)
 
@@ -87,6 +98,19 @@ class ToolRegistry:
 
         # Task control
         self.register(FinishTool())
+
+        # Computer use (hermetic): registered ONLY when a hermetic seam (tests or a
+        # hermetic FULL agent) injects a controller factory + vision describe. A bare
+        # ToolRegistry() never registers these — the hermetic/plan agent stays hermetic.
+        if self.computer_controller_factory is not None:
+            from harness.tools.computer import register_computer_tools
+            controller = self.computer_controller_factory()
+            register_computer_tools(
+                self,
+                controller=controller,
+                vision_describe=self.vision_describe,
+                permission_manager=self.permission_manager,
+            )
 
         # Learning / self-improvement (lazy: manager loads memory from disk on first use)
         if self.learning_enabled:

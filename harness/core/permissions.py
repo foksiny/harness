@@ -130,6 +130,12 @@ class PermissionManager:
                 return self._request_user_approval(f"Python script contains {risk.value.upper()} risk operations", details)
             return True
 
+        if action_type == "computer_input":
+            # Desktop input (mouse/keyboard/clipboard) requires approval in DEFAULT
+            return self._request_user_approval(
+                f"Computer input requires approval: {details.get('summary', str(details))}", details
+            )
+
         return True
 
     def _request_user_approval(self, message: str, details: Dict[str, Any]) -> bool:

@@ -31,6 +31,8 @@ PLAN_MODE_BLOCKED_TOOLS: Set[str] = {
     "edit_file",
     "replace_file_content",
     "execute_python",   # Unless explicitly marked read-only
+    "computer_control", # Desktop input is a mutation — blocked in PLAN
+    "computer_clipboard",  # Clipboard write is a mutation — blocked in PLAN
 }
 
 # Dangerous shell command prefixes blocked in PLAN mode
