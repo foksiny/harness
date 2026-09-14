@@ -116,10 +116,54 @@ class InputHandler:
 
         try:
             from prompt_toolkit import PromptSession
-            from prompt_toolkit.completion import WordCompleter
+            from prompt_toolkit.completion import WordCompleter, Completer, Completion
             from prompt_toolkit.history import InMemoryHistory
+            import os
+            from pathlib import Path
 
-            self._pt_completer = WordCompleter(SLASH_COMMANDS, sentence=True)
+            class SlashAndMentionCompleter(Completer):
+                def __init__(self, slash_commands):
+                    self.slash_completer = WordCompleter(slash_commands, sentence=True)
+
+                def get_completions(self, document, complete_event):
+                    word = document.get_word_before_cursor(WORD=True)
+                    if not word:
+                        return
+                    # Slash command completion
+                    if word.startswith('/'):
+                        yield from self.slash_completer.get_completions(document, complete_event)
+                        return
+                    # Mention path completion
+                    if word.startswith('@'):
+                        # Extract partial path after @
+                        prefix = word[1:]
+                        # Determine base directory
+                        if '/' in prefix:
+                            dir_part, name_part = os.path.split(prefix)
+                            base_dir = Path(dir_part) if dir_part else Path('.')
+                            if not base_dir.is_absolute():
+                                base_dir = Path.cwd() / base_dir
+                        else:
+                            base_dir = Path.cwd()
+                            name_part = prefix
+                        try:
+                            if base_dir.is_dir():
+                                # List candidates
+                                for entry in base_dir.iterdir():
+                                    entry_name = entry.name
+                                    if entry_name.startswith(name_part):
+                                        display = '@' + os.path.join(dir_part, entry_name) if dir_part else '@' + entry_name
+                                        # Add trailing slash for directories to mimic path completion
+                                        if entry.is_dir():
+                                            display += '/'
+                                        yield Completion(display, start_position=-len(word))
+                        except Exception:
+                            pass
+                        return
+                    # Default: slash completion fallback
+                    yield from self.slash_completer.get_completions(document, complete_event)
+
+            self._pt_completer = SlashAndMentionCompleter(SLASH_COMMANDS)
             self._pt_history = InMemoryHistory()
             self._pt_session = PromptSession(completer=self._pt_completer, history=self._pt_history)
             self._has_prompt_toolkit = True

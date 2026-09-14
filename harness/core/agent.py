@@ -504,7 +504,22 @@ class HarnessAgent:
             self.ensure_session()
             clean_text, media_blocks, attach_warnings = parse_attachments(user_prompt)
             # Expand @-mentions after media removal so summaries don't trigger further media detection
-            clean_text, mention_warnings = expand_mentions(clean_text, cwd=os.getcwd())
+            clean_text, mention_warnings, mentions = expand_mentions(clean_text, cwd=os.getcwd())
+            if mentions:
+                # Emit UX events for each mention
+                for m in mentions:
+                    if m.get("success"):
+                        self.emit("mention", {
+                            "original": m["original"],
+                            "resolved": m["resolved"],
+                            "kind": m["kind"],
+                        })
+                    else:
+                        self.emit("mention_warning", {
+                            "original": m["original"],
+                            "resolved": m["resolved"],
+                            "message": m.get("message", "unknown error"),
+                        })
             if mention_warnings:
                 attach_warnings.extend(mention_warnings)
             model_spec = self.provider.get_model_spec(self.session.model)

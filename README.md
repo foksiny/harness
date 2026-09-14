@@ -33,6 +33,8 @@
     - **Files**: summary includes line count, character count, and the first 10 lines (rest truncated). Binary files show size and a short byte preview. The model learns from the snippet rather than ingesting the whole file.
     - **Folders**: a limited directory tree is rendered up to 2 levels deep (80 items per directory). You get a quick structural overview without flooding context.
   - Mentions resolve relative to the current working directory or absolute paths. Unresolvable mentions emit a warning but leave the original `@…` text intact.
+  - **TUI autocompletion**: type `@` and press Tab to complete files and folders just like slash commands. The completer walks the filesystem relative to cwd and shows directories with a trailing `/`.
+  - **UX feedback**: when a prompt is processed, Harness emits `mention` events for each successfully resolved reference and `mention_warning` for failures, so you see exactly what was expanded and what could not be found.
 - 🛡️ **Three Permission Profiles**:
   - `Secure`: Full interlock — every modification, Python execution, or shell command prompts the user with diffs.
   - `Default`: Balanced — safe read/write operations auto-approved; destructive commands require approval.

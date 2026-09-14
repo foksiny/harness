@@ -10,7 +10,7 @@ summary so the model can work without loading the whole file.
 import os
 import re
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 # Regex for a mention: @ followed by a non-whitespace sequence.
 # We stop at punctuation that typically terminates a path.
@@ -104,25 +104,25 @@ def _summarize_folder(path: Path) -> str:
         f"```\n{tree}\n```"
     )
 
-def expand_mentions(text: str, cwd: str) -> Tuple[str, List[str]]:
+def expand_mentions(text: str, cwd: str) -> Tuple[str, List[str], List[Dict]]:
     """
     Expand @mentions in `text`.
 
-    Returns (expanded_text, warnings). Warnings are for mentions that could not be
-    resolved.
+    Returns (expanded_text, warnings, mentions). Warnings are for mentions that could not be
+    resolved. Mentions is a list of dicts with original path, resolved absolute path,
+    kind ('file'|'folder'|'error'), and success flag.
     """
     if not text:
-        return text, []
+        return text, [], []
     cwd_path = Path(cwd).resolve()
     warnings: List[str] = []
-    # We'll replace iteratively to avoid overlapping issues.
-    # Use a function for re.sub replacement
+    mentions: List[Dict] = []
+
     def replacer(match: re.Match) -> str:
         raw = match.group(1)
         clean_path, trailing = _strip_trailing_punct(raw)
         if not clean_path:
             return "@" + trailing
-        # Resolve path relative to cwd
         candidate = Path(clean_path)
         if not candidate.is_absolute():
             candidate = cwd_path / candidate
@@ -130,21 +130,53 @@ def expand_mentions(text: str, cwd: str) -> Tuple[str, List[str]]:
             candidate = candidate.resolve(strict=True)
         except FileNotFoundError:
             warnings.append(f"@{clean_path} not found")
+            mentions.append({
+                "original": f"@{clean_path}",
+                "resolved": str(candidate),
+                "kind": "error",
+                "success": False,
+                "message": "not found",
+            })
             return f"@{clean_path}{trailing}"
         except RuntimeError:
-            # Path resolution loop etc.
             warnings.append(f"@{clean_path} could not be resolved")
+            mentions.append({
+                "original": f"@{clean_path}",
+                "resolved": str(candidate),
+                "kind": "error",
+                "success": False,
+                "message": "could not resolve",
+            })
             return f"@{clean_path}{trailing}"
 
         if candidate.is_file():
             summary = _summarize_file(candidate)
+            mentions.append({
+                "original": f"@{clean_path}",
+                "resolved": str(candidate),
+                "kind": "file",
+                "success": True,
+            })
             return summary + trailing
         elif candidate.is_dir():
             summary = _summarize_folder(candidate)
+            mentions.append({
+                "original": f"@{clean_path}",
+                "resolved": str(candidate),
+                "kind": "folder",
+                "success": True,
+            })
             return summary + trailing
         else:
             warnings.append(f"@{clean_path} exists but is neither file nor dir")
+            mentions.append({
+                "original": f"@{clean_path}",
+                "resolved": str(candidate),
+                "kind": "error",
+                "success": False,
+                "message": "neither file nor dir",
+            })
             return f"@{clean_path}{trailing}"
 
     expanded = MENTION_RE.sub(replacer, text)
-    return expanded, warnings
+    return expanded, warnings, mentions
