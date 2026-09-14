@@ -52,4 +52,4 @@ Use the [issue tracker](https://github.com/foksiny/harness/issues). Include:
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

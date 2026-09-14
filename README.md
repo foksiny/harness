@@ -69,7 +69,7 @@ When a delegation finishes, the report you receive already includes each agent's
 - ❓ **Model-Driven User Questions (`ask_user`)**:
   - When encountering architectural decisions or ambiguities, the model proactively prompts the user with formatted choices, recommended options, or write-ins.
 - 🐍 **Python Code Execution with Risk Detection (`execute_python`)**:
-  - Model can run Python code via subprocess. AST analysis detects dangerous patterns (os.system, subprocess, ctypes, etc.) and surfaces risk levels; approval is required for HIGH/CRITICAL risk under DEFAULT/SECURE modes. **This is not a sandbox** — it is risk detection + user gating. Code can bypass AST checks via runtime string construction, getattr, or indirect imports. Only run code you trust, in controlled environments.
+  - Model can run Python code via subprocess. AST analysis detects dangerous patterns (os.system, subprocess, ctypes, etc.) and surfaces risk levels; approval is required for HIGH/CRITICAL risk under DEFAULT/SECURE modes. **This is NOT a sandbox** — it is risk detection + user gating. Code can bypass AST checks via runtime string construction, getattr, or indirect imports. Only run code you trust, in controlled environments. For untrusted code, use `--mode plan --perm secure` or run in a container/VM.
 - 🔎 **Free Exa Web Search (`exa_search`)**:
   - Built-in real-time web search with zero API key required.
 - 📋 **Integrated To-Do Tracking (`todo_create`, `todo_update`, `todo_list`)**:
@@ -233,7 +233,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing convention
 
 ## 🔒 Security Notes
 
-- **`execute_python` is not sandboxed.** AST analysis detects dangerous patterns but cannot prevent runtime escapes (getattr, indirect __import__, string construction). Use `--mode plan --perm secure` for untrusted code, or run in a container/VM.
+- **`execute_python` is NOT sandboxed.** AST analysis detects dangerous patterns but cannot prevent runtime escapes (getattr, indirect __import__, string construction, dynamic imports). Use `--mode plan --perm secure` for untrusted code, or run in a container/VM. This is a risk detection + user gating mechanism, not a security boundary.
 - **API keys use secure storage.** Keys are stored in `~/.harness/api_keys.json` with `0600` permissions (owner-only). If `keyring` is installed (`pip install harness-cli[secure]`), keys go to your OS keychain (macOS Keychain, GNOME Keyring, Windows Credential Manager). Environment variables remain the recommended approach for CI/CD.
 - **Full Access mode is unrestricted.** All tools execute without approval. Only use in controlled environments with trusted code.
 - **Recommended for untrusted scenarios**: `--mode plan --perm secure`, disposable API keys, and audit commands before approving.

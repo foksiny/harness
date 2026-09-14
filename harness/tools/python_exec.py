@@ -89,7 +89,7 @@ def analyze_python_safety(code: str) -> Tuple[RiskLevel, List[str]]:
 
 class ExecutePythonTool(Tool):
     name = "execute_python"
-    description = "Execute a Python script or code snippet in a separate process, capturing stdout, stderr, and output."
+    description = "Execute a Python script or code snippet in a separate process, capturing stdout, stderr, and output. WARNING: This tool is NOT sandboxed. AST analysis detects dangerous patterns but cannot prevent runtime escapes (getattr, indirect __import__, string construction). Only run trusted code in controlled environments."
     action_type = "execute_python"
     is_read_only = False
     parameters = {
