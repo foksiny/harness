@@ -16,10 +16,10 @@
 
 ## ✨ Key Features
 
-- 🏎️ **Ultra-Fast & Low Memory**: Starts in <80ms, runs on **~22MB RAM**, zero heavy framework bloat.
+- 🏎️ **Ultra-Fast & Low Memory**: Benchmarked **~88ms cold start**, **~24MB RSS** — no heavy framework bloat.
 - 🧠 **Dynamic Thinking Effort & Context Window Detection**:
-  - Dynamically measures context window limits and reasoning parameters for **any current or future model** via heuristic token extraction (`-1m`, `-2m`, `-128k`, `-256k`), model family registries, and provider specs.
-  - Provider-aware **thinking dialects**: Claude budget tokens, Gemini thinking budget (incl. `includeThoughts`), OpenAI/xAI/Mistral/Groq/Perplexity/DeepSeek reasoning effort, OpenRouter `reasoning` object, Together hybrid reasoning toggle, NVIDIA NIM DeepSeek-V4 `chat_template_kwargs`, and Cohere `thinking.token_budget` — with up-to-date context/output limits for the GPT-5, Claude 4.5, Gemini 2.5, Grok 4, DeepSeek V4, and Command-A generations.
+  - Resolves context window limits and reasoning parameters for **any current or future model** via 5-level priority: explicit registry (200+ models) → provider `/models` endpoint → model name tokens (`-1m`, `-128k`) → model family heuristics → safe default (128k). Registry covers GPT-5, Claude 4.5, Gemini 2.5, Grok 4, DeepSeek V4, and Command-A generations.
+  - Provider-aware **thinking dialects**: Claude budget tokens, Gemini thinking budget (incl. `includeThoughts`), OpenAI/xAI/Mistral/Groq/Perplexity/DeepSeek reasoning effort, OpenRouter `reasoning` object, Together hybrid reasoning toggle, NVIDIA NIM DeepSeek-V4 `chat_template_kwargs`, and Cohere `thinking.token_budget`.
 - 🌐 **16+ First-Class Providers**:
   - Anthropic, OpenAI, Google Gemini, OpenRouter, NVIDIA NIM, OpenCode Zen, Groq, DeepSeek, Mistral AI, xAI (Grok), Ollama (Local), Together AI, Fireworks AI, Cohere, Perplexity Sonar, and an Offline Mock Engine.
 - 🖼️ **Visual & Multimodal Models**:
@@ -204,11 +204,25 @@ python3 -m unittest discover -s tests -v
 
 All 38 test suites verify tools, Python safety, model context window detection, provider payloads, compaction, subagent isolation, skills, and slash commands.
 
+### Benchmarks
+
+Run `python3 benchmarks/bench_startup.py` to reproduce. Recent results:
+- Cold start: **88ms**
+- RSS (after imports): **23.8 MB**
+- Tool registration: **1.7ms** (25 tools)
+- Skill loading: **1.1ms** (12 skills)
+
+---
+
+## 🤝 Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing conventions, and architecture guidelines. Issues and PRs welcome.
+
 ---
 
 ## 🔒 Security Notes
 
 - **`execute_python` is not sandboxed.** AST analysis detects dangerous patterns but cannot prevent runtime escapes (getattr, indirect __import__, string construction). Use `--mode plan --perm secure` for untrusted code, or run in a container/VM.
-- **API keys are stored in plaintext** at `~/. Harness/config.json`. The display is masked (`mask_key`), but disk storage is unencrypted. Protect your home directory or use environment variables.
+- **API keys are stored in plaintext** at `~/.harness/config.json`. The display is masked (`mask_key`), but disk storage is unencrypted. Protect your home directory or use environment variables.
 - **Full Access mode is unrestricted.** All tools execute without approval. Only use in controlled environments with trusted code.
 - **Recommended for untrusted scenarios**: `--mode plan --perm secure`, disposable API keys, and audit commands before approving.
