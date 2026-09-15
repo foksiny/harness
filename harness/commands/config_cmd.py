@@ -69,7 +69,7 @@ def run_setup_wizard(config: HarnessConfig, renderer) -> None:
     """Interactive onboarding wizard to configure Harness."""
     renderer.console.print(Panel(
         "⚡ [bold cyan]Harness Interactive Setup Wizard[/bold cyan]\n"
-        "Let's configure your default AI provider, operational mode, and visual theme.",
+        "Let's configure your default AI provider, operational mode, visual theme, and optional Discord bot.",
         border_style="cyan",
     ))
 
@@ -124,5 +124,134 @@ def run_setup_wizard(config: HarnessConfig, renderer) -> None:
     except (EOFError, KeyboardInterrupt):
         return
 
+    # 5. Discord Bot Setup
+    renderer.console.print("\n[bold white]Step 5: Discord Bot Integration[/bold white]")
+    renderer.console.print(
+        "  Harness can run as a Discord bot, letting you interact with the agent\n"
+        "  from any Discord channel. This is optional.\n"
+    )
+    has_token = bool(config.get_discord_token())
+    if has_token:
+        renderer.console.print(f"  Current token: [green]configured[/green]")
+    else:
+        renderer.console.print(f"  Current token: [red]not set[/red]")
+    renderer.console.print("  [1] Configure Discord bot now")
+    renderer.console.print("  [2] Skip (keep current settings)")
+    try:
+        d_choice = input("Select [default: 2]: ").strip()
+        if d_choice == "1":
+            _setup_discord_bot(config, renderer)
+    except (EOFError, KeyboardInterrupt):
+        return
+
     save_config(config)
     renderer.print_success(f"Configuration successfully saved to {USER_CONFIG_PATH}!")
+
+
+def _setup_discord_bot(config: HarnessConfig, renderer) -> None:
+    """Guided Discord bot configuration sub-wizard."""
+    renderer.console.print(Panel(
+        "🤖 [bold cyan]Discord Bot Setup[/bold cyan]\n"
+        "Follow the steps below to configure your Discord bot.\n\n"
+        "[bold]Prerequisites:[/bold]\n"
+        "  1. Go to [link=https://discord.com/developers/applications]https://discord.com/developers/applications[/link]\n"
+        "  2. Click 'New Application' → name it → create it\n"
+        "  3. Go to 'Bot' tab → copy the bot token\n"
+        "  4. Go to 'OAuth2' → 'URL Generator'\n"
+        "     Scopes: [bold]bot[/bold], [bold]applications.commands[/bold]\n"
+        "     Bot Permissions: [bold]Send Messages[/bold], [bold]Read Message History[/bold],\n"
+        "     [bold]Use Slash Commands[/bold], [bold]Attach Files[/bold]\n"
+        "  5. Copy the generated URL → open in browser → invite to your server\n"
+        "  6. Right-click the channel → 'Copy Channel ID' (enable Developer Mode in Discord settings)\n",
+        border_style="cyan",
+    ))
+
+    # Bot token
+    renderer.console.print("[bold]5a. Bot Token[/bold]")
+    current_masked = mask_key(config.get_discord_token())
+    renderer.console.print(f"  Current: [dim]{current_masked or '(not set)'}[/dim]")
+    try:
+        token = getpass.getpass("  Enter bot token (leave empty to keep current): ").strip()
+        if token:
+            config.set_discord_token(token)
+            renderer.print_success("  Token saved to secure store")
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    # Guild ID (for instant command sync)
+    renderer.console.print("\n[bold]5b. Guild (Server) ID[/bold]")
+    renderer.console.print(
+        "  Optional: setting a guild ID makes slash commands appear instantly\n"
+        "  (otherwise global sync takes up to 1 hour)."
+    )
+    renderer.console.print(f"  Current: [dim]{config.discord_guild_id or '(not set — using global sync)'}[/dim]")
+    try:
+        guild_id = input("  Enter guild ID (leave empty to skip): ").strip()
+        if guild_id:
+            config.discord_guild_id = guild_id
+            renderer.print_success(f"  Guild ID set: {guild_id}")
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    # Workspace
+    renderer.console.print("\n[bold]5c. Bot Workspace[/bold]")
+    renderer.console.print(
+        "  The working directory the bot operates in. Leave empty to use the\n"
+        "  current directory."
+    )
+    try:
+        workspace = input(f"  Workspace path [default: {config.discord_workspace or '(current dir)'}]: ").strip()
+        if workspace:
+            config.discord_workspace = workspace
+            renderer.print_success(f"  Workspace set: {workspace}")
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    # Permission level
+    renderer.console.print("\n[bold]5d. Bot Permission Level[/bold]")
+    renderer.console.print(
+        "  Controls what the bot agent can do without asking for approval.\n"
+        "  [1] default — reads auto-approve, writes prompt for approval (Recommended)\n"
+        "  [2] full    — everything auto-executes (use only in trusted servers)\n"
+        "  [3] secure  — everything prompts for approval"
+    )
+    perm_map = {"1": "default", "2": "full", "3": "secure"}
+    try:
+        perm_choice = input(f"  Select [default: {config.discord_permission or 'default'}]: ").strip()
+        if perm_choice in perm_map:
+            config.discord_permission = perm_map[perm_choice]
+            renderer.print_success(f"  Permission set: {config.discord_permission}")
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    # Channel filtering
+    renderer.console.print("\n[bold]5e. Channel Filtering[/bold]")
+    renderer.console.print(
+        "  Restrict which channels the bot responds in.\n"
+        "  [1] blacklist (default) — responds everywhere EXCEPT listed channels\n"
+        "  [2] whitelist — responds ONLY in listed channels\n"
+        "  [3] none — responds in all channels"
+    )
+    try:
+        cf_choice = input("  Select [default: 1]: ").strip()
+        if cf_choice == "1":
+            config.discord_channel_mode = "blacklist"
+            channels = input("  Enter blocked channel IDs (comma-separated, empty to skip): ").strip()
+            config.discord_blacklisted_channels = channels
+        elif cf_choice == "2":
+            config.discord_channel_mode = "whitelist"
+            channels = input("  Enter allowed channel IDs (comma-separated): ").strip()
+            config.discord_whitelisted_channels = channels
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    # Auto-start
+    renderer.console.print("\n[bold]5f. Auto-Start[/bold]")
+    renderer.console.print("  Start the Discord bot automatically when launching Harness TUI?")
+    try:
+        auto = input("  Auto-start bot? (y/N) [default: N]: ").strip().lower()
+        config.discord_auto_start = auto in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    renderer.print_success("Discord bot configuration complete!")

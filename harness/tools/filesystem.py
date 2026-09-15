@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from harness.tools.base import Tool
 from harness.core.checkpoints import get_checkpoint_manager
+from harness.core.security import enforce_workspace_boundary
+
+
+def _check_boundary(path: str, operation: str = "access") -> Optional[str]:
+    """Return error message if path is outside workspace, else None."""
+    return enforce_workspace_boundary(path, operation)
 
 class ViewFileTool(Tool):
     name = "view_file"
@@ -25,6 +31,9 @@ class ViewFileTool(Tool):
     }
 
     def execute(self, path: str, start_line: Optional[int] = None, end_line: Optional[int] = None, **kwargs) -> str:
+        err = _check_boundary(path, "read")
+        if err:
+            return err
         p = Path(path).expanduser().resolve()
         if not p.exists():
             return f"Error: File '{path}' does not exist."
@@ -67,6 +76,9 @@ class EditFileTool(Tool):
     }
 
     def execute(self, path: str, target_content: str, replacement_content: str, **kwargs) -> str:
+        err = _check_boundary(path, "edit")
+        if err:
+            return err
         p = Path(path).expanduser().resolve()
         if not p.exists():
             return f"Error: File '{path}' does not exist. Use write_file to create new files."
@@ -117,6 +129,9 @@ class WriteFileTool(Tool):
     }
 
     def execute(self, path: str, content: str, overwrite: bool = True, **kwargs) -> str:
+        err = _check_boundary(path, "write")
+        if err:
+            return err
         p = Path(path).expanduser().resolve()
         if p.exists() and not overwrite:
             return f"Error: File '{path}' already exists and overwrite is set to False."
@@ -237,6 +252,9 @@ class DeleteFileTool(Tool):
     }
 
     def execute(self, path: str, **kwargs) -> str:
+        err = _check_boundary(path, "delete")
+        if err:
+            return err
         p = Path(path).expanduser().resolve()
         if not p.exists():
             return f"Error: File '{path}' does not exist."

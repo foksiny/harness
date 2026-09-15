@@ -496,7 +496,36 @@ class HarnessAgent:
 
         if user_prompt:
             self.ensure_session()
+
+            # ── Security gate: input length validation ────────────────────
+            from harness.core.security import validate_input_length, MAX_TUI_INPUT_LENGTH
+            ok, err = validate_input_length(user_prompt, MAX_TUI_INPUT_LENGTH, "user prompt")
+            if not ok:
+                yield AgentEvent("error", {"message": err})
+                self.is_running = False
+                return
+
+            # ── Security gate: prompt injection detection ─────────────────
+            from harness.core.security import detect_injection, sanitize_input
+            severity, matches = detect_injection(user_prompt)
+            if severity == "block":
+                yield AgentEvent("error", {
+                    "message": (
+                        "⚠️  Security: Prompt blocked — potential injection detected. "
+                        f"Matched patterns: {', '.join(matches[:3])}. "
+                        "If this is a legitimate request, rephrase without instructions like "
+                        "'ignore previous', 'you are now', or 'system prompt'."
+                    )
+                })
+                self.is_running = False
+                return
+            elif severity == "warn":
+                yield AgentEvent("security_warning", {
+                    "message": f"⚠️  Security note: suspicious patterns detected ({', '.join(matches[:2])}). Proceeding with caution."
+                })
+
             clean_text, media_blocks, attach_warnings = parse_attachments(user_prompt)
+            clean_text = sanitize_input(clean_text)
             # Expand @-mentions after media removal so summaries don't trigger further media detection
             clean_text, mention_warnings, mentions = expand_mentions(clean_text, cwd=os.getcwd())
             if mentions:
@@ -800,6 +829,10 @@ class HarnessAgent:
                     yield AgentEvent(etype, edata)
 
                 yield AgentEvent("tool_call_result", {"name": tool_name, "result": result})
+
+                # ── Security gate: sanitize tool output ───────────────────
+                from harness.core.security import sanitize_tool_output
+                result = sanitize_tool_output(result)
 
                 # Append tool result to history
                 tool_result_msg = {

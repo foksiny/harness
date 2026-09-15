@@ -201,6 +201,14 @@ class DiscordRenderState:
         if etype == "step_end":
             return self._flush_thinking()
 
+        if etype == "error":
+            return self._flush_thinking() + [
+                DiscordOutgoing("error", f"❌ {(data or {}).get('message', 'Unknown error')}")
+            ]
+
+        if etype == "security_warning":
+            return [DiscordOutgoing("notice", f"🛡️ {(data or {}).get('message', '')}")]
+
         if etype == "turn_complete":
             return self.finish()
 

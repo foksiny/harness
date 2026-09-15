@@ -57,7 +57,7 @@ except ImportError:  # pragma: no cover - exercised only when discord.py is abse
     app_commands = None
     HAS_DISCORD = False
 
-DEFAULT_PERMISSION = "full"
+DEFAULT_PERMISSION = "default"
 _SENTINEL = object()
 
 
@@ -781,6 +781,17 @@ if HAS_DISCORD:
             if len(prompt) > 32000:
                 await interaction.response.send_message(
                     "⚠️ Prompt too long (max ~32,000 characters).", ephemeral=True,
+                )
+                return
+            # Security gate: prompt injection detection
+            from harness.core.security import detect_injection
+            severity, matches = detect_injection(prompt)
+            if severity == "block":
+                await interaction.response.send_message(
+                    "⛔ Prompt blocked — potential injection detected. "
+                    f"Patterns: {', '.join(matches[:2])}. "
+                    "Rephrase without instructions like 'ignore previous' or 'you are now'.",
+                    ephemeral=True,
                 )
                 return
             if not self._channel_allowed(interaction.channel_id):

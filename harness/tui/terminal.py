@@ -421,6 +421,14 @@ class TerminalRenderer:
             self._finish_thinking()
             self.console.print()
 
+        elif etype == "error":
+            self._finish_markdown()
+            self._finish_thinking()
+            self.console.print(f"\n[{self.theme.error}]❌ {data.get('message', 'Unknown error')}[/{self.theme.error}]\n")
+
+        elif etype == "security_warning":
+            self.console.print(f"\n[{self.theme.warning}]🛡️ {data.get('message', '')}[/{self.theme.warning}]")
+
     def print_theme_gallery(self):
         """Display interactive gallery of all available themes with color swatches."""
         table = Table(title="🎨 Harness Theme Palette Gallery (14 Themes)", border_style=self.theme.border)
