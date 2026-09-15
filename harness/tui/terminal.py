@@ -4,6 +4,8 @@ Renders header HUDs, markdown streams, collapsible thinking, syntax diffs,
 theme galleries, and hotkey footers using Rich and active theme styling.
 """
 import os
+import random
+import threading
 import time
 from typing import Dict, Any, List, Optional
 from rich.console import Console
@@ -15,6 +17,93 @@ from rich.table import Table
 from rich.live import Live
 from harness.themes import Theme, get_theme, THEMES, render_theme_preview
 from harness.sysinfo import get_ram_usage_mb
+
+
+# ── Fun animation messages shown while the model is working ──────────────────
+
+_FUN_MESSAGES = [
+    ("jumping over the lazy fox... 🦊", "🐰"),
+    ("generating fancy confusing code... 💻", "🤔"),
+    ("thinking about how to \"fix\" this code... 🔧", "💭"),
+    ("getting frustrated on my own errors while doing more... 😅", "🐛"),
+    ("trying to not make slop... 🍦", "✨"),
+    ("testing things as i ignore other errors... 🧪", "🙈"),
+    ("idk what to say anymore... 🤷", "😶"),
+    ("searching \"how to be happy\"... 🔍", "😢"),
+    ("writing cool emoticons... 😎", "🖌️"),
+    ("adding unecessary emojis 🙂... 🎉", "🙃"),
+    ("making a cool 100% non-sloppy design... 🎨", "💅"),
+    ("reading those juicy files... 📚", "🤓"),
+    ("organizing the code so i don't get yelled at... 📁", "🫣"),
+    ("uwfhuiuwhfh... 😂🎉", "🫠"),
+    ("pretending i know what i'm doing... 🎭", "🤡"),
+    ("refactoring spaghetti into lasagna... 🍝", "👨‍🍳"),
+    ("consulting the ancient stack overflow scrolls... 📜", "🧙"),
+    ("debating whether it's a feature or a bug... ⚖️", "🐛"),
+    ("writing comments so future me doesn't cry... 😭", "📝"),
+    ("turn coffee into code... ☕➡️💻", "🤖"),
+    ("summoning the rubber duck debugger... 🦆", "🔮"),
+    ("avoiding eye contact with the failing test... 👀", "🏃"),
+    ("hoping this compiles on the first try... 🤞", "🎲"),
+]
+
+
+class _FunAnimation:
+    """Shows a random fun message at the bottom while the model is working."""
+
+    def __init__(self, console: Console, theme: Theme):
+        self._console = console
+        self._theme = theme
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._last_msg = ""
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1)
+            self._thread = None
+
+    def _loop(self):
+        while self._running:
+            delay = random.uniform(3.0, 5.0)
+            time.sleep(delay)
+            if not self._running:
+                break
+            self._show_random_message()
+
+    def _show_random_message(self):
+        msg, emoji = random.choice(_FUN_MESSAGES)
+        # Avoid repeating the same message
+        while msg == self._last_msg and len(_FUN_MESSAGES) > 1:
+            msg, emoji = random.choice(_FUN_MESSAGES)
+        self._last_msg = msg
+
+        # Pick a random animation frame
+        frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        frame = random.choice(frames)
+
+        try:
+            self._console.print(
+                f"  [{self.theme_color}]{frame} {emoji} {msg}[/{self.theme_color}]",
+                highlight=False,
+            )
+        except Exception:
+            pass
+
+    @property
+    def theme_color(self) -> str:
+        return self._theme.secondary if self._theme else "dim"
+
+
+# ── Terminal Renderer ────────────────────────────────────────────────────────
 
 class TerminalRenderer:
     """Renders rich UI elements with custom themes."""
@@ -29,9 +118,19 @@ class TerminalRenderer:
         self._md_buffer: str = ""
         self._md_live: Optional[Live] = None
         self._subagent_open: Optional[str] = None
+        self._fun_animation = _FunAnimation(self.console, self.theme)
+
+    def start_fun_animation(self):
+        """Start showing random fun messages while the model works."""
+        self._fun_animation.start()
+
+    def stop_fun_animation(self):
+        """Stop the fun animation."""
+        self._fun_animation.stop()
 
     def set_theme(self, theme_name: str):
         self.theme = get_theme(theme_name)
+        self._fun_animation._theme = self.theme
 
     def clear_screen(self):
         self.console.clear()
