@@ -146,15 +146,10 @@ if HAS_DISCORD:
                     return describe_media_blocks(provider, vfb_model, media_blocks,
                                                  question=question, system_prompt=system_prompt)
 
-                def _make_bc(**kwargs):
-                    from harness.browser.controller import BrowserController
-                    return BrowserController(**kwargs)
-
                 self.agent = HarnessAgent(
                     config=discord_cfg,
                     computer_controller_factory=_make_cc,
                     vision_describe=_make_vfb,
-                    browser_controller_factory=_make_bc,
                 )
             return self.agent
 

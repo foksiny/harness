@@ -1,9 +1,12 @@
 """
 Hermetic tests for browser automation tools.
+Browser tools are NOT auto-registered in ToolRegistry anymore (removed from
+the default toolset). These tests verify the tools still work when registered
+manually via register_browser_tools(), and that the overlay module is intact.
 Never touches a real browser — uses mock controllers via injected seams.
 """
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from harness.tools import ToolRegistry
 from harness.tools.browser import (
     BrowserLaunchTool, BrowserNavigateTool, BrowserClickTool,
@@ -15,7 +18,6 @@ from harness.tools.browser import (
 from harness.browser.overlay import (
     OVERLAY_JS, ACTION_MESSAGES, js_show_overlay, js_hide_overlay, get_action_message,
 )
-from harness.core.modes import PLAN_MODE_BLOCKED_TOOLS
 
 
 def _make_mock_controller():
@@ -40,19 +42,20 @@ def _make_mock_controller():
 
 
 class TestBrowserToolsHermetic(unittest.TestCase):
-    """All browser tools work with a mock controller — no real browser."""
+    """Browser tools work when manually registered via register_browser_tools()."""
 
     def setUp(self):
         self.ctrl = _make_mock_controller()
         self.factory = lambda **kw: self.ctrl
-        self.registry = ToolRegistry(browser_controller_factory=self.factory)
+        self.registry = ToolRegistry()
+        register_browser_tools(self.registry, controller_factory=self.factory)
 
     def test_bare_registry_has_no_browser_tools(self):
         r = ToolRegistry()
         browser = [t.name for t in r.list_tools() if t.name.startswith("browser")]
         self.assertEqual(browser, [])
 
-    def test_injected_registry_has_11_browser_tools(self):
+    def test_manual_registry_has_11_browser_tools(self):
         browser = [t.name for t in self.registry.list_tools() if t.name.startswith("browser")]
         self.assertEqual(len(browser), 11)
 
@@ -150,24 +153,7 @@ class TestBrowserToolsHermetic(unittest.TestCase):
     def test_no_controller_returns_error(self):
         r = ToolRegistry()
         result = r.execute("browser_navigate", {"url": "https://x.com"}, mode="build")
-        # Tool not found in bare registry
         self.assertIn("not found", result)
-
-
-class TestBrowserModeGating(unittest.TestCase):
-    """Browser mutation tools blocked in PLAN mode."""
-
-    def test_plan_mode_blocks_mutation_tools(self):
-        blocked_browser = [t for t in PLAN_MODE_BLOCKED_TOOLS if t.startswith("browser")]
-        self.assertEqual(len(blocked_browser), 9)
-        for name in ["browser_launch", "browser_navigate", "browser_click",
-                      "browser_type", "browser_press_key", "browser_scroll",
-                      "browser_evaluate", "browser_tab", "browser_navigation"]:
-            self.assertIn(name, PLAN_MODE_BLOCKED_TOOLS, f"{name} should be blocked in PLAN")
-
-    def test_plan_mode_allows_read_only_tools(self):
-        for name in ["browser_screenshot", "browser_get_page_info"]:
-            self.assertNotIn(name, PLAN_MODE_BLOCKED_TOOLS, f"{name} should be allowed in PLAN")
 
 
 class TestBrowserOverlay(unittest.TestCase):

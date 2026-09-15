@@ -33,16 +33,6 @@ PLAN_MODE_BLOCKED_TOOLS: Set[str] = {
     "execute_python",   # Unless explicitly marked read-only
     "computer_control", # Desktop input is a mutation — blocked in PLAN
     "computer_clipboard",  # Clipboard write is a mutation — blocked in PLAN
-    # Browser mutations blocked in PLAN (read-only tools like screenshot/list remain allowed)
-    "browser_launch",
-    "browser_navigate",
-    "browser_click",
-    "browser_type",
-    "browser_press_key",
-    "browser_scroll",
-    "browser_evaluate",
-    "browser_tab",
-    "browser_navigation",
 }
 
 # Dangerous shell command prefixes blocked in PLAN mode

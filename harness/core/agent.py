@@ -42,11 +42,9 @@ class HarnessAgent:
         learning_manager: Optional[LearningManager] = None,
         computer_controller_factory: Optional[Any] = None,
         vision_describe: Optional[Any] = None,
-        browser_controller_factory: Optional[Any] = None,
     ):
         self.computer_controller_factory = computer_controller_factory
         self.vision_describe = vision_describe
-        self.browser_controller_factory = browser_controller_factory
         self.config = config
         self.mode = Mode.from_string(config.mode)
         self.permission_manager = PermissionManager(PermissionLevel.from_string(config.permission))
@@ -66,7 +64,6 @@ class HarnessAgent:
             learning_enabled=config.learning_enabled,
             computer_controller_factory=self.computer_controller_factory,
             vision_describe=self.vision_describe,
-            browser_controller_factory=self.browser_controller_factory,
         )
         # Debounce heuristic auto-learning so at most one learned lesson is
         # captured per session.
