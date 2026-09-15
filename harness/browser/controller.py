@@ -111,6 +111,8 @@ class BrowserController:
                 f"Close the process using port {self.port} or use a different port."
             )
         args = [exe, f"--remote-debugging-port={self.port}"]
+        if is_firefox:
+            args += [f"--remote-allow-hosts=*", "--no-remote", "--new-instance"]
         if self.headless:
             args.append("--headless" if is_firefox else "--headless=new")
         args += [
