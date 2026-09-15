@@ -842,6 +842,8 @@ if HAS_DISCORD:
                 state = DiscordRenderState(max_message_len=self.max_message_len)
                 loop = asyncio.get_running_loop()
                 agent = rt.ensure_agent()
+                _typing_done = asyncio.Event()
+                typing_task = asyncio.ensure_future(asyncio.sleep(0))  # no-op placeholder
                 log.info("Agent ready: provider=%s model=%s", agent.config.provider, agent.session.model if agent.session else "none")
 
                 # ── Worker: runs on thread pool ──────────────────────────
@@ -875,6 +877,30 @@ if HAS_DISCORD:
                 log.info("Starting agent worker thread...")
                 worker_task = asyncio.get_event_loop().run_in_executor(None, _worker)
 
+                # ── Typing indicator: re-trigger every 8 seconds ─────────
+                # Discord's typing indicator auto-hides after ~10 seconds.
+                # This coroutine keeps it alive for the entire agent step.
+
+                async def _keep_typing() -> None:
+                    channel = interaction.channel
+                    if channel is None:
+                        return
+                    while not _typing_done.is_set():
+                        try:
+                            async with channel.typing():
+                                # Wait 8s or until done, whichever comes first
+                                try:
+                                    await asyncio.wait_for(
+                                        _typing_done.wait(), timeout=8.0,
+                                    )
+                                    break  # done_event was set
+                                except asyncio.TimeoutError:
+                                    pass  # re-trigger typing
+                        except Exception:
+                            break
+
+                typing_task = asyncio.ensure_future(_keep_typing())
+
                 # ── Consumer: runs on event loop ─────────────────────────
                 # Reads events from the queue and sends them to Discord in
                 # real time.
@@ -901,6 +927,8 @@ if HAS_DISCORD:
 
                 # Wait for worker thread to finish (callback restoration).
                 await worker_task
+                _typing_done.set()
+                await typing_task
                 log.info("Agent worker finished after %d events", event_count)
 
                 # Flush any remaining buffered output.
@@ -913,6 +941,11 @@ if HAS_DISCORD:
 
             except Exception as exc:
                 log.exception("Unhandled error in /ask handler")
+                _typing_done.set()
+                try:
+                    await typing_task
+                except Exception:
+                    pass
                 try:
                     await interaction.followup.send(f"❌ **Internal error**: {exc}", ephemeral=True)
                 except discord.HTTPException:
