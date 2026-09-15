@@ -98,6 +98,15 @@ class BrowserController:
         if not exe:
             raise RuntimeError("No browser found. Install Chrome/Edge/Brave/Firefox or pass browser_path.")
         is_firefox = "firefox" in exe.lower()
+
+        # If CDP is already available on this port (e.g. user's existing browser),
+        # connect to it instead of launching a new instance.
+        if self._check_cdp():
+            try:
+                self.connect()
+                return f"Connected to existing browser on port {self.port} ({Path(exe).name})"
+            except Exception:
+                pass  # CDP responded but connect failed — try launching fresh
         args = [exe, f"--remote-debugging-port={self.port}"]
         if self.headless:
             args.append("--headless" if is_firefox else "--headless=new")
