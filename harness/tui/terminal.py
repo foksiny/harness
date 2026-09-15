@@ -58,27 +58,44 @@ class _FunAnimation:
         self._console = console
         self._theme = theme
         self._running = False
+        self._paused = False
         self._thread: Optional[threading.Thread] = None
         self._last_msg = ""
+        self._printed_len = 0  # length of last printed line
 
     def start(self):
         if self._running:
             return
         self._running = True
+        self._paused = False
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._running = False
+        self._paused = False
         if self._thread:
             self._thread.join(timeout=2)
             self._thread = None
-            # Clear the animation line
-            try:
-                sys.stdout.write("\r\033[K")
-                sys.stdout.flush()
-            except Exception:
-                pass
+        self._clear_line()
+
+    def pause(self):
+        """Pause animation before Rich outputs something."""
+        self._paused = True
+        self._clear_line()
+
+    def resume(self):
+        """Resume animation after Rich finishes outputting."""
+        self._paused = False
+
+    def _clear_line(self):
+        """Clear the animation line from the terminal."""
+        try:
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
+            self._printed_len = 0
+        except Exception:
+            pass
 
     def _loop(self):
         while self._running:
@@ -93,11 +110,15 @@ class _FunAnimation:
             start = time.time()
             frame_idx = 0
             while self._running and (time.time() - start) < interval:
+                if self._paused:
+                    time.sleep(0.05)
+                    continue
                 frame = self.FRAMES[frame_idx % len(self.FRAMES)]
                 line = f"\r  {frame} {msg}"
                 try:
                     sys.stdout.write(line)
                     sys.stdout.flush()
+                    self._printed_len = len(line)
                 except Exception:
                     pass
                 frame_idx += 1
@@ -132,6 +153,14 @@ class TerminalRenderer:
     def stop_fun_animation(self):
         """Stop the fun animation."""
         self._fun_animation.stop()
+
+    def pause_fun_animation(self):
+        """Pause animation before rendering agent output."""
+        self._fun_animation.pause()
+
+    def resume_fun_animation(self):
+        """Resume animation after rendering agent output."""
+        self._fun_animation.resume()
 
     def set_theme(self, theme_name: str):
         self.theme = get_theme(theme_name)
