@@ -83,20 +83,58 @@ class _FunAnimation:
         self._write("\r\033[2K")
 
     def _loop(self):
-        while not self._stop_event.is_set():
-            msg, _tag = random.choice(_FUN_MESSAGES)
-            while msg == self._last_msg and len(_FUN_MESSAGES) > 1:
-                msg, _tag = random.choice(_FUN_MESSAGES)
-            self._last_msg = msg
+        msg = ""
+        prev_spinner_idx = 0
 
+        while not self._stop_event.is_set():
+            # Pick next message (avoid repeat)
+            next_msg, _tag = random.choice(_FUN_MESSAGES)
+            while next_msg == self._last_msg and len(_FUN_MESSAGES) > 1:
+                next_msg, _tag = random.choice(_FUN_MESSAGES)
+            self._last_msg = next_msg
+
+            # ── Phase 1: erase old message (0.5s) ──────────────────
+            old_text = f"  {self.FRAMES[prev_spinner_idx % len(self.FRAMES)]} {msg}"
+            erase_steps = max(len(old_text), 1)
+            erase_delay = 0.5 / erase_steps
+            for i in range(len(old_text) - 1, -1, -1):
+                if self._stop_event.is_set():
+                    return
+                spinner = self.FRAMES[prev_spinner_idx % len(self.FRAMES)]
+                prev_spinner_idx += 1
+                visible = f"\r  {spinner} {old_text[2:i]}"
+                pad = " " * max(len(old_text) - len(visible) + 2, 0)
+                self._write(f"{visible}{pad}")
+                time.sleep(erase_delay)
+
+            # ── Phase 2: type new message (0.5s) ───────────────────
+            new_text = f"  {self.FRAMES[prev_spinner_idx % len(self.FRAMES)]} {next_msg}"
+            type_steps = max(len(new_text) - 2, 1)
+            type_delay = 0.5 / type_steps
+            for i in range(1, len(new_text) - 1):
+                if self._stop_event.is_set():
+                    return
+                spinner = self.FRAMES[prev_spinner_idx % len(self.FRAMES)]
+                prev_spinner_idx += 1
+                visible = f"\r  {spinner} {new_text[2:i + 1]}"
+                pad = " " * max(len(new_text) - len(visible) + 1, 0)
+                self._write(f"{visible}{pad}")
+                time.sleep(type_delay)
+
+            # Write full final line
+            spinner = self.FRAMES[prev_spinner_idx % len(self.FRAMES)]
+            prev_spinner_idx += 1
+            self._write(f"\r  {spinner} {next_msg}")
+
+            msg = next_msg
+
+            # ── Phase 3: spin normally for 5-10 seconds ────────────
             interval = random.uniform(5.0, 10.0)
             start = time.time()
-            frame_idx = 0
-
             while not self._stop_event.is_set() and (time.time() - start) < interval:
-                frame = self.FRAMES[frame_idx % len(self.FRAMES)]
-                self._write(f"\r  {frame} {msg}")
-                frame_idx += 1
+                spinner = self.FRAMES[prev_spinner_idx % len(self.FRAMES)]
+                prev_spinner_idx += 1
+                self._write(f"\r  {spinner} {msg}")
                 time.sleep(0.08)
 
     def _write(self, text: str):
