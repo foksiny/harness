@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Lazy imports to avoid hard dependency
@@ -25,11 +26,25 @@ def _ensure_imports():
     raises X11/Xauth errors (NOT ImportError) on headless machines. Catch every
     failure mode so the backend simply reports "unavailable" instead of crashing.
     One-shot: the first result is cached, avoiding repeated crash attempts.
+
+    On Wayland with XWayland (rootless mode), ~/.Xauthority may not exist even
+    though X11 auth is not required. We create an empty file so python-xlib
+    doesn't crash during import.
     """
     global _pyautogui, _pil_image, _mss, _imports_done
     if _imports_done:
         return
     _imports_done = True
+
+    # XWayland rootless mode doesn't use Xauthority but python-xlib crashes
+    # if ~/.Xauthority is missing. Create an empty file so the import works.
+    xauth = Path.home() / ".Xauthority"
+    if not xauth.exists():
+        try:
+            xauth.touch(mode=0o600)
+        except Exception:
+            pass
+
     try:
         import pyautogui
         _pyautogui = pyautogui
@@ -338,7 +353,7 @@ def execute_input(action: Dict[str, Any]) -> Dict[str, Any]:
             _pyautogui.keyUp(key)
             return {"ok": True, "action": "keyup", "key": key}
         
-        if name in ("combo", "hotkey", "chord"):
+        if name in ("combo", "hotkey", "chord", "keys"):
             keys = action.get("keys", [])
             if keys:
                 _pyautogui.hotkey(*keys)

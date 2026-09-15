@@ -162,7 +162,7 @@ def cli_input(action: Dict[str, Any]) -> Dict[str, Any]:
             cmd = ["xdotool", "type", "--delay", "12", str(action.get("text", ""))]
         elif name == "key":
             cmd = ["xdotool", "key", str(action.get("key", ""))]
-        elif name == "combo":
+        elif name in ("combo", "keys"):
             keys = action.get("keys") or []
             cmd = ["xdotool", "key", *[str(k) for k in keys]]
         else:
@@ -181,7 +181,7 @@ def cli_input(action: Dict[str, Any]) -> Dict[str, Any]:
             cmd = ["ydotool", "type", str(action.get("text", ""))]
         elif name == "key":
             cmd = ["ydotool", "key", str(action.get("key", ""))]
-        elif name == "combo":
+        elif name in ("combo", "keys"):
             keys = action.get("keys") or []
             cmd = ["ydotool", "key", *[str(k) for k in keys]]
         else:

@@ -202,7 +202,7 @@ def _default_input_exec(action: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
-_XTEST_ACTIONS = {"move", "click", "drag", "scroll", "type", "key", "combo", "keyup", "keydown", "button"}
+_XTEST_ACTIONS = {"move", "click", "drag", "scroll", "type", "key", "keys", "combo", "keyup", "keydown", "button"}
 
 
 def _apply_xtest(session: Any, action: Dict[str, Any]) -> Dict[str, Any]:
@@ -235,7 +235,7 @@ def _apply_xtest(session: Any, action: Dict[str, Any]) -> Dict[str, Any]:
         session.key(token, down=True)
         session.key(token, down=False)
         return {"ok": True, "action": action_type, "key": token}
-    if action_type in ("combo", "chord"):
+    if action_type in ("combo", "chord", "keys"):
         keys = action.get("keys") or []
         for k in keys:
             session.combo_press(k)
