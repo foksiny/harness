@@ -109,6 +109,26 @@ def cli_capture(
         err = res["stderr"].strip() if res else "grim not found"
         return {"ok": False, "error": f"grim failed: {err}", "hints": capture_hints()}
 
+    # cosmic-screenshot: COSMIC desktop's native Wayland screencapture
+    if _which("cosmic-screenshot"):
+        out_dir_arg = os.path.dirname(path) or out_dir
+        cmd = ["cosmic-screenshot", "--interactive=false", "--modal=false",
+               "--notify=false", f"--save-dir={out_dir_arg}"]
+        res = _run(cmd)
+        if res and res["rc"] == 0:
+            # cosmic-screenshot saves with its own filename pattern — find the newest file
+            import glob
+            files = sorted(glob.glob(os.path.join(out_dir_arg, "Screenshot_*.png")),
+                           key=os.path.getmtime, reverse=True)
+            if files:
+                actual = files[0]
+                # Rename to our expected path
+                if actual != path:
+                    os.rename(actual, path)
+                return {"ok": True, "path": path, "backend": "cosmic-screenshot"}
+        err = res["stderr"].strip() if res else "cosmic-screenshot not found"
+        return {"ok": False, "error": f"cosmic-screenshot failed: {err}", "hints": capture_hints()}
+
     if _which("scrot"):
         args = [path]
         if region and region.get("width"):

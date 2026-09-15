@@ -136,13 +136,13 @@ def capture_screen(
     out_dir = out_dir or os.path.expanduser("~/.harness/screenshots")
     os.makedirs(out_dir, exist_ok=True)
     
-    # Try mss first (faster, supports multi-monitor)
+    # Try mss first (fastest, works on X11/macOS/Windows)
     if _mss is not None:
         try:
             result = _capture_mss(region, monitor_index, out_dir)
-            if result.get("ok") and _is_all_black(result.get("path")):
-                result["warning"] = "capture appears all-black (screen may be locked or display off)"
-            return result
+            if result.get("ok") and not _is_all_black(result.get("path")):
+                return result
+            # mss returned all-black (common on Wayland) — fall through
         except Exception:
             pass
     
@@ -150,15 +150,34 @@ def capture_screen(
     if _pyautogui is not None and _pil_image is not None:
         try:
             result = _capture_pyautogui(region, out_dir)
-            if result.get("ok") and _is_all_black(result.get("path")):
-                result["warning"] = "capture appears all-black (screen may be locked or display off)"
+            if result.get("ok") and not _is_all_black(result.get("path")):
+                return result
+        except Exception:
+            pass
+
+    # Try CLI screenshot drivers (grim for Wayland, scrot/import for X11)
+    try:
+        result = _capture_cli(region, monitor_index, out_dir)
+        if result.get("ok") and not _is_all_black(result.get("path")):
             return result
+    except Exception:
+        pass
+    
+    # Last resort: return whatever mss gave us (even if black) with a warning
+    if _mss is not None:
+        try:
+            result = _capture_mss(region, monitor_index, out_dir)
+            if result.get("ok"):
+                result["warning"] = "capture appears all-black (screen may be locked, display off, or compositor blocking)"
+                return result
         except Exception:
             pass
     
-    return {"ok": False, "error": "no capture backend available", 
-            "hints": ["install pyautogui + Pillow: pip install pyautogui Pillow",
-                      "or install mss: pip install mss"]}
+    return {"ok": False, "error": "no capture backend produced a usable image",
+            "hints": ["on Wayland: install grim (wayland screenshotter)",
+                      "on X11: install scrot or ImageMagick import",
+                      "on macOS: built-in screencapture works",
+                      "on Windows: built-in mss backend works"]}
 
 
 def _capture_mss(
@@ -245,6 +264,44 @@ def _capture_pyautogui(
         "monitor_index": 0,
         "backend": "pyautogui",
     }
+
+
+def _capture_cli(
+    region: Optional[Dict[str, Any]],
+    monitor_index: int,
+    out_dir: str,
+) -> Dict[str, Any]:
+    """Capture using CLI screenshot tools (grim/scrot/import/gnome-screenshot).
+    
+    Tries tools in order of preference for each display server:
+    - Wayland: grim (native Wayland screencapture)
+    - X11: scrot, ImageMagick import, gnome-screenshot
+    """
+    from harness.computer.wayland_utils import cli_capture
+    result = cli_capture(region=region, out_dir=out_dir)
+    if result.get("ok"):
+        path = result["path"]
+        from PIL import Image as _Img
+        try:
+            img = _Img.open(path)
+            w, h = img.size
+            geom = {"x": region.get("x", 0) if region else 0,
+                    "y": region.get("y", 0) if region else 0,
+                    "width": w, "height": h}
+            return {
+                "ok": True,
+                "path": path,
+                "image_path": path,
+                "width": w,
+                "height": h,
+                "geometry": geom,
+                "monitors": [{"width": w, "height": h}],
+                "monitor_index": monitor_index,
+                "backend": result.get("backend", "cli"),
+            }
+        except Exception:
+            pass
+    return result
 
 
 # ---------------------------------------------------------------------------
