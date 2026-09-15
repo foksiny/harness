@@ -53,3 +53,6 @@ harness = "harness.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["harness*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
