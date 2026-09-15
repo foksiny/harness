@@ -79,12 +79,10 @@ def run_interactive(agent: HarnessAgent):
         # never leak as ^C / ^[ control garbage into the terminal).
         try:
             with no_echo_stdin():
-                renderer.start_fun_animation()
-                for ev in agent.step(user_input):
-                    renderer.pause_fun_animation()
-                    renderer.render_agent_event(ev)
-                    renderer.resume_fun_animation()
                 renderer.stop_fun_animation()
+                for ev in agent.step(user_input):
+                    renderer.render_agent_event(ev)
+                renderer.start_fun_animation()
             renderer.finish_markdown()
             renderer.finish_thinking()
         except KeyboardInterrupt:

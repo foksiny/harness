@@ -50,83 +50,61 @@ _FUN_MESSAGES = [
 
 
 class _FunAnimation:
-    """Shows a random fun message at the bottom while the model is working."""
+    """Shows a random fun message at the bottom while the model is working.
+
+    The animation thread writes directly to stdout using ``\\r`` to overwrite
+    a single line.  It must NOT run concurrently with any other stdout writer
+    (Rich, print, etc.) or orphaned characters appear.
+
+    Protocol: ``start()`` launches the thread, ``stop()`` signals it to clear
+    its line and exit.  ``stop()`` blocks until the thread joins.
+    """
 
     FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
-    def __init__(self, console: Console, theme: Theme):
-        self._console = console
-        self._theme = theme
-        self._running = False
-        self._paused = False
+    def __init__(self):
+        self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._last_msg = ""
-        self._printed_len = 0  # length of last printed line
 
     def start(self):
-        if self._running:
+        if self._thread is not None and self._thread.is_alive():
             return
-        self._running = True
-        self._paused = False
+        self._stop_event.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self):
-        self._running = False
-        self._paused = False
+        """Clear the animation line and wait for the thread to exit."""
+        self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=2)
             self._thread = None
-        self._clear_line()
-
-    def pause(self):
-        """Pause animation before Rich outputs something."""
-        self._paused = True
-        self._clear_line()
-
-    def resume(self):
-        """Resume animation after Rich finishes outputting."""
-        self._paused = False
-
-    def _clear_line(self):
-        """Clear the animation line from the terminal."""
-        try:
-            sys.stdout.write("\r\033[2K")
-            sys.stdout.flush()
-            self._printed_len = 0
-        except Exception:
-            pass
+        self._write("\r\033[2K")
 
     def _loop(self):
-        while self._running:
-            # Pick a random interval between messages: 5-10 seconds
-            interval = random.uniform(5.0, 10.0)
+        while not self._stop_event.is_set():
             msg, _tag = random.choice(_FUN_MESSAGES)
             while msg == self._last_msg and len(_FUN_MESSAGES) > 1:
                 msg, _tag = random.choice(_FUN_MESSAGES)
             self._last_msg = msg
 
-            # Animate the spinner for the chosen interval
+            interval = random.uniform(5.0, 10.0)
             start = time.time()
             frame_idx = 0
-            while self._running and (time.time() - start) < interval:
-                if self._paused:
-                    time.sleep(0.05)
-                    continue
-                frame = self.FRAMES[frame_idx % len(self.FRAMES)]
-                line = f"\r  {frame} {msg}"
-                try:
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
-                    self._printed_len = len(line)
-                except Exception:
-                    pass
-                frame_idx += 1
-                time.sleep(0.08)  # 80ms per frame = ~12.5 fps spinner
 
-    @property
-    def theme_color(self) -> str:
-        return self._theme.secondary if self._theme else "dim"
+            while not self._stop_event.is_set() and (time.time() - start) < interval:
+                frame = self.FRAMES[frame_idx % len(self.FRAMES)]
+                self._write(f"\r  {frame} {msg}")
+                frame_idx += 1
+                time.sleep(0.08)
+
+    def _write(self, text: str):
+        try:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+        except Exception:
+            pass
 
 
 # ── Terminal Renderer ────────────────────────────────────────────────────────
@@ -144,7 +122,7 @@ class TerminalRenderer:
         self._md_buffer: str = ""
         self._md_live: Optional[Live] = None
         self._subagent_open: Optional[str] = None
-        self._fun_animation = _FunAnimation(self.console, self.theme)
+        self._fun_animation = _FunAnimation()
 
     def start_fun_animation(self):
         """Start showing random fun messages while the model works."""
@@ -154,17 +132,8 @@ class TerminalRenderer:
         """Stop the fun animation."""
         self._fun_animation.stop()
 
-    def pause_fun_animation(self):
-        """Pause animation before rendering agent output."""
-        self._fun_animation.pause()
-
-    def resume_fun_animation(self):
-        """Resume animation after rendering agent output."""
-        self._fun_animation.resume()
-
     def set_theme(self, theme_name: str):
         self.theme = get_theme(theme_name)
-        self._fun_animation._theme = self.theme
 
     def clear_screen(self):
         self.console.clear()

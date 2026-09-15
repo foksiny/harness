@@ -60,6 +60,10 @@ class RunCommandTool(Tool):
             # On Windows, shell=True uses the default cmd.exe shell.
             if os.name != "nt":
                 run_kwargs["executable"] = "/bin/bash"
+            else:
+                run_kwargs["creationflags"] = (
+                    subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+                )
             proc = subprocess.run(cmd, **run_kwargs)
             elapsed = round(time.time() - start_time, 2)
             out = proc.stdout

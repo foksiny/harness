@@ -258,6 +258,11 @@ Examples:
     return parser
 
 def main():
+    # Windows terminal compat: enable ANSI escapes and UTF-8 output
+    from harness.tui.win_compat import enable_windows_vt_processing, ensure_utf8_stdout
+    enable_windows_vt_processing()
+    ensure_utf8_stdout()
+
     # Intercept subcommands first
     if len(sys.argv) > 1 and sys.argv[1] in ("config", "keys", "setup", "theme", "update", "discord"):
         result = handle_subcommands(sys.argv[1:])
