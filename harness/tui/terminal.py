@@ -4,9 +4,6 @@ Renders header HUDs, markdown streams, collapsible thinking, syntax diffs,
 theme galleries, and hotkey footers using Rich and active theme styling.
 """
 import os
-import random
-import sys
-import threading
 import time
 from typing import Dict, Any, List, Optional
 from rich.console import Console
@@ -18,131 +15,6 @@ from rich.table import Table
 from rich.live import Live
 from harness.themes import Theme, get_theme, THEMES, render_theme_preview
 from harness.sysinfo import get_ram_usage_mb
-
-
-# ── Fun animation messages shown while the model is working ──────────────────
-
-_FUN_MESSAGES = [
-    ("jumping over the lazy fox... (ﾉ◕ヮ◕)ﾉ*:・ﾟ", "fox"),
-    ("generating fancy confusing code... ╰(°▽°)╯", "code"),
-    ("thinking about how to \"fix\" this code... (・_・;)", "hmm"),
-    ("getting frustrated on my own errors while doing more... (ᗒᗣᗕ)՞", "ugh"),
-    ("trying to not make slop... (￢_￢)", "nope"),
-    ("testing things as i ignore other errors... ¯\\_(ツ)_/¯", "meh"),
-    ("idk what to say anymore... (┐「ε:)", "bruh"),
-    ("searching \"how to be happy\"... ╮(╯_╰)╭", "sad"),
-    ("writing cool emoticons... (☞ﾟヮﾟ)☞", "cool"),
-    ("adding unecessary emojis... ( ͡° ͜ʖ ͡°)", "heh"),
-    ("making a cool 100% non-sloppy design... ╰(*°▽°*)╯", "nice"),
-    ("reading those juicy files... ( •̀ω•́ )σ", "read"),
-    ("organizing the code so i don't get yelled at... (／ω＼)", "shy"),
-    ("uwfhuiuwhfh... ╰(≥ω≤)╯", "bruh"),
-    ("pretending i know what i'm doing... (─‿─)", "yep"),
-    ("refactoring spaghetti into lasagna... (￣﹏￣)", "chef"),
-    ("consulting the ancient stack overflow scrolls... (◕‿◕✿)", "wise"),
-    ("debating whether it's a feature or a bug... (　-_?)", "hmm"),
-    ("writing comments so future me doesn't cry... (ಥ﹏ಥ)", "cry"),
-    ("turn coffee into code... ٩(◕‿◕｡)۶", "buzz"),
-    ("summoning the rubber duck debugger... (｀・ω・´)", "duck"),
-    ("avoiding eye contact with the failing test... (\\._.\\)", "nope"),
-    ("hoping this compiles on the first try... ┬┴┬┴┤(･_├┬┴┬┴", "nervous"),
-]
-
-
-class _FunAnimation:
-    """Shows a random fun message at the bottom while the model is working.
-
-    The animation thread writes directly to stdout using ``\\r`` to overwrite
-    a single line.  It must NOT run concurrently with any other stdout writer
-    (Rich, print, etc.) or orphaned characters appear.
-
-    Protocol: ``start()`` launches the thread, ``stop()`` signals it to clear
-    its line and exit.  ``stop()`` blocks until the thread joins.
-    """
-
-    FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-
-    def __init__(self):
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._last_msg = ""
-
-    def start(self):
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        """Clear the animation line and wait for the thread to exit."""
-        self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=2)
-            self._thread = None
-        self._write("\r\033[2K")
-
-    def _loop(self):
-        msg = ""
-        prev_spinner_idx = 0
-
-        while not self._stop_event.is_set():
-            # Pick next message (avoid repeat)
-            next_msg, _tag = random.choice(_FUN_MESSAGES)
-            while next_msg == self._last_msg and len(_FUN_MESSAGES) > 1:
-                next_msg, _tag = random.choice(_FUN_MESSAGES)
-            self._last_msg = next_msg
-
-            # ── Phase 1: erase old message (0.5s) ──────────────────
-            old_text = f"  {self.FRAMES[prev_spinner_idx % len(self.FRAMES)]} {msg}"
-            erase_steps = max(len(old_text), 1)
-            erase_delay = 0.5 / erase_steps
-            for i in range(len(old_text) - 1, -1, -1):
-                if self._stop_event.is_set():
-                    return
-                spinner = self.FRAMES[prev_spinner_idx % len(self.FRAMES)]
-                prev_spinner_idx += 1
-                visible = f"\r  {spinner} {old_text[2:i]}"
-                pad = " " * max(len(old_text) - len(visible) + 2, 0)
-                self._write(f"{visible}{pad}")
-                time.sleep(erase_delay)
-
-            # ── Phase 2: type new message (0.5s) ───────────────────
-            new_text = f"  {self.FRAMES[prev_spinner_idx % len(self.FRAMES)]} {next_msg}"
-            type_steps = max(len(new_text) - 2, 1)
-            type_delay = 0.5 / type_steps
-            for i in range(1, len(new_text) - 1):
-                if self._stop_event.is_set():
-                    return
-                spinner = self.FRAMES[prev_spinner_idx % len(self.FRAMES)]
-                prev_spinner_idx += 1
-                visible = f"\r  {spinner} {new_text[2:i + 1]}"
-                pad = " " * max(len(new_text) - len(visible) + 1, 0)
-                self._write(f"{visible}{pad}")
-                time.sleep(type_delay)
-
-            # Write full final line
-            spinner = self.FRAMES[prev_spinner_idx % len(self.FRAMES)]
-            prev_spinner_idx += 1
-            self._write(f"\r  {spinner} {next_msg}")
-
-            msg = next_msg
-
-            # ── Phase 3: spin normally for 5-10 seconds ────────────
-            interval = random.uniform(5.0, 10.0)
-            start = time.time()
-            while not self._stop_event.is_set() and (time.time() - start) < interval:
-                spinner = self.FRAMES[prev_spinner_idx % len(self.FRAMES)]
-                prev_spinner_idx += 1
-                self._write(f"\r  {spinner} {msg}")
-                time.sleep(0.08)
-
-    def _write(self, text: str):
-        try:
-            sys.stdout.write(text)
-            sys.stdout.flush()
-        except Exception:
-            pass
 
 
 # ── Terminal Renderer ────────────────────────────────────────────────────────
@@ -160,15 +32,6 @@ class TerminalRenderer:
         self._md_buffer: str = ""
         self._md_live: Optional[Live] = None
         self._subagent_open: Optional[str] = None
-        self._fun_animation = _FunAnimation()
-
-    def start_fun_animation(self):
-        """Start showing random fun messages while the model works."""
-        self._fun_animation.start()
-
-    def stop_fun_animation(self):
-        """Stop the fun animation."""
-        self._fun_animation.stop()
 
     def set_theme(self, theme_name: str):
         self.theme = get_theme(theme_name)
