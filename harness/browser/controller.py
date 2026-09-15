@@ -102,11 +102,14 @@ class BrowserController:
         # If CDP is already available on this port (e.g. user's existing browser),
         # connect to it instead of launching a new instance.
         if self._check_cdp():
-            try:
-                self.connect()
+            if self.connect():
                 return f"Connected to existing browser on port {self.port} ({Path(exe).name})"
-            except Exception:
-                pass  # CDP responded but connect failed — try launching fresh
+            # CDP responded but connect failed — the port is occupied by something
+            # that isn't a usable browser. Don't try to launch a new one on the same port.
+            raise RuntimeError(
+                f"Port {self.port} is in use but CDP connect failed. "
+                f"Close the process using port {self.port} or use a different port."
+            )
         args = [exe, f"--remote-debugging-port={self.port}"]
         if self.headless:
             args.append("--headless" if is_firefox else "--headless=new")
@@ -122,11 +125,12 @@ class BrowserController:
         else:
             launch_kwargs["start_new_session"] = True
         self._proc = subprocess.Popen(args, **launch_kwargs)
-        for _ in range(40):
+        # Firefox CDP can take a few seconds to become available; retry up to 20s.
+        for _ in range(80):
             time.sleep(0.25)
             if self._check_cdp():
-                self.connect()
-                return f"Browser launched ({Path(exe).name})"
+                if self.connect():
+                    return f"Browser launched ({Path(exe).name})"
         self.close()
         raise RuntimeError(f"Browser launched but CDP not available on port {self.port}")
 
@@ -161,7 +165,7 @@ class BrowserController:
     def _check_cdp(self) -> bool:
         import requests
         try:
-            return requests.get(f"http://127.0.0.1:{self.port}/json/version", timeout=1).status_code == 200
+            return requests.get(f"http://127.0.0.1:{self.port}/json/version", timeout=2).status_code == 200
         except Exception:
             return False
 
