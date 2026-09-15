@@ -5,6 +5,7 @@ theme galleries, and hotkey footers using Rich and active theme styling.
 """
 import os
 import random
+import sys
 import threading
 import time
 from typing import Dict, Any, List, Optional
@@ -51,6 +52,8 @@ _FUN_MESSAGES = [
 class _FunAnimation:
     """Shows a random fun message at the bottom while the model is working."""
 
+    FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
     def __init__(self, console: Console, theme: Theme):
         self._console = console
         self._theme = theme
@@ -68,35 +71,37 @@ class _FunAnimation:
     def stop(self):
         self._running = False
         if self._thread:
-            self._thread.join(timeout=1)
+            self._thread.join(timeout=2)
             self._thread = None
+            # Clear the animation line
+            try:
+                sys.stdout.write("\r\033[K")
+                sys.stdout.flush()
+            except Exception:
+                pass
 
     def _loop(self):
         while self._running:
-            delay = random.uniform(3.0, 5.0)
-            time.sleep(delay)
-            if not self._running:
-                break
-            self._show_random_message()
-
-    def _show_random_message(self):
-        msg, _tag = random.choice(_FUN_MESSAGES)
-        # Avoid repeating the same message
-        while msg == self._last_msg and len(_FUN_MESSAGES) > 1:
+            # Pick a random interval between messages: 5-10 seconds
+            interval = random.uniform(5.0, 10.0)
             msg, _tag = random.choice(_FUN_MESSAGES)
-        self._last_msg = msg
+            while msg == self._last_msg and len(_FUN_MESSAGES) > 1:
+                msg, _tag = random.choice(_FUN_MESSAGES)
+            self._last_msg = msg
 
-        # Pick a random animation frame
-        frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-        frame = random.choice(frames)
-
-        try:
-            self._console.print(
-                f"  [{self.theme_color}]{frame} {msg}[/{self.theme_color}]",
-                highlight=False,
-            )
-        except Exception:
-            pass
+            # Animate the spinner for the chosen interval
+            start = time.time()
+            frame_idx = 0
+            while self._running and (time.time() - start) < interval:
+                frame = self.FRAMES[frame_idx % len(self.FRAMES)]
+                line = f"\r  {frame} {msg}"
+                try:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+                frame_idx += 1
+                time.sleep(0.08)  # 80ms per frame = ~12.5 fps spinner
 
     @property
     def theme_color(self) -> str:
