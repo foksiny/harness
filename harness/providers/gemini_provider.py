@@ -86,7 +86,11 @@ class GeminiProvider(BaseProvider):
         active_model = model or self.default_model
         model_spec = self.get_model_spec(active_model)
 
-        endpoint = f"{self.base_url.rstrip('/')}/models/{active_model}:streamGenerateContent?alt=sse&key={self.api_key or ''}"
+        if not self.api_key:
+            raise RuntimeError(
+                "No API key for Google Gemini. Run:  harness keys set gemini <your-api-key>"
+            )
+        endpoint = f"{self.base_url.rstrip('/')}/models/{active_model}:streamGenerateContent?alt=sse&key={self.api_key}"
         headers = {"Content-Type": "application/json"}
 
         body: Dict[str, Any] = {

@@ -13,7 +13,7 @@ from typing import List, Optional, Iterator
 SLASH_COMMANDS = [
     "/help", "/goal", "/mode", "/perm", "/theme",
     "/provider", "/model", "/models", "/config", "/keys", "/setup",
-    "/effort", "/todo", "/skills", "/mcp",
+    "/effort", "/todo", "/skills", "/reload", "/mcp",
     "/subagent", "/agents", "/agent", "/back",
     "/compact", "/session", "/checkpoint", "/tokens", "/diff", "/clear",
     "/learn", "/exit", "/quit"
@@ -40,6 +40,28 @@ def no_echo_stdin(fd: Optional[int] = None) -> Iterator[None]:
 
     ``fd`` defaults to stdin; pass an explicit fd only in tests.
     """
+    if os.name == "nt":
+        # Windows: use msvcrt to suppress echo via Console API
+        try:
+            import msvcrt
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            STD_INPUT_HANDLE = -10
+            handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+            # Get current console mode
+            mode = ctypes.wintypes.DWORD()
+            kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+            ENABLE_ECHO_INPUT = 0x0004
+            new_mode = mode.value & ~ENABLE_ECHO_INPUT
+            kernel32.SetConsoleMode(handle, new_mode)
+            try:
+                yield
+            finally:
+                kernel32.SetConsoleMode(handle, mode.value)
+        except Exception:
+            yield
+        return
+
     if fd is None:
         try:
             fd = sys.stdin.fileno()
@@ -95,14 +117,25 @@ def is_command_input(line: str, known_commands: dict or frozenset) -> bool:
 
 
 def _is_path_like_token(token: str) -> bool:
+    """Detect path-like tokens across all platforms (Unix /, Windows C:\\, UNC)."""
     if token.startswith(("~/", "./", "../", "file://")):
         return True
+    # Unix absolute path
     if token.startswith("/"):
         rest = token[1:]
         if "/" in rest:
             return True
         return os.path.isfile(token) or os.path.isdir(token)
-    return False
+    # Windows absolute path: C:\..., D:\..., or UNC \\server\share
+    if len(token) >= 2 and token[1] == ":" and token[2:3] in ("\\", "/"):
+        return True
+    if token.startswith("\\\\"):
+        return True
+    # Cross-platform: let os.path decide
+    try:
+        return os.path.isabs(token) and (os.path.isfile(token) or os.path.isdir(token))
+    except Exception:
+        return False
 
 
 class InputHandler:
@@ -321,10 +354,14 @@ class InputHandler:
 
     def _raw_line(self, prompt_text: str, view: str) -> str:
         """Read one line from a raw-mode TTY so keybinds never leak into the buffer."""
-        import os
-        import select
-        import termios
-        import tty
+        try:
+            import os
+            import select
+            import termios
+            import tty
+        except ImportError:
+            # Windows / platforms without termios: fall back to plain input().
+            return input(prompt_text).strip()
 
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)

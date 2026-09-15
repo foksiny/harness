@@ -65,6 +65,7 @@ class CommandRegistry:
         self.register("effort", self._cmd_effort, "Set thinking effort: off, low, medium, high, or token count.")
         self.register("todo", self._cmd_todo, "Manage task list: /todo, /todo add <title>, /todo clear.")
         self.register("skills", self._cmd_skills, "List or reload available skills.")
+        self.register("reload", self._cmd_reload, "Reload config, skills, and permissions from disk.")
         self.register("learn", self._cmd_learn, "Manage learned memories: /learn [list], record <summary>, forget <id>, promote <id>, on, off.")
         self.register("mcp", self._cmd_mcp, "Manage MCP servers: /mcp list, /mcp add.")
         self.register("subagent", self._cmd_subagent, "Dispatch an isolated subagent: /subagent <type> <prompt>.")
@@ -82,6 +83,10 @@ class CommandRegistry:
 
     def _cmd_help(self, ctx: CommandContext):
         ctx.renderer.print_help(self.descriptions)
+        ctx.renderer.print_info(
+            "Discord bot: set a token with `harness keys set discord <token>`, then run `harness discord`. "
+            "Use `/help discord` inside the bot for the full guide."
+        )
 
     def _cmd_goal(self, ctx: CommandContext):
         if not ctx.args:
@@ -341,6 +346,39 @@ class CommandRegistry:
             lines.append(f"- **{s.name}** ({'Built-in' if s.is_builtin else 'Custom'}): {s.description}")
         ctx.renderer.print_markdown("\n".join(lines))
 
+    def _cmd_reload(self, ctx: CommandContext):
+        from harness.config import load_config
+        from harness.core.permissions import PermissionLevel
+        reloaded = []
+        errors = []
+
+        # 1. Reload config from disk
+        try:
+            fresh = load_config()
+            ctx.agent.config = fresh
+            reloaded.append("config")
+        except Exception as exc:
+            errors.append(f"config: {exc}")
+
+        # 2. Reload skills
+        try:
+            ctx.agent.skills_manager.reload()
+            reloaded.append(f"skills ({len(ctx.agent.skills_manager.skills)} loaded)")
+        except Exception as exc:
+            errors.append(f"skills: {exc}")
+
+        # 3. Re-sync permission level
+        try:
+            ctx.agent.permission_manager.level = PermissionLevel.from_string(ctx.agent.config.permission)
+            reloaded.append(f"permission → {ctx.agent.config.permission}")
+        except Exception as exc:
+            errors.append(f"permission: {exc}")
+
+        if reloaded:
+            ctx.renderer.print_success("Reloaded: " + ", ".join(reloaded))
+        for e in errors:
+            ctx.renderer.print_error(e)
+
     def _cmd_learn(self, ctx: CommandContext):
         lm = ctx.agent.learning_manager
         args = ctx.args.strip()
@@ -548,20 +586,8 @@ class CommandRegistry:
             ctx.renderer.print_info("Usage: /session [list|create [title]|delete <id>|rename <id> <title>|fork [title]|resume <id>]")
 
     def _cmd_tokens(self, ctx: CommandContext):
-        ram_mb = 0.0
-        try:
-            with open("/proc/self/status", "r") as f:
-                for line in f:
-                    if "VmRSS:" in line:
-                        ram_mb = round(int(line.split()[1]) / 1024, 1)
-        except Exception:
-            pass
-        if ram_mb == 0.0:
-            try:
-                import resource
-                ram_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
-            except Exception:
-                ram_mb = 0.0
+        from harness.sysinfo import get_ram_usage_mb
+        ram_mb = get_ram_usage_mb()
 
         if ctx.agent.session is None:
             ctx.renderer.print_info(f"Tokens: 0 | RAM Usage: {ram_mb} MB")

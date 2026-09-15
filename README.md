@@ -40,10 +40,10 @@
   - `Default`: Balanced — safe read/write operations auto-approved; destructive commands require approval.
   - `Full Access`: Unrestricted autonomous operation.
 - 🔐 **Secure API Key Storage**:
-  - Keys stored in `~/.harness/api_keys.json` with `0600` permissions (owner read/write only).
-  - OS keychain integration via `keyring` (included by default): stores keys in macOS Keychain, GNOME Keyring, or Windows Credential Manager.
-  - Automatic one-time migration from legacy plaintext `config.json`.
-  - Environment variables remain the first-priority source (ideal for CI/CD).
+   - OS keychain integration via `keyring` (included by default): stores keys in macOS Keychain, GNOME Keyring, or Windows Credential Manager.
+   - Falls back to `~/.harness/api_keys.json` with `0600` permissions (owner read/write only) when OS keychain is unavailable.
+   - Automatic one-time migration from legacy plaintext `config.json`.
+   - Environment variables remain the first-priority source (ideal for CI/CD).
 - 🌐 **Browser Automation (CDP)**:
   - Full browser control via Chrome DevTools Protocol — works with any Chromium-based browser (Chrome, Edge, Brave, Zen, Opera, Vivaldi) and Firefox.
   - Visual overlay banner injected into every page shows the user exactly what the agent is doing (navigating, clicking, typing, etc.) with icons and color-coded status.
@@ -214,22 +214,107 @@ cat logs/error.log | harness "Diagnose this stack trace"
   "compact_preserve_turns": 4,
   "compact_summary": "auto",
   "swarm_enabled": false,
-  "api_keys": {
-    "anthropic": "sk-ant-...",
-    "openai": "sk-proj-...",
-    "openrouter": "sk-or-...",
-    "nvidia": "nvapi-..."
-  }
+  "discord_channel_mode": "blacklist",
+  "discord_user_mode": "blacklist",
+  "discord_blacklisted_channels": "",
+  "discord_whitelisted_channels": "",
+  "discord_blacklisted_users": "",
+  "discord_whitelisted_users": "",
+  "discord_guild_id": "",
+  "discord_workspace": "",
+  "discord_permission": "full"
 }
 ```
+
+> The Discord bot token is never stored in `config.json` — it lives in your OS
+> keychain (macOS Keychain, GNOME Keyring, Windows Credential Manager) or the
+> secure store (`~/.harness/api_keys.json`, owner-only). Set it via
+> `harness keys set discord <token>` or `DISCORD_BOT_TOKEN`.
 
 Environment variables are also detected automatically (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `NVIDIA_API_KEY`, `GEMINI_API_KEY`, etc.).
 
 ---
 
+## 🤖 Discord Bot Integration
+
+Bind Harness into a Discord server and drive it with slash commands — prompts,
+file mentions, live tool notices, and full responses, all adapted to Discord's
+message model.
+
+### Features
+- **Slash commands**: `/ask <prompt>`, `/status`, `/clear`, `/tokens`, `/compact`, `/agents`, `/agent <id>`, `/help discord` for the full setup guide.
+- **`/discord` admin command**: manage all Discord settings directly from Discord — channel/user access modes, blacklists, whitelists, permission level, auto-start, guild ID.
+- **File mentions**: reference host files inline with `@path/to/file`, pass `file:/path` to `/ask`, or upload an attachment with the command.
+- **Discord-native output**: model **thinking** is posted as `> ` quote blocks as the agent iterates; **tool usage** is announced live (`🔧 Using tool: …`); the **final response is sent in full** when the turn completes (no streaming).
+- **Per-channel conversations**: every channel keeps its own agent session.
+- **Approval buttons**: with `discord_permission` set to `default`/`secure`, risky actions post an **Approve / Deny** button message instead of a terminal prompt.
+
+### Channel & User Access Control
+
+Access is controlled by two independent modes — one for channels, one for users — each in either **blacklist** or **whitelist** mode (default: blacklist).
+
+| Mode | Behavior |
+|---|---|
+| `blacklist` (default) | Listed items are **blocked**. Empty list = all allowed. |
+| `whitelist` | Only listed items are **allowed**. Empty list = all blocked. |
+
+Configure via CLI:
+```bash
+harness config set discord_channel_mode  blacklist   # or whitelist
+harness config set discord_blacklisted_channels  111...,222...
+harness config set discord_whitelisted_channels  333...
+harness config set discord_user_mode  blacklist       # or whitelist
+harness config set discord_blacklisted_users  444...,555...
+harness config set discord_whitelisted_users  666...
+```
+
+Or via the `/discord` slash command inside Discord:
+```
+/discord status                   # show all settings
+/discord channel_mode whitelist   # only listed channels allowed
+/discord block_channel 123456789  # add channel to blacklist
+/discord allow_channel 123456789  # add channel to whitelist
+/discord user_mode whitelist      # only listed users allowed
+/discord block_user 987654321     # add user to blacklist
+/discord allow_user 987654321     # add user to whitelist
+```
+
+### Setup
+```bash
+# 1. Install the optional Discord extra (pulls in discord.py)
+pip install "harness-cli[discord]"
+
+# 2. Create a bot in the Discord Developer Portal and grab its token.
+#    Enable the "bot" + "applications.commands" scopes and the Message Content intent.
+
+# 3. Store the token securely (OS keychain preferred, never plain config.json)
+harness keys set discord <your-bot-token>
+#    or: /keys set discord <token>   or   DISCORD_BOT_TOKEN=<token>
+
+# 4. Optional configuration
+harness config set discord_channel_mode blacklist       # blacklist | whitelist
+harness config set discord_blacklisted_channels 111...,222...
+harness config set discord_whitelisted_channels 333...
+harness config set discord_user_mode blacklist          # blacklist | whitelist
+harness config set discord_blacklisted_users 444...,555...
+harness config set discord_whitelisted_users 666...
+harness config set discord_guild_id    333...           # instant slash sync to a guild
+harness config set discord_workspace   /path/to/workdir
+harness config set discord_permission  full             # full | default | secure
+
+# 5. Launch the bot
+harness discord
+```
+
+### `/help discord` inside the bot
+The bot's `/help discord` command prints this entire walkthrough plus usage
+details, so you can configure everything without leaving Discord.
+
+---
+
 ## 🧪 Testing
 
-Harness comes with an automated test suite (265 tests across 21 files):
+Harness comes with an automated test suite (294+ tests across 21 files):
 ```bash
 python3 -m pytest tests/ -v
 ```
@@ -255,6 +340,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing convention
 ## 🔒 Security Notes
 
 - **`execute_python` runs in a real sandbox.** Backends in priority order: nsjail → Docker → restricted subprocess with `rlimit` resource confinement (memory, CPU, process count, file size; no core dumps; scrubbed environment). Network is disabled by default (opt in with `network: true`). AST analysis still flags dangerous patterns for transparency, but the sandbox is the real security boundary. Docker/nsjail give the strongest isolation; the restricted-subprocess fallback limits but does not namespace-isolate the filesystem — prefer running with Docker available for untrusted workloads.
-- **API keys use secure storage.** Keys are stored in `~/.harness/api_keys.json` with `0600` permissions (owner-only) and go to your OS keychain via `keyring` (macOS Keychain, GNOME Keyring, Windows Credential Manager) when available. Environment variables remain the recommended approach for CI/CD.
+- **API keys use secure storage.** Keys are stored in your OS keychain (`keyring`: macOS Keychain, GNOME Keyring, Windows Credential Manager) when available, with a file-based fallback (`~/.harness/api_keys.json`, `0600` permissions, owner-only). Environment variables remain the recommended approach for CI/CD.
 - **Full Access mode is unrestricted.** All tools execute without approval. Only use in controlled environments with trusted code.
 - **Recommended for untrusted scenarios**: `--mode plan --perm secure`, disposable API keys, and audit commands before approving.

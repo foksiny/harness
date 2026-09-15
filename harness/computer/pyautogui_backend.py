@@ -65,6 +65,44 @@ def is_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def _is_all_black(path: Optional[str]) -> bool:
+    """Check if a PNG screenshot is entirely or nearly all-black.
+
+    Samples a grid of pixels across the image. If the average brightness of
+    the sample is below 5 (out of 255), the image is considered all-black,
+    which typically means the display was off or the capture was blocked.
+    """
+    if not path or not os.path.exists(path):
+        return False
+    if _pil_image is None:
+        return False
+    try:
+        img = _pil_image.open(path)
+        w, h = img.size
+        if w == 0 or h == 0:
+            return True
+        pixels = []
+        step_x = max(1, w // 10)
+        step_y = max(1, h // 10)
+        for y in range(0, h, step_y):
+            for x in range(0, w, step_x):
+                px = img.getpixel((x, y))
+                if isinstance(px, int):
+                    pixels.append(px)
+                else:
+                    pixels.append(sum(px[:3]) // 3)
+        if not pixels:
+            return True
+        avg = sum(pixels) // len(pixels)
+        return avg < 5
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Capture
 # ---------------------------------------------------------------------------
 
@@ -76,6 +114,8 @@ def capture_screen(
     """Capture screen using pyautogui (PIL screenshot) or mss as primary.
     
     Returns structured dict with ok, path, geometry, backend info.
+    Validates the capture is not all-black (which indicates a locked/display-off
+    state or a compositor permission issue).
     """
     _ensure_imports()
     out_dir = out_dir or os.path.expanduser("~/.harness/screenshots")
@@ -84,14 +124,20 @@ def capture_screen(
     # Try mss first (faster, supports multi-monitor)
     if _mss is not None:
         try:
-            return _capture_mss(region, monitor_index, out_dir)
+            result = _capture_mss(region, monitor_index, out_dir)
+            if result.get("ok") and _is_all_black(result.get("path")):
+                result["warning"] = "capture appears all-black (screen may be locked or display off)"
+            return result
         except Exception:
             pass
     
     # Try pyautogui screenshot
     if _pyautogui is not None and _pil_image is not None:
         try:
-            return _capture_pyautogui(region, out_dir)
+            result = _capture_pyautogui(region, out_dir)
+            if result.get("ok") and _is_all_black(result.get("path")):
+                result["warning"] = "capture appears all-black (screen may be locked or display off)"
+            return result
         except Exception:
             pass
     
@@ -105,17 +151,24 @@ def _capture_mss(
     monitor_index: int,
     out_dir: str,
 ) -> Dict[str, Any]:
-    """Capture using mss (fastest)."""
+    """Capture using mss (fastest).
+
+    When monitor_index=0 (the entire virtual screen), mss may return a black
+    framebuffer on Wayland or multi-monitor setups. In that case we retry with
+    monitor_index=1 (the first physical monitor) which typically works.
+    """
     with _mss.mss() as sct:
         monitors = sct.monitors
         if not monitors:
             return {"ok": False, "error": "no monitors detected"}
-        
-        # monitor_index 0 = entire virtual screen in mss
-        mon = monitors[min(monitor_index, len(monitors) - 1)]
-        
+
+        idx = monitor_index
+        if idx == 0 and len(monitors) > 1:
+            idx = 1
+
+        mon = monitors[min(idx, len(monitors) - 1)]
+
         if region:
-            # Crop to requested region
             grab_region = {
                 "left": region.get("x", mon["left"]),
                 "top": region.get("y", mon["top"]),
@@ -124,13 +177,13 @@ def _capture_mss(
             }
         else:
             grab_region = mon
-        
+
         shot = sct.grab(grab_region)
         width, height = shot.width, shot.height
-        
+
         png_path = os.path.join(out_dir, f"screen-{int(time.time()*1000)}.png")
         _pil_image.frombytes("RGB", (width, height), shot.rgb).save(png_path)
-        
+
         return {
             "ok": True,
             "path": png_path,
@@ -140,7 +193,7 @@ def _capture_mss(
             "geometry": {"x": grab_region.get("left", 0), "y": grab_region.get("top", 0),
                          "width": width, "height": height},
             "monitors": monitors,
-            "monitor_index": monitor_index,
+            "monitor_index": idx,
             "backend": "mss",
         }
 

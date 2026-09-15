@@ -91,6 +91,10 @@ class AnthropicProvider(BaseProvider):
         model_spec = self.get_model_spec(active_model)
 
         endpoint = f"{self.base_url.rstrip('/')}/messages"
+        if not self.api_key:
+            raise RuntimeError(
+                f"No API key for Anthropic. Run:  harness keys set anthropic <your-api-key>"
+            )
         headers = {
             "Content-Type": "application/json",
             "x-api-key": self.api_key or "",

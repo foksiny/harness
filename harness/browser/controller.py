@@ -107,7 +107,12 @@ class BrowserController:
             "--disable-background-networking", "--disable-sync",
             "--disable-extensions", url,
         ]
-        self._proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        launch_kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.name == "nt":
+            launch_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            launch_kwargs["start_new_session"] = True
+        self._proc = subprocess.Popen(args, **launch_kwargs)
         for _ in range(40):
             time.sleep(0.25)
             if self._check_cdp():

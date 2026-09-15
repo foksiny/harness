@@ -10,15 +10,10 @@ import sys
 import importlib
 
 def measure_rss_mb():
-    """Current process RSS in MB (Linux /proc/self/status)."""
-    try:
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) / 1024  # kB -> MB
-    except Exception:
-        pass
-    return -1.0
+    """Current process RSS in MB (cross-platform)."""
+    from harness.sysinfo import get_ram_usage_mb
+    mb = get_ram_usage_mb()
+    return mb if mb > 0 else -1.0
 
 def bench_cold_start():
     """Time a fresh import of the core harness modules."""

@@ -29,6 +29,9 @@ def display_config_table(config: HarnessConfig, renderer) -> None:
             val_str = f"{len(v)} key(s) stored in config"
         elif k == "base_urls":
             val_str = f"{len(v)} custom endpoint(s)"
+        elif k == "discord_bot_token":
+            resolved = config.get_discord_token()
+            val_str = mask_key(resolved) if resolved else "(not set)"
         else:
             val_str = str(v)
         table.add_row(k, val_str, type(v).__name__)

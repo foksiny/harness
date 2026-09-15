@@ -48,16 +48,19 @@ class RunCommandTool(Tool):
         start_time = time.time()
 
         try:
-            proc = subprocess.run(
-                cmd,
+            run_kwargs = dict(
                 shell=True,
                 cwd=work_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 timeout=t_limit,
-                executable="/bin/bash",
             )
+            # On Unix force bash so shell pipelines behave identically everywhere.
+            # On Windows, shell=True uses the default cmd.exe shell.
+            if os.name != "nt":
+                run_kwargs["executable"] = "/bin/bash"
+            proc = subprocess.run(cmd, **run_kwargs)
             elapsed = round(time.time() - start_time, 2)
             out = proc.stdout
             err = proc.stderr

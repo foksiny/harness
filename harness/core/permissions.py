@@ -3,6 +3,7 @@ Permissions and Security Governance for Harness.
 Controls tool execution rights across Secure, Default, and Full Access profiles.
 """
 from enum import Enum
+import os
 import re
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any
@@ -113,7 +114,7 @@ class PermissionManager:
         if action_type in ("write_file", "edit_file"):
             # Editing local workspace files is allowed in Default mode
             target_file = details.get("path", "")
-            if target_file.startswith("/") and not target_file.startswith(str(Path.cwd())):
+            if os.path.isabs(target_file) and not target_file.startswith(str(Path.cwd())):
                 return self._request_user_approval(f"Modifying file outside workspace: {target_file}", details)
             return True
 

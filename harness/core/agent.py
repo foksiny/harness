@@ -500,6 +500,9 @@ class HarnessAgent:
         self.is_running = True
         tools_executed_this_turn = 0
 
+        if user_prompt is not None and not user_prompt.strip():
+            user_prompt = None
+
         if user_prompt:
             self.ensure_session()
             clean_text, media_blocks, attach_warnings = parse_attachments(user_prompt)

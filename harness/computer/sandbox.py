@@ -271,9 +271,10 @@ def _execute_restricted(
         tmp.write(code)
     
     try:
-        # Create restricted environment
+        # Create restricted environment (platform-aware temp dir for HOME)
+        home_dir = os.path.expanduser("~")
         env = {
-            "HOME": "/tmp",
+            "HOME": home_dir,
             "PATH": os.environ.get("PATH", ""),
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -286,6 +287,8 @@ def _execute_restricted(
         }
         
         # Set resource limits in a wrapper script
+        # Escape backslashes so Windows paths survive inside the wrapper's string literals.
+        safe_tmp = tmp_path.replace("\\", "\\\\")
         if HAS_RESOURCE:
             wrapper_code = f'''
 import resource
@@ -317,13 +320,13 @@ except (ValueError, resource.error, AttributeError):
     pass
 
 # Execute the target script
-exec(compile(open("{tmp_path}").read(), "{tmp_path}", "exec"))
+exec(compile(open("{safe_tmp}").read(), "{safe_tmp}", "exec"))
 '''
         else:
             # On Windows, resource module is unavailable, skip limits
             wrapper_code = f'''
 import sys
-exec(compile(open("{tmp_path}").read(), "{tmp_path}", "exec"))
+exec(compile(open("{safe_tmp}").read(), "{safe_tmp}", "exec"))
 '''
         
         wrapper_path = tmp_path + ".wrapper"

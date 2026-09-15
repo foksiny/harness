@@ -5,12 +5,6 @@ theme galleries, and hotkey footers using Rich and active theme styling.
 """
 import os
 import time
-try:
-    import resource
-    HAS_RESOURCE = True
-except ImportError:
-    resource = None
-    HAS_RESOURCE = False
 from typing import Dict, Any, List, Optional
 from rich.console import Console
 from rich.panel import Panel
@@ -20,6 +14,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.live import Live
 from harness.themes import Theme, get_theme, THEMES, render_theme_preview
+from harness.sysinfo import get_ram_usage_mb
 
 class TerminalRenderer:
     """Renders rich UI elements with custom themes."""
@@ -54,20 +49,7 @@ class TerminalRenderer:
         self.console.print(f"[{self.theme.muted}]The Premier Agentic AI Engineering Harness v1.0.0[/{self.theme.muted}]\n")
 
     def _get_ram_usage_mb(self) -> float:
-        try:
-            with open("/proc/self/status", "r") as f:
-                for line in f:
-                    if "VmRSS:" in line:
-                        kb = int(line.split()[1])
-                        return round(kb / 1024, 1)
-        except Exception:
-            pass
-        if HAS_RESOURCE and resource is not None:
-            try:
-                return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
-            except Exception:
-                pass
-        return 0.0
+        return get_ram_usage_mb()
 
     def print_hud(self, mode: str, perm: str, provider: str, model: str, tokens: int, context_win: int, todos_summary: str = ""):
         """Display live header HUD with status indicators."""

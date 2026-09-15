@@ -82,6 +82,18 @@ class HarnessConfig:
     force_media_attach: bool = False # Force-attach images even when the model isn't flagged vision-capable
     vfb_provider: str = "" # Vision fallback provider; when set, degraded media get described via this provider
     vfb_model: str = ""    # Vision fallback model; empty => the provider's default model
+    discord_bot_token: str = ""   # Discord bot token (stored in the secure store; DISCORD_BOT_TOKEN env fallback)
+    discord_channel_ids: str = "" # Deprecated: use discord_blacklisted_channels / discord_whitelisted_channels
+    discord_guild_id: str = ""    # Guild ID to sync slash commands to instantly (optional; otherwise global)
+    discord_workspace: str = ""   # Working directory the Discord bot operates in (default: current directory)
+    discord_permission: str = "full"  # Permission profile for the bot agent (secure, default, full)
+    discord_auto_start: bool = False   # Start the Discord bot automatically when running interactive TUI
+    discord_channel_mode: str = "blacklist"  # "blacklist" or "whitelist" — how discord_blacklisted/whitelisted_channels is interpreted
+    discord_user_mode: str = "blacklist"     # "blacklist" or "whitelist" — how discord_blacklisted/whitelisted_users is interpreted
+    discord_blacklisted_channels: str = ""   # Comma-separated channel IDs blocked from the bot (when channel_mode=blacklist)
+    discord_whitelisted_channels: str = ""   # Comma-separated channel IDs the bot may operate in (when channel_mode=whitelist)
+    discord_blacklisted_users: str = ""      # Comma-separated user IDs blocked from the bot (when user_mode=blacklist)
+    discord_whitelisted_users: str = ""      # Comma-separated user IDs the bot may operate for (when user_mode=whitelist)
     api_keys: Dict[str, str] = field(default_factory=dict)
     base_urls: Dict[str, str] = field(default_factory=lambda: {
         "ollama": "http://localhost:11434",
@@ -125,6 +137,36 @@ class HarnessConfig:
         self.api_keys.pop(prov, None)
         return secure_store.remove_key(prov)
 
+    def get_discord_token(self) -> Optional[str]:
+        """Resolve the Discord bot token: secure store -> config field -> environment."""
+        # 1. Secure store (OS keychain or restricted file)
+        stored = secure_store.get_key("discord")
+        if stored:
+            return stored
+        # 2. Config in-memory override (set during this session)
+        if self.discord_bot_token:
+            return self.discord_bot_token
+        # 3. Environment variables
+        return os.environ.get("DISCORD_BOT_TOKEN") or os.environ.get("DISCORD_TOKEN")
+
+    def set_discord_token(self, token: str) -> None:
+        """Store the Discord bot token in the secure store and in-memory cache."""
+        clean = (token or "").strip()
+        self.discord_bot_token = clean
+        if clean:
+            secure_store.set_key("discord", clean)
+
+    def remove_discord_token(self) -> bool:
+        """Remove the Discord bot token from the secure store and in-memory cache."""
+        self.discord_bot_token = ""
+        return secure_store.remove_key("discord")
+
+    def set_discord_channel_ids(self, channel_ids: str) -> None:
+        """Store comma-separated allowed Discord channel IDs (normalized)."""
+        self.discord_channel_ids = ",".join(
+            c.strip() for c in (channel_ids or "").split(",") if c.strip()
+        )
+
     def list_keys_status(self) -> List[Dict[str, Any]]:
         """Return status and masked keys for all supported providers."""
         from harness.providers import PROVIDER_CONFIGS
@@ -167,6 +209,13 @@ class HarnessConfig:
         k = key.lower().strip()
         if not hasattr(self, k):
             return False
+
+        if k == "discord_bot_token":
+            self.set_discord_token(value)
+            return True
+        if k == "discord_channel_ids":
+            self.set_discord_channel_ids(value)
+            return True
 
         current_val = getattr(self, k)
         if isinstance(current_val, bool):
@@ -224,18 +273,30 @@ def load_config() -> HarnessConfig:
         for prov in list(config.api_keys.keys()):
             config.api_keys[prov] = secure_store.get_key(prov) or ""
 
+    # Migrate a plaintext discord_bot_token from config.json into secure store
+    if config.discord_bot_token:
+        stored = secure_store.get_key("discord")
+        if not stored:
+            secure_store.set_key("discord", config.discord_bot_token)
+        config.discord_bot_token = stored or config.discord_bot_token
+
     # Enforce restrictive file permissions on config files
     secure_store.ensure_file_permissions()
+
+    # Validate and clean up the key store (detect plaintext leaks, fix perms)
+    secure_store.validate_keys_store()
 
     return config
 
 def save_config(config: HarnessConfig, global_only: bool = True) -> None:
-    """Save configuration to disk. API keys are stored in secure store, not config.json."""
+    """Save configuration to disk. API keys and the Discord token are stored in the
+    secure store, never in config.json."""
     target_path = USER_CONFIG_PATH if global_only else WORKSPACE_CONFIG_PATH
     target_path.parent.mkdir(parents=True, exist_ok=True)
     data = config.to_dict()
-    # API keys live in secure store; strip from config.json
+    # Secrets live in secure store; strip from config.json
     data.pop("api_keys", None)
+    data.pop("discord_bot_token", None)
     with open(target_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     # Enforce restrictive permissions

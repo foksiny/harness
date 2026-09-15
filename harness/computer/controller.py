@@ -114,7 +114,12 @@ def _default_capture_backend(region: Any, monitor_index: int, out_dir: str) -> D
                 monitors = sct.monitors or []
                 if not monitors:
                     return default_result("capture", "no monitors detected by mss")
-                mon = monitors[monitor_index] if 0 <= monitor_index < len(monitors) else monitors[0]
+                # When monitor_index=0 (virtual screen), prefer monitor 1 on
+                # multi-monitor setups to avoid black frames on Wayland.
+                idx = monitor_index
+                if idx == 0 and len(monitors) > 1:
+                    idx = 1
+                mon = monitors[idx] if 0 <= idx < len(monitors) else monitors[0]
                 shot = sct.grab(mon)
                 width, height = shot.width, shot.height
                 try:

@@ -106,6 +106,11 @@ def handle_subcommands(args: list) -> bool:
         handle_update_command(renderer)
         return True
 
+    elif sub == "discord":
+        from harness.discord import run_discord_bot
+        token = args[1] if len(args) > 1 and not args[1].startswith("--") else None
+        return run_discord_bot(config, token=token)
+
     return False
 
 
@@ -166,6 +171,53 @@ def handle_update_command(renderer: TerminalRenderer) -> None:
     except Exception as ex:
         renderer.print_error(f"Update failed: {str(ex)}")
 
+def _maybe_start_discord_bot(config: HarnessConfig) -> None:
+    """Start the Discord bot in a background daemon thread if auto_start is enabled.
+
+    The thread shares the same in-memory config (with all API keys already
+    resolved) so it never needs to touch the OS keyring or re-read config.json.
+    Because it's a daemon thread it dies automatically when the CLI exits.
+    For a persistent bot, run ``harness discord`` directly.
+    """
+    if not config.discord_auto_start:
+        return
+    token = config.get_discord_token()
+    if not token:
+        return
+    try:
+        import discord as _discord  # noqa: F401
+    except ImportError:
+        return
+
+    # Eagerly resolve every known provider key into the in-memory dict so the
+    # background thread never touches the keyring (which can fail off the main
+    # thread on some platforms — especially macOS Keychain and Windows Credential
+    # Locker).
+    from harness.providers import PROVIDER_CONFIGS
+    for prov in PROVIDER_CONFIGS:
+        resolved = config.get_api_key(prov)
+        if resolved:
+            config.api_keys[prov] = resolved
+    # Also resolve the Discord token itself
+    if not config.api_keys.get("discord"):
+        config.api_keys["discord"] = token
+
+    import threading
+    import traceback
+
+    def _run():
+        from harness.discord.bot import HarnessDiscordBot
+        try:
+            bot = HarnessDiscordBot(config, token=token, quiet=True)
+            bot.run()
+        except KeyboardInterrupt:
+            pass
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+
+    t = threading.Thread(target=_run, daemon=True, name="harness-discord-bot")
+    t.start()
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="harness",
@@ -178,6 +230,7 @@ Subcommands:
   keys [list|set|remove]                Manage LLM provider API keys
   theme [list|preview]                  Browse or preview visual themes
   update                                Pull latest changes from upstream repository
+  discord [token]                       Launch the Discord bot (bound to your Harness config)
 
 Examples:
   harness                               # Launch interactive TUI
@@ -187,6 +240,8 @@ Examples:
   harness keys set openai               # Set API key securely
   harness theme preview dracula         # View visual theme preview card
   harness update                        # Update to latest version
+  harness keys set discord <token>      # Store your Discord bot token
+  harness discord                       # Start the Discord bot
   cat error.log | harness "Debug error" # Read piped stdin input
         """,
     )
@@ -204,8 +259,10 @@ Examples:
 
 def main():
     # Intercept subcommands first
-    if len(sys.argv) > 1 and sys.argv[1] in ("config", "keys", "setup", "theme", "update"):
-        handle_subcommands(sys.argv[1:])
+    if len(sys.argv) > 1 and sys.argv[1] in ("config", "keys", "setup", "theme", "update", "discord"):
+        result = handle_subcommands(sys.argv[1:])
+        if isinstance(result, int):  # e.g. `harness discord` returns a process exit code
+            sys.exit(result)
         return
 
     parser = build_parser()
@@ -284,6 +341,7 @@ def main():
             sys.exit(1)
     else:
         # Launch Interactive TUI
+        _maybe_start_discord_bot(config)
         run_interactive(agent)
 
 if __name__ == "__main__":

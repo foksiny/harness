@@ -155,6 +155,13 @@ class OpenAICompatibleProvider(BaseProvider):
         think_parser = ThinkTagParser()
 
         endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
+
+        if not self.api_key and self.name != "ollama":
+            raise RuntimeError(
+                f"No API key for {self.display_name}. "
+                f"Run:  harness keys set {self.name} <your-api-key>"
+            )
+
         headers = {
             "User-Agent": self.user_agent,
             "Content-Type": "application/json",

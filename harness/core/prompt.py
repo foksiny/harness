@@ -4,6 +4,7 @@ Generates state-of-the-art agentic system prompts customized to active Mode,
 Permission Profile, Available Tools, Skills, and Workspace Context.
 """
 import os
+import platform
 import time
 import subprocess
 from pathlib import Path
@@ -163,7 +164,7 @@ class SystemPromptBuilder:
         sections.append(f"\n## WORKSPACE CONTEXT:")
         sections.append(f"- Current Working Directory: `{cwd}`")
         sections.append(f"- System Time: {now_str}")
-        sections.append(f"- OS / Platform: Linux")
+        sections.append(f"- OS / Platform: {platform.system()} {platform.machine()}")
         sections.append(f"- Version Control: {git_info}")
 
         # 4. Project Rules

@@ -11,7 +11,11 @@ pip install -r requirements.txt
 python3 -m unittest discover -s tests -v
 ```
 
-All 221 tests must pass before opening a PR.
+All tests must pass before opening a PR. Run:
+```bash
+python3 -m pytest tests/ -q
+```
+The total test count is maintained in `pyproject.toml` under `[tool.pytest.ini_options]`.
 
 ## Development Workflow
 

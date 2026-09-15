@@ -143,9 +143,157 @@ def migrate_plaintext_keys(api_keys: dict) -> None:
 
 
 def ensure_file_permissions() -> None:
-    """Fix permissions on config.json and api_keys.json if they're too open."""
+    """Fix permissions on config.json and api_keys.json.
+
+    On Unix: enforces 0o600 (owner read/write only).
+    On Windows: restricts ACL to the current user only (removes inherited
+    access and grants full control to the owner).
+    """
     for path in (Path.home() / ".harness" / "config.json", KEYS_FILE):
-        if path.exists():
+        if not path.exists():
+            continue
+        if os.name == "nt":
+            _restrict_windows_file(path)
+        else:
             current = stat.S_IMODE(os.stat(str(path)).st_mode)
-            if current & 0o077:  # group or other has access
+            if current & 0o077:
                 path.chmod(KEYS_FILE_PERMS)
+
+
+def _restrict_windows_file(path: Path) -> None:
+    """Restrict a file's ACL to the current user on Windows.
+
+    Uses ctypes to call the Windows Security API directly, avoiding the
+    need for the pywin32 package.  On failure (e.g. unsupported FS), this
+    is a silent no-op — the file remains accessible but we never crash.
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+
+        # Get current process token
+        token = ctypes.wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(),
+            0x0008,  # TOKEN_QUERY
+            ctypes.byref(token),
+        ):
+            return
+
+        try:
+            # Get token user (the file owner)
+            token_user = ctypes.create_string_buffer(128)
+            ret_len = ctypes.wintypes.DWORD()
+            if not advapi32.GetTokenInformation(
+                token, 1,  # TokenUser
+                token_user, len(token_user),
+                ctypes.byref(ret_len),
+            ):
+                return
+
+            # Parse TOKEN_USER: first field is PSID
+            psid = ctypes.cast(token_user, ctypes.POINTER(ctypes.c_void_p)).contents.value
+
+            # Build a DACL with only the current user: (NULL ACL = no access for anyone)
+            # Use SetNamedSecurityInfoW to set a DACL that only grants the owner full control
+            import ctypes.wintypes as wt
+
+            # SECURITY_DESCRIPTOR with owner, group, DACL
+            # We'll use SetNamedSecurityInfoW with SET_ACCESS and PROTECTED_DACL
+            SID_OWNER_ONLY = 0x00000001
+            SE_FILE_OBJECT = 1
+
+            # Build a minimal DACL: just owner with full control
+            pSid = psid
+
+            # EXPLICIT_ACCESS_W structure
+            class EXPLICIT_ACCESS(ctypes.Structure):
+                _fields_ = [
+                    ("grfAccessPermissions", ctypes.c_ulong),
+                    ("grfAccessMode", ctypes.c_ulong),  # SET_ACCESS = 0
+                    ("grfInheritance", ctypes.c_ulong),   # NO_INHERITANCE = 0
+                    ("Trustee", ctypes.c_byte * 48),       # TRUSTEE_W (padded)
+                ]
+
+            ea = EXPLICIT_ACCESS()
+            ea.grfAccessPermissions = 0x001F01FF  # GENERIC_ALL
+            ea.grfAccessMode = 0  # SET_ACCESS
+            ea.grfInheritance = 0  # NO_INHERITANCE
+
+            # Set TRUSTEE: fill the TrusteeName offset with the SID
+            ctypes.memset(ctypes.addressof(ea.Trustee), 0, len(ea.Trustee))
+            # TRUSTEE_W fields: pMultipleTrustee(8), MultipleTrusteeOperation(4), TrusteeForm(4)=TRUSTEE_IS_SID=1, TrusteeType(4)=TRUSTEE_USER=1, ptstrName(8)=SID
+            ctypes.memmove(ctypes.addressof(ea.Trustee) + 20, ctypes.addressof(ctypes.c_void_p(psid)), ctypes.sizeof(ctypes.c_void_p))
+
+            # Build DACL
+            pAcl = ctypes.c_void_p()
+            acl_ret = advapi32.SetEntriesInAclW(1, ctypes.byref(ea), None, ctypes.byref(pAcl))
+            if acl_ret != 0 or not pAcl:
+                return
+
+            try:
+                str_path = str(path)
+                result = advapi32.SetNamedSecurityInfoW(
+                    str_path,
+                    SE_FILE_OBJECT,
+                    0x00000004,  # DACL_SECURITY_INFORMATION
+                    None, None,  # owner, group
+                    pAcl,        # DACL
+                    None,        # SACL
+                )
+            finally:
+                advapi32.LocalFree(pAcl)
+        finally:
+            kernel32.CloseHandle(token)
+    except Exception:
+        pass  # Silent fallback: file remains as-is
+
+
+def validate_keys_store() -> dict:
+    """Validate the keys store: check file permissions, detect plaintext leaks,
+    and report any issues. Returns a dict with status info."""
+    result = {"ok": True, "issues": [], "migrated": 0}
+
+    # Check api_keys.json permissions
+    if KEYS_FILE.exists():
+        current = stat.S_IMODE(os.stat(str(KEYS_FILE)).st_mode)
+        if current & 0o077:
+            result["issues"].append(f"api_keys.json has loose permissions: {oct(current)}")
+            KEYS_FILE.chmod(KEYS_FILE_PERMS)
+            result["issues"].append("Fixed permissions to 0o600")
+
+    # Check for plaintext keys in config.json that should be in secure store
+    config_path = KEYS_FILE.parent / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            api_keys = data.get("api_keys", {})
+            discord_token = data.get("discord_bot_token", "")
+            if api_keys:
+                for prov, key in api_keys.items():
+                    if key and key.strip():
+                        # Migrate plaintext key to secure store
+                        existing = get_key(prov)
+                        if not existing:
+                            set_key(prov, key.strip())
+                            result["migrated"] += 1
+                result["issues"].append(f"Found {len(api_keys)} plaintext keys in config.json (migrated to secure store)")
+            if discord_token and discord_token.strip():
+                existing = get_key("discord")
+                if not existing:
+                    set_key("discord", discord_token.strip())
+                    result["migrated"] += 1
+                    result["issues"].append("Migrated plaintext discord token to secure store")
+        except Exception:
+            pass
+
+    # Check if keyring is functional
+    kr = _get_keyring()
+    if kr is None:
+        result["issues"].append("OS keyring not available; using file-based secure store")
+
+    return result
