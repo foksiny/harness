@@ -8,5 +8,9 @@ build/
 env/
 .harness/sessions/
 .harness/*.db
+# Runtime agent state — auto-learned lessons (with hit counters/timestamps)
+# and skills auto-promoted from them. Per-user/per-machine, not source code.
+.harness/memories.json
+.harness/skills/
 bin/
 *.deb
