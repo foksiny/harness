@@ -43,8 +43,9 @@ def no_echo_stdin(fd: Optional[int] = None) -> Iterator[None]:
     if os.name == "nt":
         # Windows: use msvcrt to suppress echo via Console API
         try:
-            import msvcrt
+            import msvcrt  # noqa: F401
             import ctypes
+            import ctypes.wintypes  # noqa: F401 — submodule, not exposed by `import ctypes`
             kernel32 = ctypes.windll.kernel32
             STD_INPUT_HANDLE = -10
             handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)

@@ -186,23 +186,161 @@ class TestThinkingAndDiscovery(unittest.TestCase):
         ]
         for c in chunks:
             renderer.render_agent_event(AgentEvent('text_delta', c))
-        full = ''.join(chunks)
-        self.assertEqual(renderer._md_buffer, full)
+
+        # Append-only streaming: every completed block is printed as it
+        # arrives, so only the trailing (unfinished) block may remain buffered.
+        self.assertEqual(renderer._md_buffer, 'Second paragraph with **bold** text.\n')
 
         renderer._finish_markdown()
         self.assertEqual(renderer._md_buffer, '')
-        self.assertIsNone(renderer._md_live)
 
         renderer._finish_markdown()
         self.assertEqual(renderer._md_buffer, '')
 
-    def test_markdown_preview_is_bounded(self):
+    def test_markdown_stream_is_append_only_no_cursor_repositioning(self):
+        """Regression test for the Windows 'Oi! 👋' repeated-greeting bug.
+
+        The old implementation repainted a rich.live.Live region every delta;
+        on Windows ConPTY/conhost the immediate-wrap quirk made every repaint
+        leak the previous frame's first line, printing the greeting once per
+        refresh down the left margin. The streamed output must therefore be
+        append-only: no cursor-up / erase-line / carriage-return repositioning
+        and no hidden-cursor escape sequences.
+        """
+        import io
+        from rich.console import Console
+
         renderer = TerminalRenderer('cyberpunk')
-        line = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n'
-        renderer._md_buffer = line * 100
-        preview = renderer._md_preview()
-        self.assertLessEqual(len(preview), len(line) * 40)
-        self.assertTrue(preview.startswith('Lorem ipsum'))
+        renderer.console = Console(
+            file=io.StringIO(), force_terminal=True, width=80
+        )
+
+        chunks = [
+            'Oi! 👋\n',
+            '\n',
+            'Sou o Harness, seu assistente de engenharia.\n',
+            '\n',
+            '- Código – escrever, debugar\n',
+            '- DevOps\n',
+        ]
+        for c in chunks:
+            renderer.render_agent_event(AgentEvent('text_delta', c))
+        renderer._finish_markdown()
+
+        out = renderer.console.file.getvalue()
+        self.assertIn('Oi!', out)
+        self.assertNotIn('\x1b[1A', out)      # cursor up (Live repaint climb)
+        self.assertNotIn('\x1b[2K', out)      # erase line
+        self.assertNotIn('\x1b[?25l', out)    # hide cursor
+        self.assertNotIn('\r', out.replace('\r\n', '\n'))  # bare carriage return
+        # The greeting must appear exactly once.
+        self.assertEqual(out.count('Oi!'), 1)
+
+    def test_markdown_stream_never_opens_a_live_region(self):
+        """No Live region may be created while streaming (Windows-safe by design)."""
+        renderer = TerminalRenderer('cyberpunk')
+        self.assertFalse(hasattr(renderer, '_md_live'))
+        for c in ('Oi! 👋\n', '\n', 'Sou o Harness.\n'):
+            renderer.render_agent_event(AgentEvent('text_delta', c))
+        renderer._finish_markdown()
+        self.assertFalse(hasattr(renderer, '_md_live'))
+
+    def test_markdown_stream_holds_back_open_code_fence(self):
+        """Text inside an unterminated code fence must stay buffered.
+
+        A flush at a blank line inside an open fence would split the fence
+        into two renders and print garbled code blocks.
+        """
+        renderer = TerminalRenderer('cyberpunk')
+        chunks = [
+            'Intro paragraph.\n',
+            '\n',
+            '```python\n',
+            'x = 1\n',
+            '\n',       # blank line INSIDE the fence — must not trigger a flush
+            'y = 2\n',
+        ]
+        for c in chunks:
+            renderer.render_agent_event(AgentEvent('text_delta', c))
+        self.assertEqual(renderer._md_buffer, '```python\nx = 1\n\ny = 2\n')
+
+        # Closing the fence and adding a blank line flushes the whole fence.
+        renderer.render_agent_event(AgentEvent('text_delta', '```\n\n'))
+        self.assertEqual(renderer._md_buffer, '')
+        renderer._finish_markdown()
+        self.assertEqual(renderer._md_buffer, '')
+
+    def test_md_completed_end_boundary_cases(self):
+        end = TerminalRenderer._md_completed_end
+        # Nothing complete yet.
+        self.assertEqual(end('Oi! partial greet'), 0)
+        # Blank line ends the first block.
+        self.assertEqual(end('P1\n\nP2 partial'), len('P1\n\n'))
+        # Blank lines inside a closed fence only bound AFTER the fence.
+        buf = 'Intro\n\n```python\nx = 1\n\ny = 2\n```\n\nTail'
+        self.assertEqual(end(buf), len('Intro\n\n```python\nx = 1\n\ny = 2\n```\n\n'))
+        # Unterminated fence: nothing after its opening may be flushed.
+        self.assertEqual(end('Intro\n\n```python\nx = 1\n\ny = 2'), len('Intro\n\n'))
+        # Tilde fences too.
+        buf5 = 'P\n\n~~~\ncode\n~~~\n\nX'
+        self.assertEqual(end(buf5), len('P\n\n~~~\ncode\n~~~\n\n'))
+
+    def test_streamed_markdown_matches_whole_document_render(self):
+        """Streaming must be visually identical to rendering the full markdown
+        at once, no matter where the SSE deltas happen to split the text.
+
+        This is the core quality contract of the append-only streamer that
+        replaced the Windows-buggy rich.live.Live repaint.
+        """
+        import io
+        import itertools
+        from rich.console import Console
+        from rich.markdown import Markdown
+
+        blocks = {
+            'para': 'Oi! Sou o Harness, seu assistente.',
+            'head': '## A Heading',
+            'list': '- Código\n- Arquitetura\n- DevOps',
+            'olist': '1. Um\n2. Dois',
+            'quote': '> Nota do agente.',
+            'fence': '```python\nx = 1\n```',
+            'table': '| A | B |\n|---|---|\n| 1 | 2 |',
+            'hr': '---',
+        }
+
+        def whole(md):
+            buf = io.StringIO()
+            c = Console(file=buf, force_terminal=True, width=60)
+            c.print(Markdown(md, code_theme='monokai'))
+            return buf.getvalue()
+
+        def streamed(md, cuts):
+            r = TerminalRenderer('cyberpunk')
+            r.console = Console(file=io.StringIO(), force_terminal=True, width=60)
+            prev = 0
+            for cut in list(cuts) + [len(md)]:
+                if cut > prev:
+                    r.render_agent_event(AgentEvent('text_delta', md[prev:cut]))
+                    prev = cut
+            r._finish_markdown()
+            return r.console.file.getvalue()
+
+        combos = list(itertools.permutations(blocks.keys(), 2)) + [
+            ('para', 'list', 'para'),
+            ('para', 'para', 'para'),
+            ('para', 'fence', 'para'),
+            ('hr', 'para', 'hr'),
+        ]
+        for combo in combos:
+            md = '\n\n'.join(blocks[k] for k in combo)
+            expected = whole(md)
+            # Split the stream at assorted offsets, including mid-word and
+            # mid-fence positions, to simulate arbitrary SSE chunking.
+            for cuts in (range(1, len(md), 5), range(2, len(md), 11), [len(md) // 2]):
+                self.assertEqual(
+                    streamed(md, cuts), expected,
+                    f'stream != whole for {combo} with cuts {cuts}',
+                )
 
 if __name__ == '__main__':
     unittest.main()

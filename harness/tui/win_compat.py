@@ -21,6 +21,10 @@ def enable_windows_vt_processing():
 
     try:
         import ctypes
+        import ctypes.wintypes  # noqa: F401 — required by the ctypes calls below;
+        # `import ctypes` alone does not expose `ctypes.wintypes` (it is a
+        # submodule), so without this import GetConsoleMode raises
+        # AttributeError and VT processing is silently never enabled.
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
 
         STD_OUTPUT_HANDLE = -11

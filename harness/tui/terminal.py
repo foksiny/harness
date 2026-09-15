@@ -4,6 +4,7 @@ Renders header HUDs, markdown streams, collapsible thinking, syntax diffs,
 theme galleries, and hotkey footers using Rich and active theme styling.
 """
 import os
+import re
 import time
 from typing import Dict, Any, List, Optional
 from rich.console import Console
@@ -12,7 +13,6 @@ from rich.text import Text
 from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.table import Table
-from rich.live import Live
 from harness.themes import Theme, get_theme, THEMES, render_theme_preview
 from harness.sysinfo import get_ram_usage_mb
 
@@ -30,7 +30,8 @@ class TerminalRenderer:
         self._thinking_start_time: float = 0.0
         self._thinking_line_chars: int = 0
         self._md_buffer: str = ""
-        self._md_live: Optional[Live] = None
+        self._md_stream_started: bool = False
+        self._md_last_blank: bool = False
         self._subagent_open: Optional[str] = None
 
     def set_theme(self, theme_name: str):
@@ -122,7 +123,7 @@ class TerminalRenderer:
         self._finish_thinking()
 
     def finish_markdown(self):
-        """Public method to close Live markdown display on turn complete or interrupt."""
+        """Flush the trailing partial markdown block on turn end or interrupt."""
         self._finish_markdown()
 
     def _finish_thinking(self):
@@ -140,30 +141,115 @@ class TerminalRenderer:
         self._is_thinking_visible = False
         self._current_thinking = ""
 
-    def _finish_markdown(self):
-        """Flush the streamed markdown segment once and reset the buffer."""
-        if self._md_live is not None:
-            self._md_live.stop()
-            self._md_live = None
-        if self._md_buffer:
-            self.console.print(Markdown(self._md_buffer, code_theme=self.theme.code_theme))
-            self._md_buffer = ""
+    def _md_print_block(self, chunk: str):
+        """Print one markdown block with whole-document spacing semantics.
 
-    def _md_preview(self) -> str:
-        """Return only the tail of the buffer so the Live region stays bounded.
-
-        Re-rendering the whole (ever-growing) document in a Live region causes
-        the terminal to scroll and leak duplicate frames into scrollback.
+        Rich renders lists / quotes / tables with their own leading blank line
+        and a horizontal rule with its own trailing blank line; other blocks
+        need the caller to supply the separator. This emits exactly one blank
+        line between adjacent blocks — byte-identical to rendering the whole
+        document at once.
         """
-        try:
-            height = self.console.height or 24
-        except Exception:
-            height = 24
-        limit = max(3, min(height - 2, 40))
-        lines = self._md_buffer.splitlines(keepends=True)
-        if len(lines) <= limit:
-            return self._md_buffer
-        return "".join(lines[-limit:])
+        kind = self._md_block_kind(chunk)
+        last_line = next(
+            (ln for ln in reversed(chunk.splitlines()) if ln.strip()), ""
+        ).lstrip()
+        trailing_blank = bool(re.fullmatch(r"(-{3,}|\*{3,}|_{3,})", last_line))
+        if (
+            self._md_stream_started
+            and kind not in ("list", "quote", "table")
+            and not self._md_last_blank
+        ):
+            self.console.print()
+        self.console.print(Markdown(chunk, code_theme=self.theme.code_theme), end="")
+        self._md_stream_started = True
+        self._md_last_blank = trailing_blank
+
+    def _finish_markdown(self):
+        """Flush the trailing (not yet printed) markdown segment and reset the buffer."""
+        if self._md_buffer:
+            self._md_print_block(self._md_buffer)
+            self._md_buffer = ""
+        self._md_stream_started = False
+        self._md_last_blank = False
+
+    @staticmethod
+    def _md_completed_end(buffer: str) -> int:
+        """Return the length of the longest prefix of ``buffer`` that is safe to
+        print right now, i.e. ends at a markdown block boundary.
+
+        A boundary is the newline ending a blank line *outside* any fenced code
+        block. Text inside an open fence is held back: a) a fence with a trailing
+        blank line would otherwise be printed in two pieces that read as two
+        separate blocks; b) more importantly, the moment we print something we
+        can never take it back — so we only print what is guaranteed final.
+        """
+        in_fence = False
+        fence_marker = ""
+        pos = 0
+        last_boundary = 0
+        for line in buffer.splitlines(keepends=True):
+            stripped = line.strip()
+            if not in_fence and (stripped.startswith("```") or stripped.startswith("~~~")):
+                in_fence = True
+                fence_marker = stripped[:3]
+            elif in_fence and stripped.startswith(fence_marker):
+                in_fence = False
+            pos += len(line)
+            if not in_fence and not stripped:
+                last_boundary = pos
+        return last_boundary
+
+    @staticmethod
+    def _md_block_kind(chunk: str) -> str:
+        """Classify the first markdown block of ``chunk``.
+
+        Rich renders lists / quotes / tables with a self-supplied leading blank
+        line, paragraphs / headings / fences without one, and a horizontal rule
+        with a self-supplied *trailing* blank line. The streamer must know the
+        kind to emit exactly one blank line between adjacent blocks, matching a
+        whole-document render.
+        """
+        first = next((ln for ln in chunk.splitlines() if ln.strip()), "")
+        s = first.lstrip()
+        if s.startswith(("```", "~~~")):
+            return "fence"
+        if re.match(r"^#{1,6}\s", s):
+            return "heading"
+        if re.match(r"^[-*+]\s", s) or (s and s[0].isdigit() and re.match(r"^\d+[.)]\s", s)):
+            return "list"
+        if s.startswith(">"):
+            return "quote"
+        if s.startswith("|") and "<" not in s.split("|")[0]:
+            return "table"
+        if re.fullmatch(r"(-{3,}|\*{3,}|_{3,})", s):
+            return "hr"
+        return "paragraph"
+
+    def _md_flush_completed(self):
+        """Append-only stream: print every completed markdown block immediately.
+
+        This replaces the previous ``rich.live.Live`` repaint. Live repaints
+        assume the cursor is still sitting on the frame's last row and climb
+        back with ``\\r`` + erase-line + cursor-up pairs. Windows ConPTY and
+        legacy consoles wrap the cursor immediately when the final column is
+        written (POSIX terminals defer that wrap), so every repaint
+        under-climbs by one row and permanently leaks the previous frame's
+        first line — on Windows the streamed greeting appeared once per
+        refresh, stacked down the left margin. An append-only stream performs
+        no cursor repositioning at all, so it cannot leak frames on any
+        terminal.
+        """
+        while True:
+            completed = self._md_completed_end(self._md_buffer)
+            if completed <= 0:
+                return
+            chunk, self._md_buffer = (
+                self._md_buffer[:completed],
+                self._md_buffer[completed:],
+            )
+            self._md_print_block(chunk)
+            self._md_stream_started = True
 
     def _sub_id(self, agent_id: str) -> str:
         return f"[bold {self.theme.secondary}]{agent_id}[/bold {self.theme.secondary}]"
@@ -334,18 +420,9 @@ class TerminalRenderer:
         elif etype == "text_delta":
             self._finish_thinking()
             self._md_buffer += str(data)
-            preview = Markdown(self._md_preview(), code_theme=self.theme.code_theme)
-            if self._md_live is None:
-                self._md_live = Live(
-                    preview,
-                    console=self.console,
-                    refresh_per_second=15,
-                    vertical_overflow="ellipsis",
-                    transient=True,
-                )
-                self._md_live.start()
-            else:
-                self._md_live.update(preview)
+            # Append-only streaming: print each completed markdown block once.
+            # No Live repaint / cursor repositioning — see _md_flush_completed.
+            self._md_flush_completed()
 
         elif etype == "tool_call_start":
             self._finish_markdown()
