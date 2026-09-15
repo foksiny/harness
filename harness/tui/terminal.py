@@ -22,29 +22,29 @@ from harness.sysinfo import get_ram_usage_mb
 # ── Fun animation messages shown while the model is working ──────────────────
 
 _FUN_MESSAGES = [
-    ("jumping over the lazy fox... 🦊", "🐰"),
-    ("generating fancy confusing code... 💻", "🤔"),
-    ("thinking about how to \"fix\" this code... 🔧", "💭"),
-    ("getting frustrated on my own errors while doing more... 😅", "🐛"),
-    ("trying to not make slop... 🍦", "✨"),
-    ("testing things as i ignore other errors... 🧪", "🙈"),
-    ("idk what to say anymore... 🤷", "😶"),
-    ("searching \"how to be happy\"... 🔍", "😢"),
-    ("writing cool emoticons... 😎", "🖌️"),
-    ("adding unecessary emojis 🙂... 🎉", "🙃"),
-    ("making a cool 100% non-sloppy design... 🎨", "💅"),
-    ("reading those juicy files... 📚", "🤓"),
-    ("organizing the code so i don't get yelled at... 📁", "🫣"),
-    ("uwfhuiuwhfh... 😂🎉", "🫠"),
-    ("pretending i know what i'm doing... 🎭", "🤡"),
-    ("refactoring spaghetti into lasagna... 🍝", "👨‍🍳"),
-    ("consulting the ancient stack overflow scrolls... 📜", "🧙"),
-    ("debating whether it's a feature or a bug... ⚖️", "🐛"),
-    ("writing comments so future me doesn't cry... 😭", "📝"),
-    ("turn coffee into code... ☕➡️💻", "🤖"),
-    ("summoning the rubber duck debugger... 🦆", "🔮"),
-    ("avoiding eye contact with the failing test... 👀", "🏃"),
-    ("hoping this compiles on the first try... 🤞", "🎲"),
+    ("jumping over the lazy fox... (ﾉ◕ヮ◕)ﾉ*:・ﾟ", "fox"),
+    ("generating fancy confusing code... ╰(°▽°)╯", "code"),
+    ("thinking about how to \"fix\" this code... (・_・;)", "hmm"),
+    ("getting frustrated on my own errors while doing more... (ᗒᗣᗕ)՞", "ugh"),
+    ("trying to not make slop... (￢_￢)", "nope"),
+    ("testing things as i ignore other errors... ¯\\_(ツ)_/¯", "meh"),
+    ("idk what to say anymore... (┐「ε:)", "bruh"),
+    ("searching \"how to be happy\"... ╮(╯_╰)╭", "sad"),
+    ("writing cool emoticons... (☞ﾟヮﾟ)☞", "cool"),
+    ("adding unecessary emojis... ( ͡° ͜ʖ ͡°)", "heh"),
+    ("making a cool 100% non-sloppy design... ╰(*°▽°*)╯", "nice"),
+    ("reading those juicy files... ( •̀ω•́ )σ", "read"),
+    ("organizing the code so i don't get yelled at... (／ω＼)", "shy"),
+    ("uwfhuiuwhfh... ╰(≥ω≤)╯", "bruh"),
+    ("pretending i know what i'm doing... (─‿─)", "yep"),
+    ("refactoring spaghetti into lasagna... (￣﹏￣)", "chef"),
+    ("consulting the ancient stack overflow scrolls... (◕‿◕✿)", "wise"),
+    ("debating whether it's a feature or a bug... (　-_?)", "hmm"),
+    ("writing comments so future me doesn't cry... (ಥ﹏ಥ)", "cry"),
+    ("turn coffee into code... ٩(◕‿◕｡)۶", "buzz"),
+    ("summoning the rubber duck debugger... (｀・ω・´)", "duck"),
+    ("avoiding eye contact with the failing test... (\\._.\\)", "nope"),
+    ("hoping this compiles on the first try... ┬┴┬┴┤(･_├┬┴┬┴", "nervous"),
 ]
 
 
@@ -80,10 +80,10 @@ class _FunAnimation:
             self._show_random_message()
 
     def _show_random_message(self):
-        msg, emoji = random.choice(_FUN_MESSAGES)
+        msg, _tag = random.choice(_FUN_MESSAGES)
         # Avoid repeating the same message
         while msg == self._last_msg and len(_FUN_MESSAGES) > 1:
-            msg, emoji = random.choice(_FUN_MESSAGES)
+            msg, _tag = random.choice(_FUN_MESSAGES)
         self._last_msg = msg
 
         # Pick a random animation frame
@@ -92,7 +92,7 @@ class _FunAnimation:
 
         try:
             self._console.print(
-                f"  [{self.theme_color}]{frame} {emoji} {msg}[/{self.theme_color}]",
+                f"  [{self.theme_color}]{frame} {msg}[/{self.theme_color}]",
                 highlight=False,
             )
         except Exception:
