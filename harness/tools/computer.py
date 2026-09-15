@@ -245,7 +245,10 @@ class ComputerControlTool(Tool):
         "(list|focus|active), clipboard {op(read|write),text}, "
         "sleep {ms}. All actions run in order; the batch stops on the first "
         "failure and returns per-action results so the model can see exactly "
-        "which step was rejected. Requires approval under DEFAULT/SECURE modes."
+        "which step was rejected. After execution, a screenshot is automatically "
+        "taken and included in the result so you can verify what happened. "
+        "Click actions show a red dot indicator at the click position. "
+        "Requires approval under DEFAULT/SECURE modes."
     )
     parameters = {
         "type": "object",
@@ -295,7 +298,51 @@ class ComputerControlTool(Tool):
                                  "error": "not approved (denied by permission policy)"}
                                 for a in actions]})
 
-        return _pp(self.controller.execute_batch(actions))
+        results = self.controller.execute_batch(actions)
+
+        # Show a visual click indicator (red dot flash) for click actions
+        for action in actions:
+            if action.get("action") == "click" and action.get("x") is not None:
+                self._flash_click_indicator(action["x"], action.get("y", 0))
+
+        # Auto-screenshot after input so the model can see the result
+        screenshot_path = None
+        try:
+            cap = self.controller.capture()
+            if cap.get("ok"):
+                screenshot_path = cap.get("image_path") or cap.get("path")
+        except Exception:
+            pass
+
+        output = {"ok": all(r.get("ok", False) for r in results),
+                  "actions": results,
+                  "action_count": len(results)}
+        if screenshot_path:
+            output["screenshot"] = screenshot_path
+        return _pp(output)
+
+    def _flash_click_indicator(self, x: int, y: int) -> None:
+        """Briefly draw a red dot at the click position for visual feedback."""
+        try:
+            from PIL import Image, ImageDraw
+            import time, os
+            indicator_path = os.path.join(
+                os.path.expanduser("~/.harness/screenshots"),
+                f"click-{int(time.time()*1000)}.png"
+            )
+            # Draw on the latest screenshot if available, otherwise capture fresh
+            src = self.controller.latest_capture()
+            if src and os.path.exists(src):
+                img = Image.open(src).copy()
+            else:
+                return
+            draw = ImageDraw.Draw(img)
+            r = 12
+            draw.ellipse([x - r, y - r, x + r, y + r], fill="red", outline="white", width=2)
+            img.save(indicator_path)
+            self.controller._latest_capture_path = indicator_path
+        except Exception:
+            pass
 
 
 class ClipboardTool(Tool):
