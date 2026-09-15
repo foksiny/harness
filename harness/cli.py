@@ -341,9 +341,9 @@ def main():
         return describe_media_blocks(provider, vfb_model, media_blocks,
                                     question=question, system_prompt=system_prompt)
 
-    def _make_browser_controller():
+    def _make_browser_controller(**kwargs):
         from harness.browser.controller import BrowserController
-        return BrowserController()
+        return BrowserController(**kwargs)
 
     agent = HarnessAgent(
         config=config,
