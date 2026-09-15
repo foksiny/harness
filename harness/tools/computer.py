@@ -300,11 +300,6 @@ class ComputerControlTool(Tool):
 
         results = self.controller.execute_batch(actions)
 
-        # Show a visual click indicator (red dot flash) for click actions
-        for action in actions:
-            if action.get("action") == "click" and action.get("x") is not None:
-                self._flash_click_indicator(action["x"], action.get("y", 0))
-
         # Auto-screenshot after input so the model can see the result
         screenshot_path = None
         try:
@@ -314,6 +309,12 @@ class ComputerControlTool(Tool):
         except Exception:
             pass
 
+        # Draw red dot indicators on the post-action screenshot for click actions
+        click_positions = [(a["x"], a.get("y", 0)) for a in actions
+                           if a.get("action") == "click" and a.get("x") is not None]
+        if click_positions and screenshot_path:
+            self._draw_click_indicators(screenshot_path, click_positions)
+
         output = {"ok": all(r.get("ok", False) for r in results),
                   "actions": results,
                   "action_count": len(results)}
@@ -321,26 +322,16 @@ class ComputerControlTool(Tool):
             output["screenshot"] = screenshot_path
         return _pp(output)
 
-    def _flash_click_indicator(self, x: int, y: int) -> None:
-        """Briefly draw a red dot at the click position for visual feedback."""
+    def _draw_click_indicators(self, path: str, positions: list) -> None:
+        """Draw red dots at click positions on the screenshot image."""
         try:
             from PIL import Image, ImageDraw
-            import time, os
-            indicator_path = os.path.join(
-                os.path.expanduser("~/.harness/screenshots"),
-                f"click-{int(time.time()*1000)}.png"
-            )
-            # Draw on the latest screenshot if available, otherwise capture fresh
-            src = self.controller.latest_capture()
-            if src and os.path.exists(src):
-                img = Image.open(src).copy()
-            else:
-                return
+            img = Image.open(path)
             draw = ImageDraw.Draw(img)
-            r = 12
-            draw.ellipse([x - r, y - r, x + r, y + r], fill="red", outline="white", width=2)
-            img.save(indicator_path)
-            self.controller._latest_capture_path = indicator_path
+            for x, y in positions:
+                r = 12
+                draw.ellipse([x - r, y - r, x + r, y + r], fill="red", outline="white", width=2)
+            img.save(path)
         except Exception:
             pass
 
