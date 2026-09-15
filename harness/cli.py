@@ -322,30 +322,9 @@ def main():
             print(f"Error: Session '{args.resume}' not found.", file=sys.stderr)
             sys.exit(1)
 
-    # Wire up computer-use tools (screen_capture, screen_analyze, computer_control, etc.)
-    def _make_computer_controller():
-        from harness.computer.controller import ComputerController
-        return ComputerController()
-
-    def _make_vision_describe(media_blocks, question=None, system_prompt=None):
-        from harness.vision.describe import describe_media_blocks
-        from harness.providers import get_provider
-        vfb_prov_id = config.vfb_provider.strip()
-        if not vfb_prov_id:
-            return ("", "no vision fallback provider configured (set vfb_provider in config)")
-        try:
-            provider = get_provider(vfb_prov_id, config)
-        except Exception as exc:
-            return ("", f"could not init vision fallback provider '{vfb_prov_id}': {exc}")
-        vfb_model = config.vfb_model.strip() or provider.default_model
-        return describe_media_blocks(provider, vfb_model, media_blocks,
-                                    question=question, system_prompt=system_prompt)
-
     agent = HarnessAgent(
         config=config,
         session=session,
-        computer_controller_factory=_make_computer_controller,
-        vision_describe=_make_vision_describe,
     )
 
     if full_prompt:

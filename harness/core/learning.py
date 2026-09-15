@@ -204,8 +204,14 @@ class LearningManager:
             self.hit(lesson.id)
         return "\n".join(lines)
 
-    def promote(self, lesson_id: str, name: Optional[str] = None) -> bool:
-        """Promote a lesson into a real workspace skill (SKILL.md + reload).
+    def promote(self, lesson_id: str, name: Optional[str] = None, scope: str = "workspace") -> bool:
+        """Promote a lesson into a real skill (SKILL.md + reload).
+
+        Args:
+            lesson_id: The lesson to promote.
+            name: Optional skill name (lowercase, underscores). Defaults to a slug.
+            scope: "workspace" writes to .harness/skills/ (project-specific).
+                   "global" writes to ~/.harness/skills/ (available across all projects).
 
         Returns False if the lesson is missing or promotion failed.
         """
@@ -216,19 +222,30 @@ class LearningManager:
         slug = "".join(c if c.isalnum() or c in "_" else "_" for c in slug).strip("_")[:60]
         slug = slug.replace(" ", "_") or "learned_lesson"
 
-        skill_dir = self.workspace_path / ".harness" / "skills" / slug
+        if scope == "global":
+            skill_dir = Path.home() / ".harness" / "skills" / slug
+        else:
+            skill_dir = self.workspace_path / ".harness" / "skills" / slug
         skill_file = skill_dir / "SKILL.md"
         try:
             skill_file.parent.mkdir(parents=True, exist_ok=True)
             trigger = lesson.tags[0] if lesson.tags else (
                 next((t for t in lesson.summary.lower().split() if len(t) > 3), "learned_lesson")
             )
+            scope_note = (
+                "This is a **global skill** — available across all projects and workspaces."
+                if scope == "global" else
+                "This is a **workspace skill** — scoped to this project only."
+            )
             content = f"""---
 name: {slug}
 description: {lesson.summary}
 triggers: [learned {trigger}]
+scope: {scope}
 ---
 # {slug.replace('_', ' ').title()}
+
+{scope_note}
 
 {lesson.summary}
 

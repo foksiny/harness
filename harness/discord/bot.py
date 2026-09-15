@@ -128,28 +128,8 @@ if HAS_DISCORD:
                 perm = (self.config.discord_permission or DEFAULT_PERMISSION).lower()
                 discord_cfg = replace(self.config, permission=perm)
 
-                def _make_cc():
-                    from harness.computer.controller import ComputerController
-                    return ComputerController()
-
-                def _make_vfb(media_blocks, question=None, system_prompt=None):
-                    from harness.vision.describe import describe_media_blocks
-                    from harness.providers import get_provider
-                    vfb_prov_id = discord_cfg.vfb_provider.strip()
-                    if not vfb_prov_id:
-                        return ("", "no vision fallback provider configured")
-                    try:
-                        provider = get_provider(vfb_prov_id, discord_cfg)
-                    except Exception as exc:
-                        return ("", f"could not init vision fallback provider: {exc}")
-                    vfb_model = discord_cfg.vfb_model.strip() or provider.default_model
-                    return describe_media_blocks(provider, vfb_model, media_blocks,
-                                                 question=question, system_prompt=system_prompt)
-
                 self.agent = HarnessAgent(
                     config=discord_cfg,
-                    computer_controller_factory=_make_cc,
-                    vision_describe=_make_vfb,
                 )
             return self.agent
 

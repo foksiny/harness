@@ -171,6 +171,26 @@ class TestLearningManager(unittest.TestCase):
             self.assertEqual(skill.name, "git_commits")
             self.assertIn("conventional commits", skill.description)
 
+    def test_promote_global_writes_to_global_skills_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lm = make_manager(tmp)
+            reloaded = []
+            lm.set_reload_hook(lambda: reloaded.append(True))
+            lid = lm.record("Always use type hints in Python", tags=["python", "typing"])
+
+            self.assertTrue(lm.promote(lid, name="type_hints", scope="global"))
+            skill_file = Path.home() / ".harness" / "skills" / "type_hints" / "SKILL.md"
+            self.assertTrue(skill_file.exists())
+            content = skill_file.read_text(encoding="utf-8")
+            self.assertIn("name: type_hints", content)
+            self.assertIn("scope: global", content)
+            self.assertIn("global skill", content.lower())
+            self.assertEqual(reloaded, [True])
+            # Cleanup
+            skill_file.unlink()
+            skill_file.parent.rmdir()
+
     def test_promote_missing_lesson_returns_false(self):
         with tempfile.TemporaryDirectory() as td:
             lm = make_manager(Path(td))
@@ -236,6 +256,26 @@ class TestLearningTools(unittest.TestCase):
             out = registry.execute("learn_record", {"summary": "   "})
             self.assertIn("Error", out)
             self.assertEqual(registry.learning_manager.list(), [])
+
+    def test_promote_tool_with_scope(self):
+        with tempfile.TemporaryDirectory() as td:
+            lm = make_manager(Path(td))
+            registry = ToolRegistry(learning_manager=lm)
+            out = registry.execute("learn_record", {"summary": "Use virtualenvs for isolation", "tags": ["python"]})
+            self.assertIn("Recorded lesson", out)
+            # Extract lesson id from the output
+            lesson_id = out.split("`")[1]
+            # Promote as global
+            result = registry.execute("learn_promote", {"lesson_id": lesson_id, "name": "venv_isolation", "scope": "global"})
+            self.assertIn("global", result)
+            self.assertIn("Promoted", result)
+            skill_file = Path.home() / ".harness" / "skills" / "venv_isolation" / "SKILL.md"
+            self.assertTrue(skill_file.exists())
+            content = skill_file.read_text(encoding="utf-8")
+            self.assertIn("scope: global", content)
+            # Cleanup
+            skill_file.unlink()
+            skill_file.parent.rmdir()
 
 
 class TestLearningPrompt(unittest.TestCase):

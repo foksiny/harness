@@ -8,3 +8,5 @@ build/
 env/
 .harness/sessions/
 .harness/*.db
+bin/
+*.deb

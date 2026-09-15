@@ -86,9 +86,14 @@ class LearnRecallTool(Tool):
 class LearnPromoteTool(Tool):
     name = "learn_promote"
     description = (
-        "Promote a recorded lesson into a real reusable skill (writes a SKILL.md under "
-        ".harness/skills/ and reloads the skill catalog, so it becomes a first-class skill "
-        "the agent can read_skill). Best used for lessons proven valuable across multiple tasks."
+        "Promote a recorded lesson into a real reusable skill (writes a SKILL.md and "
+        "reloads the skill catalog, so it becomes a first-class skill the agent can "
+        "read_skill). Best used for lessons proven valuable across multiple tasks.\n\n"
+        "Scope:\n"
+        "- 'workspace' (default): Skill lives in .harness/skills/ — only available in this project.\n"
+        "- 'global': Skill lives in ~/.harness/skills/ — available across ALL projects. "
+        "Use this when the lesson is broadly applicable (e.g. a coding convention, a tool "
+        "trick, a debugging technique) and not specific to one codebase."
     )
     action_type = "learning"
     is_read_only = False
@@ -103,6 +108,11 @@ class LearnPromoteTool(Tool):
                 "type": "string",
                 "description": "Optional skill name (lowercase, underscores). Defaults to a slug of the summary.",
             },
+            "scope": {
+                "type": "string",
+                "enum": ["workspace", "global"],
+                "description": "'workspace' (default) scopes the skill to this project only. 'global' makes it available across all projects. Use 'global' for broadly reusable lessons.",
+            },
         },
         "required": ["lesson_id"],
     }
@@ -110,7 +120,8 @@ class LearnPromoteTool(Tool):
     def __init__(self, learning_manager: LearningManager):
         self.learning_manager = learning_manager
 
-    def execute(self, lesson_id: str, name: Optional[str] = None, **kwargs) -> str:
-        if self.learning_manager.promote(lesson_id, name=name):
-            return f"Promoted lesson `{lesson_id}` into a skill (catalog reloaded)."
+    def execute(self, lesson_id: str, name: Optional[str] = None, scope: str = "workspace", **kwargs) -> str:
+        if self.learning_manager.promote(lesson_id, name=name, scope=scope):
+            loc = "global (~/.harness/skills/)" if scope == "global" else "workspace (.harness/skills/)"
+            return f"Promoted lesson `{lesson_id}` into a {scope} skill at {loc} (catalog reloaded)."
         return f"Error: lesson `{lesson_id}` not found or could not be promoted."

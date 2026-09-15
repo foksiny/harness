@@ -94,14 +94,9 @@ When a delegation finishes, the report you receive already includes each agent's
 - 🧩 **Extensible Skills & 11 Built-in Skills**:
   - Discovers skills from `~/.harness/skills/` and `.harness/skills/`.
   - Includes specialized **`skill_creator`** (generates and installs new skills on user request) and **`mcp_integrator`** (connects and configures MCP servers on user request).
-- 🖥️ **Computer Use (`screen_capture`, `screen_analyze`, `computer_control`)**:
-  - Desktop interaction: screenshot capture, vision-based screen analysis, batched mouse/keyboard/clipboard control.
-  - **PyAutoGUI primary backend**: cross-platform capture + input (X11/Wayland via XWayland) with graceful fallback to mss → ctypes XTEST → CLI drivers (`grim`/`scrot`/`xdotool`/`ydotool`). Imports are crash-proof on headless machines — backend simply reports unavailable with install hints.
-  - Hermetic design: all computer tools are hermetic — they never raise, never touch a display unless a controller seam is injected, and return structured results with install hints when backends are unavailable.
-  - Vision fallback integration: screen content is described via the VFB core so text-only models can "see" the screen as text; vision-capable models (Anthropic, Gemini) get pixel-attach bonus.
-  - Permission-gated: read-only tools (`screen_capture`, `screen_analyze`) auto-approve; input tools (`computer_control`, `computer_clipboard`) require per-action approval under DEFAULT/SECURE mode, auto-approve under FULL, and are blocked in PLAN.
 - 🧠 **Continuous Learning & Self-Improvement**:
   - The agent transparently learns across sessions: `learn_record` / `learn_recall` / `learn_promote` let it (and you, via `/learn`) persist reusable lessons, inject top matches into every system prompt, and promote matured lessons into real skills.
+  - **Global skill promotion**: When the agent finds a lesson broadly useful across projects (coding patterns, debugging techniques, tool tricks), it promotes it as a **global skill** (`~/.harness/skills/`) so it's available everywhere. Workspace-specific lessons stay scoped to `.harness/skills/`.
 - 🔌 **Model Context Protocol (MCP) Client**:
   - Supports `stdio` and `sse` JSON-RPC 2.0 servers configured in `mcp.json`.
 - 🎨 **14 Handcrafted Visual Themes**:
@@ -127,7 +122,7 @@ pip install -e .
 harness
 ```
 
-All dependencies install by default — computer-use (PyAutoGUI, mss, Pillow), keychain storage (keyring), and the full TUI (prompt-toolkit, httpx, pydantic) are core requirements, not optional extras.
+All dependencies install by default — keychain storage (keyring) and the full TUI (prompt-toolkit, httpx, pydantic) are core requirements, not optional extras.
 
 ### Command Line Examples
 ```bash
@@ -192,7 +187,6 @@ cat logs/error.log | harness "Diagnose this stack trace"
 8. **`docker_deploy`**: Multi-stage Dockerfiles and container orchestration.
 9. **`performance_profiler`**: Latency, memory leak diagnosis, and caching strategies.
 10. **`documentation_writer`**: Architecture RFCs, user guides, and API references.
-11. **`computer_use`**: Screen control patterns — capture, describe, click, type, and verify desktop workflows.
 
 ---
 
@@ -319,7 +313,7 @@ Harness comes with an automated test suite (294+ tests across 21 files):
 python3 -m pytest tests/ -v
 ```
 
-The suite verifies tools, sandboxed execution, model context window detection, provider payloads, compaction, subagent/swarm parallelism, checkpoints, computer-use hermeticity, skills, and slash commands.
+The suite verifies tools, sandboxed execution, model context window detection, provider payloads, compaction, subagent/swarm parallelism, checkpoints, skills, learning, and slash commands.
 
 ### Benchmarks
 
