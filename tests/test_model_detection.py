@@ -83,9 +83,9 @@ class TestModelDetection(unittest.TestCase):
         c4 = detect_context_window("qwen-3-512k")
         self.assertEqual(c4, 512000)
 
-        # Future Gemini model
+        # Future Gemini model (no provider → conservative default)
         c5 = detect_context_window("gemini-3-pro")
-        self.assertEqual(c5, 1048576)
+        self.assertEqual(c5, 128000)
 
     def test_future_reasoning_detection(self):
         # r1 pattern

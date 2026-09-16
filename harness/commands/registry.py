@@ -15,6 +15,89 @@ from harness.core.checkpoints import get_checkpoint_manager
 from harness.core.agent import AgentEvent
 from harness.tui.input_handler import VIEW_AGENTS, VIEW_PARENT, no_echo_stdin
 
+# Provider-to-model prefix mappings for /models filtering.
+# Models with explicit provider prefixes (e.g. "together/deepseek-v4-pro") belong
+# to that provider. Bare model names use family-based matching.
+_PROVIDER_PREFIXES = {
+    "anthropic": ("anthropic/",),
+    "openai": ("openai/",),
+    "gemini": ("google/",),
+    "google": ("google/",),
+    "deepseek": ("deepseek/",),
+    "nvidia": ("deepseek-ai/", "nvidia/", "meta/", "qwen/", "mistral/"),
+    "nim": ("deepseek-ai/", "nvidia/", "meta/", "qwen/", "mistral/"),
+    "groq": ("openai/",),
+    "xai": (),
+    "cohere": (),
+    "mistral": (),
+    "perplexity": (),
+    "together": ("together/", "meta/", "minimaxai/", "moonshotai/", "zai-org/"),
+    "openrouter": ("anthropic/", "google/", "openai/", "deepseek-ai/", "meta-llama/",
+                   "meta/", "nvidia/", "qwen/", "mistral/", "together/", "minimaxai/",
+                   "moonshotai/", "zai-org/", "accounts/fireworks/"),
+    "fireworks": ("accounts/fireworks/",),
+    "ollama": (),
+    "mock": (),
+}
+
+# Bare model name families → provider (used when no prefix).
+_MODEL_FAMILY_PROVIDER = {
+    "claude": "anthropic",
+    "gpt": "openai",
+    "o1": "openai", "o3": "openai", "o4": "openai", "o5": "openai",
+    "gemini": "gemini",
+    "grok": "xai",
+    "command": "cohere",
+    "mistral": "mistral", "codestral": "mistral", "pixtral": "mistral",
+    "ministral": "mistral",
+    "sonar": "perplexity",
+    "deepseek": "deepseek",
+    "llama": "meta",
+    "gemma": "google",
+    "qwen": "qwen", "qwq": "qwen",
+    "glm": "zai-org",
+}
+
+
+def _model_belongs_to_provider(model_name: str, provider: str) -> bool:
+    """Check if a model name belongs to a given provider."""
+    ml = model_name.lower().strip()
+    prov = provider.lower().strip()
+
+    # 1. Check explicit prefix matches (e.g. "together/deepseek-v4-pro" → together)
+    prefixes = _PROVIDER_PREFIXES.get(prov, ())
+    for pfx in prefixes:
+        if ml.startswith(pfx):
+            return True
+
+    # 2. Check bare model name families
+    family_prov = None
+    for family, p in _MODEL_FAMILY_PROVIDER.items():
+        if family in ml:
+            family_prov = p
+            break
+
+    if family_prov is None:
+        return False
+
+    # Map family provider to target provider (with aliases)
+    prov_aliases = {
+        "gemini": ("gemini", "google"),
+        "google": ("gemini", "google"),
+        "meta": ("nvidia", "nim", "groq", "together", "fireworks", "ollama"),
+        "qwen": ("nvidia", "nim", "groq", "together", "openrouter"),
+    }
+
+    if family_prov == prov:
+        return True
+    if prov in prov_aliases.get(family_prov, ()):
+        return True
+    if family_prov in prov_aliases.get(prov, ()):
+        return True
+
+    return False
+
+
 class CommandContext:
     def __init__(self, agent: Any, renderer: Any, raw_args: str):
         self.agent = agent
@@ -196,24 +279,35 @@ class CommandRegistry:
         models_data = []
         seen = set()
 
-        # Include discovered remote models if cached
-        from harness.providers.discovery import load_cached_models
+        from harness.providers.discovery import load_cached_models, load_universal_models
         cache = load_cached_models()
+        univ = load_universal_models()
         cached_prov = cache.get(target_prov, {}).get("models", [])
+
+        def _resolve_context(name: str, spec_ctx: int) -> int:
+            base = name.lower().split("/")[-1].split(":")[0]
+            if base in univ and isinstance(univ[base], int):
+                return univ[base]
+            return spec_ctx
+
         for rm in cached_prov:
             mid = rm.get("id")
             if mid and mid not in seen:
                 seen.add(mid)
+                spec = inspect_model(mid, target_prov)
+                ctx_from_cache = rm.get("context_length") or 0
+                cache_thinking = rm.get("supports_thinking")
+                cache_tt = rm.get("thinking_type")
                 models_data.append({
                     "name": mid,
-                    "context": rm.get("context_length") or 128000,
-                    "output": 16384,
-                    "thinking": rm.get("supports_thinking", False),
-                    "thinking_type": rm.get("thinking_type"),
-                    "vision": bool(rm.get("supports_vision", inspect_model(mid, target_prov).supports_vision)),
+                    "context": _resolve_context(mid, ctx_from_cache or spec.context_window),
+                    "output": spec.max_output_tokens,
+                    "thinking": spec.supports_thinking or bool(cache_thinking),
+                    "thinking_type": spec.thinking_type or cache_tt,
+                    "vision": bool(rm.get("supports_vision", spec.supports_vision)),
+                    "reasoning_options": list(rm.get("reasoning_options") or spec.reasoning_options),
                 })
 
-        # Add known registry models filtered by provider relevance
         for mname, mdata in KNOWN_MODEL_REGISTRY.items():
             if mname in seen:
                 continue
@@ -223,27 +317,7 @@ class CommandRegistry:
             include = False
             if target_prov in ("all", "catalog"):
                 include = True
-            elif target_prov == "anthropic" and "claude" in ml:
-                include = True
-            elif target_prov == "openai" and any(k in ml for k in ("gpt", "o1", "o3", "o4")):
-                include = True
-            elif target_prov == "gemini" and "gemini" in ml:
-                include = True
-            elif target_prov == "deepseek" and "deepseek" in ml:
-                include = True
-            elif target_prov in ("nvidia", "nim") and any(k in ml for k in ("meta", "llama", "deepseek", "nvidia", "qwen", "mistral")):
-                include = True
-            elif target_prov == "groq" and any(k in ml for k in ("llama", "gemma", "mixtral", "qwen")):
-                include = True
-            elif target_prov == "xai" and "grok" in ml:
-                include = True
-            elif target_prov == "cohere" and "command" in ml:
-                include = True
-            elif target_prov == "mistral" and any(k in ml for k in ("mistral", "codestral", "pixtral")):
-                include = True
-            elif target_prov == "perplexity" and "sonar" in ml:
-                include = True
-            elif target_prov in ("openrouter", "together", "fireworks", "ollama", "mock"):
+            elif _model_belongs_to_provider(ml, target_prov):
                 include = True
             elif not models_data:
                 include = True
@@ -252,11 +326,12 @@ class CommandRegistry:
                 seen.add(mname)
                 models_data.append({
                     "name": mname,
-                    "context": spec.context_window,
+                    "context": _resolve_context(mname, spec.context_window),
                     "output": spec.max_output_tokens,
                     "thinking": spec.supports_thinking,
                     "thinking_type": spec.thinking_type,
                     "vision": spec.supports_vision,
+                    "reasoning_options": list(spec.reasoning_options),
                 })
 
         ctx.renderer.print_models_catalog(target_prov, models_data)
@@ -356,12 +431,28 @@ class CommandRegistry:
 
     def _cmd_effort(self, ctx: CommandContext):
         if not ctx.args:
-            ctx.renderer.print_info(f"Current thinking effort: {ctx.agent.config.thinking_effort}. Options: off, low, medium, high, or integer tokens.")
+            current = ctx.agent.config.thinking_effort
+            model = ctx.agent.session.model if ctx.agent.session else ctx.agent.config.model
+            spec = ctx.agent.provider.get_model_spec(model)
+            dialect = spec.thinking_type or "reasoning_effort"
+            budget = dialect in ("budget_tokens", "thinking_budget", "thinking_token_budget")
+            budget_note = " | Budget: set any integer token count" if budget else ""
+            ctx.renderer.print_info(
+                f"Current thinking effort: {current} (dialect: {dialect}{budget_note}). "
+                f"Options: off, low, medium, high, or integer tokens."
+            )
             return
-        ctx.agent.config.thinking_effort = ctx.args.strip()
+        setting = ctx.args.strip()
+        ctx.agent.config.thinking_effort = setting
         save_config(ctx.agent.config)
-        _publish_state({"thinking_effort": ctx.args.strip()}, ctx)
-        ctx.renderer.print_success(f"Thinking effort set to: {ctx.args.strip()}")
+        model = ctx.agent.session.model if ctx.agent.session else ctx.agent.config.model
+        spec = ctx.agent.provider.get_model_spec(model)
+        dialect = spec.thinking_type or "reasoning_effort"
+        params = ctx.agent.provider.normalize_thinking_effort(spec, setting)
+        ctx.renderer.print_success(f"Thinking effort set to: {setting} (dialect: {dialect})")
+        if params:
+            ctx.renderer.print_info(f"Request params: {params}")
+        _publish_state({"thinking_effort": setting}, ctx)
 
     def _cmd_todo(self, ctx: CommandContext):
         args = ctx.args.strip()

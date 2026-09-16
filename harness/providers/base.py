@@ -53,7 +53,7 @@ class BaseProvider(ABC):
 
         ttype = model_spec.thinking_type or "reasoning_effort"
         eff = effort_setting.lower().strip()
-        off = eff in ("off", "none", "false", "disabled")
+        off = eff in ("off", "none", "false", "disabled", "no", "0", "disable", "stop", "cancel")
 
         if ttype == "budget_tokens":
             # Anthropic style
@@ -92,7 +92,15 @@ class BaseProvider(ABC):
             # NVIDIA NIM (DeepSeek-V4 etc.) — reasoning_effort none|high|max.
             if off:
                 return {"chat_template_kwargs": {"thinking": False}}
-            return {"chat_template_kwargs": {"thinking": True}, "reasoning_effort": "high"}
+            effort = "high"
+            if eff in ("max", "maximum", "full", "deep", "verbose", "detailed", "extensive", "thorough"):
+                effort = "max"
+            elif eff in ("low", "minimal", "light", "brief", "shallow"):
+                effort = "high"
+            elif eff.isdigit():
+                n = int(eff)
+                effort = "max" if n >= 12000 else "high"
+            return {"chat_template_kwargs": {"thinking": True}, "reasoning_effort": effort}
 
         # reasoning_effort / default
         if off:
@@ -101,9 +109,9 @@ class BaseProvider(ABC):
 
     @staticmethod
     def _level_tokens(eff: str, low_t: int, med_t: int, high_t: int) -> int:
-        if eff == "low":
+        if eff in ("low", "minimal", "light", "brief", "shallow"):
             return low_t
-        if eff == "high":
+        if eff in ("high", "max", "maximum", "full", "deep", "verbose", "detailed", "extensive", "thorough"):
             return high_t
         if eff.isdigit():
             return int(eff)
@@ -111,12 +119,82 @@ class BaseProvider(ABC):
 
     @staticmethod
     def _level_effort(eff: str) -> str:
-        if eff in ("low", "medium", "high"):
-            return eff
+        if eff in ("low", "minimal", "light", "brief", "shallow"):
+            return "low"
+        if eff in ("high", "max", "maximum", "full", "deep", "verbose", "detailed", "extensive", "thorough"):
+            return "high"
+        if eff in ("medium", "med", "moderate", "normal", "default", "standard"):
+            return "medium"
         if eff.isdigit():
             n = int(eff)
             return "low" if n < 4000 else ("medium" if n < 12000 else "high")
         return "medium"
+
+
+def probe_effort_options(dialect: Optional[str]) -> List[str]:
+    """Probe which effort names a dialect actually accepts.
+
+    Returns a list of canonical effort level names that produce distinct
+    results for the given dialect. Also indicates if numeric token counts
+    are accepted (shown as '<n>' in the list).
+    """
+    if not dialect:
+        return []
+
+    def _run(v):
+        eff = v.lower().strip()
+        off = eff in ("off", "none", "false", "disabled", "no", "0", "disable", "stop", "cancel")
+        if dialect == "budget_tokens":
+            if off: return {}
+            return {"thinking": {"type": "enabled", "budget_tokens": max(1024, BaseProvider._level_tokens(eff, 2048, 8192, 16384))}}
+        if dialect == "thinking_budget":
+            if off: return {}
+            return {"thinking_config": {"thinking_budget": BaseProvider._level_tokens(eff, 2048, 8192, 16384), "include_thoughts": True}}
+        if dialect == "thinking_token_budget":
+            if off: return {"thinking": {"type": "disabled"}}
+            return {"thinking": {"type": "enabled", "token_budget": max(1024, BaseProvider._level_tokens(eff, 2048, 8192, 16384))}}
+        if dialect == "reasoning_object":
+            if off: return {"reasoning": {"enabled": False}}
+            return {"reasoning": {"effort": BaseProvider._level_effort(eff)}}
+        if dialect == "reasoning_toggle":
+            if off: return {"reasoning": {"enabled": False}}
+            return {"reasoning": {"enabled": True}}
+        if dialect == "chat_template_kwargs":
+            if off: return {"chat_template_kwargs": {"thinking": False}}
+            effort = "max" if eff in ("max", "maximum", "full", "deep") or (eff.isdigit() and int(eff) >= 12000) else "high"
+            return {"chat_template_kwargs": {"thinking": True}, "reasoning_effort": effort}
+        # reasoning_effort / default
+        if off: return {}
+        return {"reasoning_effort": BaseProvider._level_effort(eff)}
+
+    # Test canonical levels and check which produce distinct results
+    levels = [("off", "off"), ("low", "low"), ("medium", "medium"), ("high", "high")]
+    results = {}
+    for label, probe_val in levels:
+        r = repr(_run(probe_val))
+        if r not in results:
+            results[r] = label
+
+    canonical = list(results.values())
+
+    # For toggle/nim dialects, prefer natural names over level names
+    if dialect == "reasoning_toggle" and len(canonical) == 2:
+        # off + one other → show as "off, on"
+        canonical = ["off", "on"]
+    elif dialect == "chat_template_kwargs" and len(canonical) == 2:
+        # off + one other → show as "none, high, max"
+        canonical = ["none", "high", "max"]
+
+    # Check if numeric values are preserved as actual token counts (not just mapped to levels)
+    high_r = _run("high")
+    num_r = _run("8000")
+    if num_r != high_r and num_r != _run("off"):
+        # Check if the numeric value is actually in the result (token count preserved)
+        num_str = repr(num_r)
+        if "8000" in num_str:
+            canonical.append("<n>")
+
+    return canonical
 
     @abstractmethod
     def stream_chat(

@@ -1,511 +1,610 @@
 """
 Model-Specific Detection & Capability Engine for Harness.
-Dynamically resolves context window limits, token output boundaries, and
-reasoning/thinking effort mechanics for any current or future LLM.
 
-Thinking is negotiated per-provider using a small set of *dialects*:
+Capability resolution is DATA-DRIVEN — the same architecture opencode, Cline,
+and Kilo Code converged on. Nothing here guesses a model's limits by matching
+its *family* in the name (``"claude" in name -> 200k``). Instead:
 
-* ``budget_tokens``           - Anthropic ``{"thinking": {"type": "enabled", "budget_tokens": N}}``
-* ``thinking_budget``         - Gemini   ``{"thinking_config": {"thinking_budget": N, "include_thoughts": true}}``
-* ``reasoning_effort``        - OpenAI / xAI / Mistral / Groq / Perplexity / DeepSeek / Ollama ``{"reasoning_effort": "low|medium|high"}``
-* ``reasoning_object``        - OpenRouter ``{"reasoning": {"effort": "low|medium|high"}}``
-* ``reasoning_toggle``        - Together hybrid ``{"reasoning": {"enabled": true|false}}``
-* ``chat_template_kwargs``    - NVIDIA NIM (DeepSeek-V4) ``{"chat_template_kwargs": {"thinking": true}}`` + ``reasoning_effort``
-* ``thinking_token_budget``   - Cohere ``{"thinking": {"type": "enabled", "token_budget": N}}``
+Tier 1  Live provider ``/models`` metadata   (discovery.fetch_remote_models)
+Tier 2  Universal models.dev catalog         (discovery, ``~/.harness`` cache)
+Tier 3  Bundled flat-data catalog            (KNOWN_MODEL_REGISTRY, exact-id lookup)
+Tier 4  Literal capability markers           (suffixes the model id *itself*
+                                              declares: ``-1m``/``-128k``/``-vl``/``-reasoning``)
+Tier 5  Provider-level defaults              (PROVIDER_FALLBACKS / dialect map)
+Tier 6  Conservative universal default       (128k context, no extras)
+
+Only tiers 4/5/6 run without any metadata, and each is explicitly labelled via
+``ModelSpec.source`` so callers can tell whether a value is authoritative.
+
+Thinking is negotiated per-provider using a small set of *dialects*, chosen by
+provider identity (never by model family):
+
+* ``budget_tokens``            - Anthropic   ``{"thinking": {"type": "enabled", "budget_tokens": N}}``
+* ``adaptive``                 - Anthropic 4.6+ ``{"thinking": {"type": "adaptive"}}``
+* ``thinking_budget``          - Gemini 2.5 ``{"thinking_config": {"thinking_budget": N, "include_thoughts": true}}``
+* ``thinking_level``           - Gemini 3   ``{"thinking_config": {"include_thoughts": true, "thinking_level": L}}``
+* ``reasoning_effort``         - OpenAI/xAI/Mistral/Groq/DeepSeek/Ollama/... ``{"reasoning_effort": L}``
+* ``reasoning_object``         - OpenRouter effort ``{"reasoning": {"effort": L}}``
+* ``reasoning_max_tokens``     - OpenRouter budget ``{"reasoning": {"max_tokens": N}}``
+* ``reasoning_toggle``         - Together hybrid ``{"reasoning": {"enabled": bool}}``
+* ``chat_template_kwargs``     - NVIDIA NIM (DeepSeek-V4) ``{"chat_template_kwargs": {"thinking": bool}}``
+* ``thinking_token_budget``    - Cohere ``{"thinking": {"type": "enabled", "token_budget": N}}``
 """
 import re
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List, Tuple
 
 # Thinking negotiation dialects understood by ``normalize_thinking_effort``.
 THINKING_DIALECTS = (
     "budget_tokens",
+    "adaptive",
     "thinking_budget",
+    "thinking_level",
     "reasoning_effort",
     "reasoning_object",
+    "reasoning_max_tokens",
     "reasoning_toggle",
     "chat_template_kwargs",
     "thinking_token_budget",
 )
 
-# Together hybrid (reasoning.toggle) model name hints.
-TOGETHER_REASONING_TOGGLE_HINTS = ("kimi", "glm", "minimax", "deepseek-v4")
+# Probe values to test which effort names a dialect actually accepts.
+_PROBE_EFFORTS = [
+    "off", "none", "disable",
+    "low", "minimal", "light",
+    "medium", "med", "moderate", "normal",
+    "high", "max", "maximum", "full", "deep",
+    "500", "8000", "16000",
+]
+
+# ─── Literal capability markers ─────────────────────────────────────────────
+#
+# Tier-4 last resort. These are substrings the *model id itself* declares as a
+# capability (OpenRouter/model-hub naming conventions), NOT family guesses.
+#   - context:  "-128k", "-1m", "-2m" ... (explicit token-count suffix)
+#   - vision:   "-vl", "vlm", "vision", "omni", "4o", "gpt-4.1", ...
+#   - thinking: "-reasoning", "-reasoner", "qwq", "r1", "o1/o3/o4/o5", ...
+
+FALLBACK_CONTEXT = 128_000
+FALLBACK_OUTPUT = 16_384
+
+VISION_MARKERS = (
+    "vision", "-vl", "vlm", "multimodal", "-omni", "neva", "muse",
+    "gemma-3", "paligemma", "idefics", "molmo", "smolvlm", "internvl",
+    "minicpm-v", "cogvlm", "llava", "moondream", "phi-4-vision",
+    "fuyu", "ferret", "cambrian", "4o", "gpt-4.1", "llama-4",
+)
+VIDEO_MARKERS = ("video", "-video")
+
+REASONING_MARKERS = (
+    "reason", "reasoner", "reasoning", "thinking", "thought",
+    "qwq", "r1", "o1", "o3", "o4", "o5", "muse",
+)
+
+# Marker normalisation map: a marker substring in a model id maps to a strong
+# (True) or strong-negative (False) capability answer.
+_MARKER_SIGNALS = {m: True for m in VISION_MARKERS}
+_MARKER_SIGNALS.update({m: False for m in ("embedding", "embed", "-dry", "-slim", "-textonly")})
+
 
 @dataclass
 class ModelSpec:
     name: str
     provider: str
-    context_window: int
-    max_output_tokens: int
+    context_window: int          # 0 => unknown
+    max_output_tokens: int       # 0 => unknown
     supports_thinking: bool
     thinking_type: Optional[str]  # one of THINKING_DIALECTS
     supports_tools: bool = True
     supports_vision: bool = False
     supports_video: bool = False
+    reasoning_options: List[str] = field(default_factory=list)  # server-advertised reasoning mechanisms
+    source: str = "default"      # catalog | server | universal | literal | provider | default
 
-# Known baseline catalog for exact matches — covers all major providers and model families.
-# Future models auto-detected via heuristics; add entries here for precise overrides.
-# Entry shape: {"context": int, "output": int, "thinking": bool, "thinking_type": dialect}
+
+def _E(context: int, output: int, thinking: bool, ttype: Optional[str] = None,
+       vision: Optional[bool] = None, video: Optional[bool] = None,
+       reasoning_options: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Compact constructor for a bundled catalog entry."""
+    e: Dict[str, Any] = {
+        "context": context,
+        "output": output,
+        "thinking": thinking,
+        "thinking_type": ttype,
+        "vision": vision,
+        "video": video,
+    }
+    if reasoning_options:
+        e["reasoning_options"] = list(reasoning_options)
+    return e
+
+
+# ─── Bundled flat-data catalog ──────────────────────────────────────────────
+# A hand-maintained *data* snapshot (models.dev style) covering the models this
+# harness ships defaults for. New / unknown models are resolved dynamically via
+# tier 1/2 (live provider metadata + universal catalog) BEFORE this table, and
+# tier 4/5/6 after it. Entry shape:
+#   context: int | output: int | thinking: bool | thinking_type: dialect-pin
+#   vision/video: pinned True/False (or None => fall through to markers/defaults)
+#
+# `thinking_type` is only pinned when the *server* exposes a non-default
+# reasoning mechanism for that model (e.g. NVIDIA NIM's DeepSeek-V4 uses
+# chat-template kwargs). Otherwise the provider dialect (tier 5) applies.
 KNOWN_MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     # ─── Anthropic ───────────────────────────────────────────────────────────
-    "claude-opus-4-5": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
-    "claude-opus-4-5-20251101": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
-    "claude-sonnet-4-5": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
-    "claude-sonnet-4-5-20250929": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
-    "claude-haiku-4-5": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
-    "claude-haiku-4-5-20251001": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
-    "claude-sonnet-4": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
-    "claude-sonnet-4-20250514": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
-    "claude-opus-4": {"context": 200000, "output": 32000, "thinking": True, "thinking_type": "budget_tokens"},
-    "claude-opus-4-20250514": {"context": 200000, "output": 32000, "thinking": True, "thinking_type": "budget_tokens"},
-    "claude-4-sonnet": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
-    "claude-3-7-sonnet": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
-    "claude-3-7-sonnet-20250219": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
-    "claude-3-5-sonnet": {"context": 200000, "output": 8192, "thinking": False, "thinking_type": None},
-    "claude-3-5-sonnet-20241022": {"context": 200000, "output": 8192, "thinking": False, "thinking_type": None},
-    "claude-3-5-haiku": {"context": 200000, "output": 8192, "thinking": False, "thinking_type": None},
-    "claude-3-5-haiku-20241022": {"context": 200000, "output": 8192, "thinking": False, "thinking_type": None},
-    "claude-3-opus": {"context": 200000, "output": 4096, "thinking": False, "thinking_type": None},
-    "claude-3-opus-20240229": {"context": 200000, "output": 4096, "thinking": False, "thinking_type": None},
+    "claude-opus-4-5": _E(200000, 64000, True, vision=True, video=True),
+    "claude-opus-4-5-20251101": _E(200000, 64000, True, vision=True, video=True),
+    "claude-sonnet-4-5": _E(200000, 64000, True, vision=True, video=True),
+    "claude-sonnet-4-5-20250929": _E(200000, 64000, True, vision=True, video=True),
+    "claude-haiku-4-5": _E(200000, 64000, True, vision=True, video=True),
+    "claude-haiku-4-5-20251001": _E(200000, 64000, True, vision=True, video=True),
+    "claude-sonnet-4": _E(200000, 64000, True, vision=True, video=True),
+    "claude-sonnet-4-20250514": _E(200000, 64000, True, vision=True, video=True),
+    "claude-opus-4": _E(200000, 32000, True, vision=True, video=True),
+    "claude-opus-4-20250514": _E(200000, 32000, True, vision=True, video=True),
+    "claude-4-sonnet": _E(200000, 64000, True, vision=True, video=True),
+    "claude-3-7-sonnet": _E(200000, 64000, True, vision=True, video=True),
+    "claude-3-7-sonnet-20250219": _E(200000, 64000, True, vision=True, video=True),
+    "claude-3-5-sonnet": _E(200000, 8192, False, vision=True, video=True),
+    "claude-3-5-sonnet-20241022": _E(200000, 8192, False, vision=True, video=True),
+    "claude-3-5-haiku": _E(200000, 8192, False, vision=True, video=True),
+    "claude-3-5-haiku-20241022": _E(200000, 8192, False, vision=True, video=True),
+    "claude-3-opus": _E(200000, 4096, False, vision=True, video=True),
+    "claude-3-opus-20240229": _E(200000, 4096, False, vision=True, video=True),
 
     # OpenRouter dotted aliases
-    "anthropic/claude-sonnet-4.5": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
-    "anthropic/claude-opus-4.5": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
-    "anthropic/claude-haiku-4.5": {"context": 200000, "output": 64000, "thinking": True, "thinking_type": "budget_tokens"},
+    "anthropic/claude-sonnet-4.5": _E(200000, 64000, True, vision=True, video=True),
+    "anthropic/claude-opus-4.5": _E(200000, 64000, True, vision=True, video=True),
+    "anthropic/claude-haiku-4.5": _E(200000, 64000, True, vision=True, video=True),
 
     # ─── OpenAI ──────────────────────────────────────────────────────────────
-    "gpt-5": {"context": 400000, "output": 128000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "gpt-5-2025-08-07": {"context": 400000, "output": 128000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "gpt-5-mini": {"context": 400000, "output": 128000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "gpt-5-mini-2025-08-07": {"context": 400000, "output": 128000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "gpt-5-nano": {"context": 400000, "output": 128000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "gpt-5.1": {"context": 400000, "output": 128000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "gpt-5.1-2025-11-13": {"context": 400000, "output": 128000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "gpt-5-codex": {"context": 400000, "output": 128000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "gpt-5.1-codex": {"context": 400000, "output": 128000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "gpt-5.1-codex-max": {"context": 400000, "output": 128000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "gpt-5.1-codex-mini": {"context": 400000, "output": 128000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "o1": {"context": 200000, "output": 100000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "o1-preview": {"context": 128000, "output": 32768, "thinking": True, "thinking_type": "reasoning_effort"},
-    "o1-mini": {"context": 128000, "output": 65536, "thinking": True, "thinking_type": "reasoning_effort"},
-    "o3": {"context": 200000, "output": 100000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "o3-mini": {"context": 200000, "output": 100000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "o3-pro": {"context": 200000, "output": 100000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "o4-mini": {"context": 200000, "output": 100000, "thinking": True, "thinking_type": "reasoning_effort"},
-    "gpt-4.1": {"context": 1047576, "output": 32768, "thinking": False, "thinking_type": None},
-    "gpt-4.1-mini": {"context": 1047576, "output": 32768, "thinking": False, "thinking_type": None},
-    "gpt-4.1-nano": {"context": 1047576, "output": 32768, "thinking": False, "thinking_type": None},
-    "gpt-4o": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
-    "gpt-4o-2024-11-20": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
-    "gpt-4o-mini": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
-    "gpt-4-turbo": {"context": 128000, "output": 4096, "thinking": False, "thinking_type": None},
+    "gpt-5": _E(400000, 128000, True, reasoning_options=["reasoning_effort", "reasoning_summary"]),
+    "gpt-5-2025-08-07": _E(400000, 128000, True),
+    "gpt-5-mini": _E(400000, 128000, True),
+    "gpt-5-mini-2025-08-07": _E(400000, 128000, True),
+    "gpt-5-nano": _E(400000, 128000, True),
+    "gpt-5.1": _E(400000, 128000, True, reasoning_options=["reasoning_effort", "reasoning_summary"]),
+    "gpt-5.1-2025-11-13": _E(400000, 128000, True),
+    "gpt-5-codex": _E(400000, 128000, True),
+    "gpt-5.1-codex": _E(400000, 128000, True),
+    "gpt-5.1-codex-max": _E(400000, 128000, True),
+    "gpt-5.1-codex-mini": _E(400000, 128000, True),
+    "o1": _E(200000, 100000, True, vision=False),
+    "o1-preview": _E(128000, 32768, True, vision=False),
+    "o1-mini": _E(128000, 65536, True, vision=False),
+    "o3": _E(200000, 100000, True, vision=True),
+    "o3-mini": _E(200000, 100000, True, vision=False),
+    "o3-pro": _E(200000, 100000, True, vision=True),
+    "o4-mini": _E(200000, 100000, True, vision=True),
+    "gpt-4.1": _E(1047576, 32768, False, vision=True, video=True),
+    "gpt-4.1-mini": _E(1047576, 32768, False, vision=True, video=True),
+    "gpt-4.1-nano": _E(1047576, 32768, False, vision=True, video=True),
+    "gpt-4o": _E(128000, 16384, False, vision=True, video=True),
+    "gpt-4o-2024-11-20": _E(128000, 16384, False, vision=True, video=True),
+    "gpt-4o-mini": _E(128000, 16384, False, vision=True, video=True),
+    "gpt-4-turbo": _E(128000, 4096, False, vision=True, video=True),
 
     # ─── Google Gemini ───────────────────────────────────────────────────────
-    "gemini-2.5-pro": {"context": 1048576, "output": 65536, "thinking": True, "thinking_type": "thinking_budget"},
-    "gemini-2.5-pro-latest": {"context": 1048576, "output": 65536, "thinking": True, "thinking_type": "thinking_budget"},
-    "gemini-2.5-flash": {"context": 1048576, "output": 65536, "thinking": True, "thinking_type": "thinking_budget"},
-    "gemini-2.5-flash-latest": {"context": 1048576, "output": 65536, "thinking": True, "thinking_type": "thinking_budget"},
-    "gemini-2.5-flash-lite": {"context": 1048576, "output": 65536, "thinking": True, "thinking_type": "thinking_budget"},
-    "gemini-2.0-flash": {"context": 1048576, "output": 8192, "thinking": False, "thinking_type": None},
-    "gemini-1.5-pro": {"context": 2097152, "output": 8192, "thinking": False, "thinking_type": None},
-    "gemini-1.5-flash": {"context": 1048576, "output": 8192, "thinking": False, "thinking_type": None},
-    "google/gemini-2.5-pro": {"context": 1048576, "output": 65536, "thinking": True, "thinking_type": "thinking_budget"},
-    "google/gemini-2.5-flash": {"context": 1048576, "output": 65536, "thinking": True, "thinking_type": "thinking_budget"},
-    "google/gemini-2.5-flash-lite": {"context": 1048576, "output": 65536, "thinking": True, "thinking_type": "thinking_budget"},
+    "gemini-2.5-pro": _E(1048576, 65536, True, vision=True,
+                          reasoning_options=["thinking_budget", "thinking_level"]),
+    "gemini-2.5-pro-latest": _E(1048576, 65536, True, vision=True),
+    "gemini-2.5-flash": _E(1048576, 65536, True, vision=True),
+    "gemini-2.5-flash-latest": _E(1048576, 65536, True, vision=True),
+    "gemini-2.5-flash-lite": _E(1048576, 65536, True, vision=True),
+    "gemini-2.0-flash": _E(1048576, 8192, False, vision=True, video=True),
+    "gemini-1.5-pro": _E(2097152, 8192, False, vision=True, video=True),
+    "gemini-1.5-flash": _E(1048576, 8192, False, vision=True, video=True),
+    "google/gemini-2.5-pro": _E(1048576, 65536, True, vision=True),
+    "google/gemini-2.5-flash": _E(1048576, 65536, True, vision=True),
+    "google/gemini-2.5-flash-lite": _E(1048576, 65536, True, vision=True),
+    "google/gemma-3-27b-it": _E(128000, 8192, False, vision=True, video=False),
 
     # ─── DeepSeek (direct + NIM-hosted + OpenRouter) ─────────────────────────
-    "deepseek-flash": {"context": 1048576, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek-chat": {"context": 65536, "output": 8192, "thinking": False, "thinking_type": None},
-    "deepseek-reasoner": {"context": 65536, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
+    "deepseek-flash": _E(1048576, 8192, True, vision=False),
+    "deepseek-chat": _E(65536, 8192, False, vision=False),
+    "deepseek-reasoner": _E(65536, 8192, True, vision=False,
+                            reasoning_options=["reasoning_effort"]),
     # DeepSeek V4 family — 1M context window
-    "deepseek-v4-pro": {"context": 1048576, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek-v4-pro-0813": {"context": 1048576, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek-v4-flash": {"context": 1048576, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek-v4-flash-0731": {"context": 1310720, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek-ai/deepseek-v4-pro": {"context": 1048576, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek-ai/deepseek-v4-pro-0813": {"context": 1048576, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek-ai/deepseek-v4-flash": {"context": 1048576, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek-ai/deepseek-v4-flash-0731": {"context": 1310720, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek/deepseek-v4-pro": {"context": 1048576, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek/deepseek-v4-pro-0813": {"context": 1048576, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek/deepseek-v4-flash": {"context": 1048576, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek/deepseek-v4-flash-0731": {"context": 1310720, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek-ai/deepseek-r1": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek-ai/DeepSeek-R1": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek-ai/deepseek-r1-0528": {"context": 163840, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "deepseek-ai/deepseek-v3.2": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
-    "deepseek-ai/deepseek-v3.1": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
-    "deepseek-ai/deepseek-v3": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
-    "deepseek-ai/deepseek-v2.5": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "deepseek-v4-pro": _E(1048576, 16384, True, vision=False),
+    "deepseek-v4-pro-0813": _E(1048576, 16384, True, vision=False),
+    "deepseek-v4-flash": _E(1048576, 16384, True, vision=False),
+    "deepseek-v4-flash-0731": _E(1310720, 16384, True, vision=False),
+    "deepseek-ai/deepseek-v4-pro": _E(1048576, 16384, True, vision=False,
+                                      ttype="chat_template_kwargs", reasoning_options=["chat_template_kwargs"]),
+    "deepseek-ai/deepseek-v4-pro-0813": _E(1048576, 16384, True, vision=False,
+                                           ttype="chat_template_kwargs", reasoning_options=["chat_template_kwargs"]),
+    "deepseek-ai/deepseek-v4-flash": _E(1048576, 16384, True, vision=False,
+                                        ttype="chat_template_kwargs", reasoning_options=["chat_template_kwargs"]),
+    "deepseek-ai/deepseek-v4-flash-0731": _E(1310720, 16384, True, vision=False,
+                                             ttype="chat_template_kwargs", reasoning_options=["chat_template_kwargs"]),
+    "deepseek/deepseek-v4-pro": _E(1048576, 16384, True, vision=False),
+    "deepseek/deepseek-v4-pro-0813": _E(1048576, 16384, True, vision=False),
+    "deepseek/deepseek-v4-flash": _E(1048576, 16384, True, vision=False),
+    "deepseek/deepseek-v4-flash-0731": _E(1310720, 16384, True, vision=False),
+    "deepseek-ai/deepseek-r1": _E(128000, 16384, True, vision=False,
+                                  reasoning_options=["reasoning_effort", "reasoning_content"]),
+    "deepseek-ai/DeepSeek-R1": _E(128000, 16384, True, vision=False),
+    "deepseek-ai/deepseek-r1-0528": _E(163840, 16384, True, vision=False),
+    "deepseek-ai/deepseek-v3.2": _E(128000, 16384, False, vision=False),
+    "deepseek-ai/deepseek-v3.1": _E(128000, 16384, False, vision=False),
+    "deepseek-ai/deepseek-v3": _E(128000, 16384, False, vision=False),
+    "deepseek-ai/deepseek-v2.5": _E(128000, 8192, False, vision=False),
 
     # ─── Meta Llama (Groq, Together, Fireworks, Ollama, NIM) ─────────────────
-    "llama-3.3-70b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "meta-llama/llama-3.3-70b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "meta/llama-3.3-70b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "llama-3.1-405b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "meta-llama/llama-3.1-405b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "meta/llama-3.1-405b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "llama-3.1-70b-versatile": {"context": 131072, "output": 32768, "thinking": False, "thinking_type": None},
-    "llama-3.1-8b-instant": {"context": 131072, "output": 131072, "thinking": False, "thinking_type": None},
-    "llama-3.3-70b-versatile": {"context": 131072, "output": 32768, "thinking": False, "thinking_type": None},
+    "llama-3.3-70b-instruct": _E(128000, 8192, False, vision=False),
+    "meta-llama/llama-3.3-70b-instruct": _E(128000, 8192, False, vision=False),
+    "meta/llama-3.3-70b-instruct": _E(128000, 8192, False, vision=False),
+    "llama-3.1-405b-instruct": _E(128000, 8192, False, vision=False),
+    "meta-llama/llama-3.1-405b-instruct": _E(128000, 8192, False, vision=False),
+    "meta/llama-3.1-405b-instruct": _E(128000, 8192, False, vision=False),
+    "llama-3.1-70b-versatile": _E(131072, 32768, False, vision=False),
+    "llama-3.1-8b-instant": _E(131072, 131072, False, vision=False),
+    "llama-3.3-70b-versatile": _E(131072, 32768, False, vision=False),
     # Llama 4 family
-    "meta-llama/llama-4-scout-17b-16e-instruct": {"context": 512000, "output": 16384, "thinking": False, "thinking_type": None},
-    "meta-llama/llama-4-maverick-17b-128e-instruct": {"context": 1048576, "output": 16384, "thinking": False, "thinking_type": None},
-    "meta/llama-4-scout-17b-16e-instruct": {"context": 512000, "output": 16384, "thinking": False, "thinking_type": None},
-    "meta/llama-4-maverick-17b-128e-instruct": {"context": 1048576, "output": 16384, "thinking": False, "thinking_type": None},
+    "meta-llama/llama-4-scout-17b-16e-instruct": _E(512000, 16384, False, vision=True, video=False),
+    "meta-llama/llama-4-maverick-17b-128e-instruct": _E(1048576, 16384, False, vision=True, video=False),
+    "meta/llama-4-scout-17b-16e-instruct": _E(512000, 16384, False, vision=True, video=False),
+    "meta/llama-4-maverick-17b-128e-instruct": _E(1048576, 16384, False, vision=True, video=False),
 
     # ─── Mistral ─────────────────────────────────────────────────────────────
-    "mistral-large-latest": {"context": 262144, "output": 8192, "thinking": False, "thinking_type": None},
-    "mistral-large-2512": {"context": 262144, "output": 8192, "thinking": False, "thinking_type": None},
-    "mistral-medium-3-5": {"context": 262144, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "mistral-medium-latest": {"context": 262144, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "mistral-small-latest": {"context": 262144, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
-    "mistral-small-2603": {"context": 262144, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
-    "codestral-latest": {"context": 131072, "output": 8192, "thinking": False, "thinking_type": None},
-    "codestral-2508": {"context": 131072, "output": 8192, "thinking": False, "thinking_type": None},
-    "ministral-8b-2512": {"context": 262144, "output": 8192, "thinking": False, "thinking_type": None},
-    "mistral-medium": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "mistral-small": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "mistral-nemo": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "pixtral-large-latest": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
+    "mistral-large-latest": _E(262144, 8192, False, vision=False),
+    "mistral-large-2512": _E(262144, 8192, False, vision=False),
+    "mistral-medium-3-5": _E(262144, 16384, True, vision=False),
+    "mistral-medium-latest": _E(262144, 16384, True, vision=False),
+    "mistral-small-latest": _E(262144, 8192, True, vision=False),
+    "mistral-small-2603": _E(262144, 8192, True, vision=False),
+    "codestral-latest": _E(131072, 8192, False, vision=False),
+    "codestral-2508": _E(131072, 8192, False, vision=False),
+    "ministral-8b-2512": _E(262144, 8192, False, vision=False),
+    "mistral-medium": _E(128000, 8192, False, vision=False),
+    "mistral-small": _E(128000, 8192, False, vision=False),
+    "mistral-nemo": _E(128000, 8192, False, vision=False),
+    "pixtral-large-latest": _E(128000, 8192, False, vision=True, video=False),
 
     # ─── Qwen ────────────────────────────────────────────────────────────────
-    "qwen-2.5-coder-32b": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "qwen/qwen-2.5-coder-32b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "qwen-3-235b-a22b": {"context": 128000, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
-    "qwen/qwen-3-235b-a22b": {"context": 128000, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
-    "qwen/qwen3-next-80b-a3b-thinking": {"context": 262144, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "qwq-32b": {"context": 131072, "output": 32768, "thinking": True, "thinking_type": "reasoning_effort"},
-    "qwq-32b-preview": {"context": 32768, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
+    "qwen-2.5-coder-32b": _E(128000, 8192, False, vision=False),
+    "qwen/qwen-2.5-coder-32b-instruct": _E(128000, 8192, False, vision=False),
+    "qwen-3-235b-a22b": _E(128000, 8192, True, vision=False),
+    "qwen/qwen-3-235b-a22b": _E(128000, 8192, True, vision=False),
+    "qwen/qwen3-next-80b-a3b-thinking": _E(262144, 16384, True, vision=False),
+    "qwq-32b": _E(131072, 32768, True, vision=False),
+    "qwq-32b-preview": _E(32768, 8192, True, vision=False),
 
     # ─── xAI Grok ────────────────────────────────────────────────────────────
-    "grok-4.6": {"context": 500000, "output": 65536, "thinking": True, "thinking_type": "reasoning_effort"},
-    "grok-4.5": {"context": 500000, "output": 65536, "thinking": True, "thinking_type": "reasoning_effort"},
-    "grok-4.3": {"context": 1048576, "output": 65536, "thinking": True, "thinking_type": "reasoning_effort"},
-    "grok-4.20-0309-reasoning": {"context": 1048576, "output": 65536, "thinking": True, "thinking_type": "reasoning_effort"},
-    "grok-4.20-0309-non-reasoning": {"context": 1048576, "output": 65536, "thinking": False, "thinking_type": None},
-    "grok-3": {"context": 131072, "output": 16384, "thinking": False, "thinking_type": None},
-    "grok-3-mini": {"context": 131072, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "grok-2": {"context": 131072, "output": 8192, "thinking": False, "thinking_type": None},
-    "grok-beta": {"context": 131072, "output": 8192, "thinking": False, "thinking_type": None},
+    "grok-4.6": _E(500000, 65536, True, vision=True),
+    "grok-4.5": _E(500000, 65536, True, vision=True),
+    "grok-4.3": _E(1048576, 65536, True, vision=True),
+    "grok-4.20-0309-reasoning": _E(1048576, 65536, True, vision=True),
+    "grok-4.20-0309-non-reasoning": _E(1048576, 65536, False, vision=True),
+    "grok-3": _E(131072, 16384, False, vision=False),
+    "grok-3-mini": _E(131072, 16384, True, vision=False),
+    "grok-2": _E(131072, 8192, False, vision=False),
+    "grok-beta": _E(131072, 8192, False, vision=False),
 
     # ─── Cohere Command ──────────────────────────────────────────────────────
-    "command-a-reasoning-08-2025": {"context": 256000, "output": 32768, "thinking": True, "thinking_type": "thinking_token_budget"},
-    "command-a-plus-05-2026": {"context": 128000, "output": 65536, "thinking": True, "thinking_type": "thinking_token_budget"},
-    "command-a-03-2025": {"context": 256000, "output": 8192, "thinking": False, "thinking_type": None},
-    "command-r-plus": {"context": 128000, "output": 4096, "thinking": False, "thinking_type": None},
-    "command-r": {"context": 128000, "output": 4096, "thinking": False, "thinking_type": None},
+    "command-a-reasoning-08-2025": _E(256000, 32768, True, vision=True,
+                                      ttype="thinking_token_budget", reasoning_options=["thinking_token_budget"]),
+    "command-a-plus": _E(128000, 65536, True, vision=True,
+                         ttype="thinking_token_budget", reasoning_options=["thinking_token_budget"]),
+    "command-a-plus-05-2026": _E(128000, 65536, True, vision=True,
+                                 ttype="thinking_token_budget", reasoning_options=["thinking_token_budget"]),
+    "command-a-03-2025": _E(256000, 8192, False, vision=True),
+    "command-r-plus": _E(128000, 4096, False, vision=False),
+    "command-r": _E(128000, 4096, False, vision=False),
 
     # ─── Perplexity ──────────────────────────────────────────────────────────
-    "sonar-pro": {"context": 200000, "output": 8192, "thinking": False, "thinking_type": None},
-    "sonar": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "sonar-reasoning": {"context": 128000, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
-    "sonar-reasoning-pro": {"context": 128000, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
-    "sonar-deep-research": {"context": 128000, "output": 8192, "thinking": True, "thinking_type": "reasoning_effort"},
+    "sonar-pro": _E(200000, 8192, False, vision=False),
+    "sonar": _E(128000, 8192, False, vision=False),
+    "sonar-reasoning": _E(128000, 8192, True, vision=False,
+                          reasoning_options=["reasoning_effort"]),
+    "sonar-reasoning-pro": _E(128000, 8192, True, vision=False),
+    "sonar-deep-research": _E(128000, 8192, True, vision=False),
 
     # ─── NVIDIA NIM specific model IDs ───────────────────────────────────────
-    "nvidia/nemotron-3-ultra-550b-a55b": {"context": 262144, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "nvidia/nemotron-3-super-120b-a12b": {"context": 262144, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "nvidia/nemotron-3-nano-30b-a3b": {"context": 262144, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "nvidia/llama-3.1-nemotron-ultra-253b-v1": {"context": 131072, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "nvidia/llama-3.1-nemotron-nano-8b-v1": {"context": 131072, "output": 8192, "thinking": False, "thinking_type": None},
-    "nvidia/nvidia-nemotron-nano-9b-v2": {"context": 131072, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "nvidia/deepseek-ai/deepseek-r1": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "nvidia/nemotron-4-340b-instruct": {"context": 4096, "output": 4096, "thinking": False, "thinking_type": None},
+    "nvidia/nemotron-3-ultra-550b-a55b": _E(262144, 16384, True, vision=False,
+                                            reasoning_options=["reasoning_effort"]),
+    "nvidia/nemotron-3-super-120b-a12b": _E(262144, 16384, True, vision=False),
+    "nvidia/nemotron-3-nano-30b-a3b": _E(262144, 16384, True, vision=False),
+    "nvidia/llama-3.1-nemotron-ultra-253b-v1": _E(131072, 16384, True, vision=False),
+    "nvidia/llama-3.1-nemotron-nano-8b-v1": _E(131072, 8192, False, vision=False),
+    "nvidia/nvidia-nemotron-nano-9b-v2": _E(131072, 16384, True, vision=False),
+    "nvidia/deepseek-ai/deepseek-r1": _E(128000, 16384, True, vision=False),
+    "nvidia/nemotron-4-340b-instruct": _E(4096, 4096, False, vision=False),
 
     # ─── Together AI popular models ──────────────────────────────────────────
-    "together/deepseek-r1": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "together/qwen-2.5-coder-32b-instruct": {"context": 128000, "output": 8192, "thinking": False, "thinking_type": None},
-    "together/deepseek-v4-pro": {"context": 1048576, "output": 16384, "thinking": True, "thinking_type": "reasoning_toggle"},
-    "moonshotai/kimi-k3": {"context": 1048576, "output": 16384, "thinking": True, "thinking_type": "reasoning_toggle"},
-    "zai-org/glm-5.2": {"context": 524288, "output": 16384, "thinking": True, "thinking_type": "reasoning_toggle"},
-    "minimaxai/minimax-m2.7": {"context": 524288, "output": 16384, "thinking": True, "thinking_type": "reasoning_toggle"},
-    "minimaxai/minimax-m3": {"context": 524288, "output": 16384, "thinking": True, "thinking_type": "reasoning_toggle"},
+    "together/deepseek-r1": _E(128000, 16384, True, vision=False),
+    "together/qwen-2.5-coder-32b-instruct": _E(128000, 8192, False, vision=False),
+    "together/deepseek-v4-pro": _E(1048576, 16384, True, vision=False,
+                                   ttype="reasoning_toggle", reasoning_options=["reasoning_toggle"]),
+    "moonshotai/kimi-k3": _E(1048576, 16384, True, vision=False,
+                             ttype="reasoning_toggle", reasoning_options=["reasoning_toggle"]),
+    "zai-org/glm-5.2": _E(524288, 16384, True, vision=False,
+                          ttype="reasoning_toggle", reasoning_options=["reasoning_toggle"]),
+    "z-ai/glm-5.3": _E(1310720, 16384, True, vision=False,
+                        ttype="chat_template_kwargs", reasoning_options=["chat_template_kwargs"]),
+    "z-ai/glm-5.3-flash": _E(1310720, 16384, True, vision=False,
+                              ttype="chat_template_kwargs", reasoning_options=["chat_template_kwargs"]),
+    "zai-org/glm-5.3": _E(1310720, 16384, True, vision=False,
+                          ttype="chat_template_kwargs", reasoning_options=["chat_template_kwargs"]),
+    "zai-org/glm-5.3-flash": _E(1310720, 16384, True, vision=False,
+                                ttype="chat_template_kwargs", reasoning_options=["chat_template_kwargs"]),
+    "minimaxai/minimax-m2.7": _E(524288, 16384, True, vision=False,
+                                 ttype="reasoning_toggle", reasoning_options=["reasoning_toggle"]),
+    "minimaxai/minimax-m3": _E(524288, 16384, True, vision=False,
+                               ttype="reasoning_toggle", reasoning_options=["reasoning_toggle"]),
 
     # ─── OpenRouter GPT-OSS (also on Groq / Together) ────────────────────────
-    "openai/gpt-oss-120b": {"context": 131072, "output": 65536, "thinking": True, "thinking_type": "reasoning_effort"},
-    "openai/gpt-oss-20b": {"context": 131072, "output": 65536, "thinking": True, "thinking_type": "reasoning_effort"},
+    "openai/gpt-oss-120b": _E(131072, 65536, True, vision=True),
+    "openai/gpt-oss-20b": _E(131072, 65536, True, vision=True),
 
     # ─── Fireworks popular models ────────────────────────────────────────────
-    "accounts/fireworks/models/deepseek-r1": {"context": 128000, "output": 16384, "thinking": True, "thinking_type": "reasoning_effort"},
-    "accounts/fireworks/models/deepseek-v3": {"context": 128000, "output": 16384, "thinking": False, "thinking_type": None},
+    "accounts/fireworks/models/deepseek-r1": _E(128000, 16384, True, vision=False),
+    "accounts/fireworks/models/deepseek-v3": _E(128000, 16384, False, vision=False),
 }
-
-# Reasoning-name hints used for future / unregistered models.
-REASONING_HINTS = (
-    "r1", "reasoner", "reasoning", "o1", "o3", "o4", "thinking", "thought", "qwq",
-    "gpt-5", "grok-4", "nemotron", "magistral", "muse",
-)
-
-# Vision-language name hints. Positive hints cover the known omni / VLM families
-# (OpenAI "4o / 4.1 / 5", all Gemini, all Claude, Grok-4, Pixtral, Llama-4, and
-# the common open VLMs); negative hints beat positives for text-only variants.
-VISION_POSITIVE_HINTS = (
-    "vision", "vlm", "multimodal", "omni", "4o", "gpt-4.1", "gpt-5", "pixtral",
-    "nvlm", "cogvlm", "llava", "moondream", "phi-4-vision", "salamandra",
-    "qwen2.5-vl", "qwen3-vl", "-vl", "minicpm-v", "internvl", "gemini", "claude",
-    "grok-4", "llama-4", "command-",
-    # Explicit multimodal families.
-    "muse", "gemma-3", "paligemma", "neva", "chameleon", "idefics", "molmo",
-    "fuyu", "ferret", "cambrian", "smolvlm",
-)
-VISION_NEGATIVE_HINTS = (
-    "text", "embedding", "embed", "dry", "slim", "nemotron",
-)
-
-
-def detect_vision_support(model_name: str, provider: str = "") -> bool:
-    """Best-effort vision-language capability detection for ANY model.
-
-    Priority: explicit registry override -> name heuristics (positive beats
-    absent; negative beats positive) -> provider family default (all Gemini
-    models are multimodal). Server-reported capabilities discovered from each
-    provider's ``/models`` endpoint override the heuristic in
-    ``resolve_model_spec_dynamic``.
-    """
-    name = (model_name or "").lower().strip()
-    prov = (provider or "").lower().strip()
-
-    entry = _lookup_registry(model_name)
-    if entry is not None and "vision" in entry:
-        return bool(entry["vision"])
-
-    if any(tok in name for tok in VISION_NEGATIVE_HINTS):
-        return False
-    if any(tok in name for tok in VISION_POSITIVE_HINTS):
-        return True
-    if prov in ("gemini", "google"):
-        return True
-    return False
 
 
 def _lookup_registry(model_name: str) -> Optional[Dict[str, Any]]:
-    """Bidirectional prefix/suffix match against the known-model catalog.
+    """Exact-id lookup against the bundled catalog.
 
-    Handles OpenRouter-style ``provider/model:tag`` names, bare model names,
-    and dashed-vs-dotted alias families."""
-    name = (model_name or "").lower().strip()
+    Handles OpenRouter ``provider/model:tag`` names, bare model names, and
+    dashed-vs-dotted alias families. No fuzzy/prefix matching on arbitrary
+    substrings — the id must actually be known.
+    """
+    name = (model_name or "").strip().lower()
+    if not name:
+        return None
     name_base = name.split(":")[0]
 
+    # Pass 1: exact match (preferred).
+    for k, v in KNOWN_MODEL_REGISTRY.items():
+        kl = k.lower()
+        if name == kl or name_base == kl or name == kl.replace(".", "-") or name_base == kl.replace(".", "-"):
+            return v
+
+    # Pass 2: suffix/prefix match (OpenRouter provider/model patterns).
     for k, v in KNOWN_MODEL_REGISTRY.items():
         kl = k.lower()
         if (
-            name == kl
-            or name_base == kl
-            or name.endswith(f"/{kl}")
+            name.endswith(f"/{kl}")
             or name_base.endswith(f"/{kl}")
             or kl.endswith(f"/{name}")
             or kl.endswith(f"/{name_base}")
-            or name == kl.replace(".", "-")
-            or name_base == kl.replace(".", "-")
         ):
             return v
     return None
 
 
-def detect_context_window(model_name: str, provider: str = "") -> int:
-    """
-    Dynamically measure the context window for ANY model (current or future).
-    Analyzes exact matches, explicit token naming indicators (-1m, -128k, etc.),
-    and model family defaults.
-    """
-    name = (model_name or "").lower().strip()
-    name_base = name.split(":")[0]  # Strip OpenRouter tags like :free, :nitro
+def _literal_context(model_name: str) -> Optional[int]:
+    """Extract a context window the model id literally declares.
 
-    # 1. Exact catalog match (bidirectional prefix/suffix)
-    entry = _lookup_registry(name)
-    if entry:
-        return entry["context"]
-
-    # 2. Extract explicit context tokens from model name suffix/infix
-    # Examples: llama-3.1-8b-instruct-128k, qwen-2.5-1m, gpt-4o-256k
+    Handles ``-128k``/``-256k``/``-1m``/``-2m`` style suffixes that are part of
+    the canonical model id (e.g. ``llama-4-256k-instruct``, ``qwen-3-512k``).
+    """
+    name = (model_name or "").lower()
     match_m = re.search(r"[-_]([1-9][0-9]?)\s*m\b", name)
     if match_m:
         return int(match_m.group(1)) * 1_000_000
-
     match_k = re.search(r"[-_]([1-9][0-9]{1,3})\s*k\b", name)
     if match_k:
         return int(match_k.group(1)) * 1_000
-
-    # 3. Model family heuristics for future models
-    if "gemini" in name:
-        return 1_048_576  # 1M for the 2.5+ / 3.x generation
-
-    if "claude" in name:
-        return 200_000  # Future Claude models: 200k base
-
-    if "gpt-4.1" in name or "gpt-4-1" in name:
-        return 1_047_576
-
-    if "gpt-5" in name or name.startswith("gpt-5"):
-        return 400_000
-
-    if any(p in name for p in ("o1", "o3", "o4")):
-        return 200_000
-
-    if "grok-4.20" in name or "grok-4.3" in name:
-        return 1_048_576
-
-    if "grok-4" in name:
-        return 500_000
-
-    if "v4-flash-0731" in name:
-        return 1_310_720
-
-    if "v4" in name and any(x in name for x in ("deepseek", "flash", "pro")):
-        return 1_048_576
-
-    if "deepseek-flash" in name or "deepseek-v4-pro" in name:
-        return 1_048_576
-
-    if "llama-4-maverick" in name:
-        return 1_048_576
-
-    if "llama-4-scout" in name or "llama-4" in name:
-        return 512_000
-
-    if "command-a" in name:
-        return 256_000 if "plus" not in name else 128_000
-
-    if "sonar-pro" in name:
-        return 200_000
-
-    if "mistral" in name and any(x in name for x in ("large", "medium", "small", "ministral")):
-        return 262_144
-
-    if "qwen-3" in name or "qwen3" in name:
-        return 1_000_000
-
-    if "v3.2" in name or "v3.1" in name:
-        return 163_840
-
-    if any(p in name for p in ("gpt-4", "llama-3", "qwen-2", "mistral", "deepseek", "grok")):
-        return 128_000
-
-    # 4. Provider-specific heuristics
-    prov = (provider or "").lower()
-    if prov == "gemini":
-        return 1_048_576
-    if prov == "anthropic":
-        return 200_000
-
-    # 5. Safe universal default
-    return 128_000
+    return None
 
 
-def _provider_dialect(thinking_type: Optional[str], name: str, provider: str) -> Optional[str]:
-    """Translate a canonical dialect to the exact one a provider understands.
-
-    An explicitly configured provider always wins over model-name inference,
-    because a model name like ``anthropic/claude-*`` served through OpenRouter
-    must use OpenRouter's ``reasoning`` object rather than Anthropic's
-    ``budget_tokens``."""
-    prov = (provider or "").lower().strip()
-    n = (name or "").lower()
-
-    if not thinking_type:
-        return None
-
-    if prov == "openrouter":
-        return "reasoning_object"
-    if prov == "together":
-        return "reasoning_toggle" if any(h in n for h in TOGETHER_REASONING_TOGGLE_HINTS) else "reasoning_effort"
-    if prov == "nvidia" or "nim" in prov:
-        # NVIDIA exposes per-model mechanisms; DeepSeek-V4 uses chat-template kwargs.
-        if "deepseek-v4" in n:
-            return "chat_template_kwargs"
-        return "reasoning_effort"
-    if prov in ("anthropic", "gemini", "cohere", "openai", "deepseek", "xai",
-                "mistral", "groq", "perplexity", "google", "nim", "fireworks", "ollama"):
-        if prov in ("anthropic",) or "claude" in n:
-            return "budget_tokens"
-        if prov in ("gemini", "google") or "gemini" in n:
-            return "thinking_budget"
-        if prov == "cohere" or "command" in n:
-            return "thinking_token_budget"
-        return "reasoning_effort"
-
-    # Unknown provider: infer the dialect from the model family name.
-    if "claude" in n:
-        return "budget_tokens"
-    if "gemini" in n:
-        return "thinking_budget"
-    if "command" in n:
-        return "thinking_token_budget"
-
-    # Leave known dialects as-is; anything unexpected normalizes to OpenAI-style.
-    return thinking_type if thinking_type in THINKING_DIALECTS else "reasoning_effort"
+def _has_marker(model_name: str, markers) -> Optional[bool]:
+    name = (model_name or "").lower()
+    hit = None
+    for m in markers:
+        if m in name:
+            hit = True
+    return hit
 
 
-def detect_thinking_support(model_name: str, provider: str = "") -> tuple[bool, Optional[str]]:
+# ─── Provider-level fallbacks (tier 5) ──────────────────────────────────────
+# Data, keyed by provider identity — NOT by model-family name. Applied only
+# when a model has no catalog entry and no literal markers. ``None`` context
+# means "no opinion" (falls through to the universal default).
+PROVIDER_FALLBACKS: Dict[str, Dict[str, Any]] = {
+    "gemini":     {"context": 1048576, "thinking": True,  "vision": True,  "video": True},
+    "google":     {"context": 1048576, "thinking": True,  "vision": True,  "video": True},
+    "anthropic":  {"context": 200000,  "thinking": True,  "vision": True,  "video": True},
+    "openai":     {"context": 128000,  "thinking": True,  "vision": True,  "video": False},
+    "xai":        {"context": 131072,  "thinking": True,  "vision": True,  "video": False},
+    "openrouter": {"context": 128000,  "thinking": False, "vision": False, "video": False},
+    "together":   {"context": 131072,  "thinking": False, "vision": False, "video": False},
+    "nvidia":     {"context": 131072,  "thinking": False, "vision": False, "video": False},
+    "nim":        {"context": 131072,  "thinking": False, "vision": False, "video": False},
+    "mistral":    {"context": 262144,  "thinking": False, "vision": False, "video": False},
+    "cohere":     {"context": 128000,  "thinking": False, "vision": False, "video": False},
+    "groq":       {"context": 131072,  "thinking": False, "vision": False, "video": False},
+    "deepseek":   {"context": 128000,  "thinking": False, "vision": False, "video": False},
+    "perplexity": {"context": 128000,  "thinking": False, "vision": False, "video": False},
+    "fireworks":  {"context": 128000,  "thinking": False, "vision": False, "video": False},
+    "ollama":     {"context": 65536,   "thinking": False, "vision": False, "video": False},
+    "opencode":   {"context": 400000,  "thinking": True,  "vision": True,  "video": False},
+    "mock":       {"context": 128000,  "thinking": False, "vision": False, "video": False},
+}
+
+# Canonical reasoning dialect per provider. This is what ``normalize_thinking_effort``
+# uses when a model advertises thinking but no server mechanism pinned it.
+PROVIDER_DIALECTS: Dict[str, str] = {
+    "anthropic": "budget_tokens",
+    "gemini": "thinking_budget",
+    "google": "thinking_budget",
+    "openai": "reasoning_effort",
+    "xai": "reasoning_effort",
+    "mistral": "reasoning_effort",
+    "groq": "reasoning_effort",
+    "deepseek": "reasoning_effort",
+    "perplexity": "reasoning_effort",
+    "fireworks": "reasoning_effort",
+    "ollama": "reasoning_effort",
+    "opencode": "reasoning_object",
+    "nvidia": "reasoning_effort",
+    "nim": "reasoning_effort",
+    "openrouter": "reasoning_object",
+    "together": "reasoning_effort",
+    "cohere": "thinking_token_budget",
+    "mock": "reasoning_effort",
+}
+
+
+def _provider_dialect(thinking_type: Optional[str], name: str, provider: str,
+                      reasoning_options: Optional[List[str]] = None) -> Optional[str]:
+    """Translate a canonical dialect to the exact one the provider understands.
+
+    The dialect is a property of the *provider* (its request schema), never of
+    the model family. A pinned ``thinking_type`` (server-advertised mechanism)
+    always wins; otherwise the provider map applies.
     """
-    Dynamically determine if a model supports thinking/reasoning effort
-    and what parameter structure (dialect) it requires.
+    if thinking_type and thinking_type in THINKING_DIALECTS:
+        return thinking_type
+
+    prov = (provider or "").lower().strip()
+    if prov in PROVIDER_DIALECTS:
+        return PROVIDER_DIALECTS[prov]
+    if thinking_type:
+        return thinking_type
+    return "reasoning_effort"
+
+
+def detect_context_window(model_name: str, provider: str = "") -> int:
+    """Resolve a model's context window, newest metadata first.
+
+    Catalog entry -> literal token-count suffix in the id -> provider fallback
+    -> conservative universal default. Never guesses from model *family*.
+    """
+    name = (model_name or "").strip()
+    name_base = (name or "").lower().split(":")[0]
+
+    entry = _lookup_registry(name)
+    if entry is not None and entry.get("context"):
+        return int(entry["context"])
+
+    lit = _literal_context(name_base)
+    if lit:
+        return lit
+
+    fallback = PROVIDER_FALLBACKS.get((provider or "").lower().strip())
+    if fallback and fallback.get("context"):
+        return int(fallback["context"])
+
+    return FALLBACK_CONTEXT
+
+
+def detect_thinking_support(model_name: str, provider: str = "") -> Tuple[bool, Optional[str]]:
+    """Resolve thinking support + request dialect for any model id.
+
+    Catalog pin -> literal reasoning marker in the id -> provider fallback.
+    The dialect comes from the provider (or the catalog pin), never from the
+    model family name.
+    """
+    name = (model_name or "").strip().lower()
+    prov = (provider or "").lower().strip()
+
+    entry = _lookup_registry(model_name)
+    if entry is not None:
+        thinking = bool(entry["thinking"])
+        if not thinking:
+            return False, None
+        pinned = entry.get("thinking_type")
+        if pinned in THINKING_DIALECTS:
+            return True, pinned
+        return True, _provider_dialect(entry["thinking_type"], name, prov, entry.get("reasoning_options"))
+
+    if _has_marker(name, REASONING_MARKERS):
+        return True, _provider_dialect(None, name, prov)
+
+    fallback = PROVIDER_FALLBACKS.get(prov)
+    if fallback and fallback.get("thinking"):
+        return True, _provider_dialect(None, name, prov)
+
+    return False, None
+
+
+def detect_vision_support(model_name: str, provider: str = "") -> bool:
+    """Resolve vision-language (image input) support for any model id.
+
+    Catalog pin -> literal modality marker in the id -> provider fallback -> False.
     """
     name = (model_name or "").lower().strip()
-    name_base = name.split(":")[0]
     prov = (provider or "").lower().strip()
 
-    # 1. Exact registry check
-    entry = _lookup_registry(name)
-    if entry is not None:
-        return entry["thinking"], _provider_dialect(entry["thinking_type"], name, provider)
+    entry = _lookup_registry(model_name)
+    if entry is not None and entry.get("vision") is not None:
+        return bool(entry["vision"])
 
-    # 2. Heuristic detection of reasoning patterns in current and future models
-    is_reasoning = any(token in name for token in REASONING_HINTS)
+    sig = _has_marker(name, VISION_MARKERS)
+    if sig:
+        return sig
+    for neg in ("embedding", "embed", "-dry", "-slim", "-textonly"):
+        if neg in name:
+            return False
 
-    if not is_reasoning and ("claude-3-7" in name or "claude-4" in name or "claude-sonnet-4" in name):
-        is_reasoning = True
+    fallback = PROVIDER_FALLBACKS.get(prov)
+    if fallback and fallback.get("vision"):
+        return True
+    return False
 
-    if not is_reasoning and ("gemini-2.5" in name or "gemini-3" in name):
-        is_reasoning = True
 
-    if not is_reasoning:
-        return False, None
+# Provider families/APIs that accept native image+video input alongside text.
+VIDEO_CAPABLE_PROVIDERS = ("gemini", "google", "anthropic", "nvidia", "nim")
 
-    # Determine canonical parameter format, then normalize to the provider dialect.
-    if "claude" in name:
-        canonical = "budget_tokens"
-    elif "gemini" in name:
-        canonical = "thinking_budget"
-    elif "command" in name:
-        canonical = "thinking_token_budget"
-    else:
-        canonical = "reasoning_effort"
 
-    return True, _provider_dialect(canonical, name, provider)
+def _model_supports_video(model_name: str, provider: str) -> bool:
+    """Video input follows the same data-driven tiers as vision."""
+    name = (model_name or "").lower().strip()
+    prov = (provider or "").lower().strip()
+
+    entry = _lookup_registry(model_name)
+    if entry is not None and entry.get("video") is not None:
+        return bool(entry["video"])
+
+    if _has_marker(name, VIDEO_MARKERS):
+        return True
+
+    fallback = PROVIDER_FALLBACKS.get(prov)
+    if fallback and fallback.get("video"):
+        return True
+    return False
 
 
 def inspect_model(model_name: str, provider: str = "") -> ModelSpec:
+    """Generate a complete ``ModelSpec`` for any model id and provider.
+
+    Network-free: bundled catalog + literal markers + provider fallbacks +
+    universal default. Live provider metadata is merged on top by
+    ``discovery.resolve_model_spec_dynamic``.
     """
-    Generate complete ModelSpec for any given model name and provider.
-    Uses the static catalog's output limits when present, heuristics otherwise.
-    """
-    clean_name = model_name.strip()
+    clean_name = (model_name or "").strip()
     context = detect_context_window(clean_name, provider)
     supports_thinking, thinking_type = detect_thinking_support(clean_name, provider)
 
-    # Prefer catalog output limits; fall back to heuristics for unknown models.
-    max_output: Optional[int] = None
     entry = _lookup_registry(clean_name)
+
+    # Output limit: catalog pin -> proportional heuristic based on context.
+    max_output: Optional[int] = None
     if entry is not None and entry.get("output"):
         max_output = int(entry["output"])
-
     if not max_output:
-        if "claude-3-7" in clean_name.lower() or "claude-sonnet-4" in clean_name.lower():
-            max_output = 64000
-        elif any(k in clean_name.lower() for k in ("o1", "o3", "o4")):
-            max_output = 100000
-        elif "gpt-5" in clean_name.lower():
-            max_output = 128000
-        elif any(k in clean_name.lower() for k in ("o1-preview", "o1-mini", "gemini-2.5", "r1")):
-            max_output = 32768
-        elif context >= 1000000:
+        if context >= 1_000_000:
             max_output = 65536
-        elif context >= 128000:
+        elif context >= 128_000:
             max_output = 16384
-        else:
+        elif context >= 32_000:
             max_output = 8192
+        else:
+            max_output = 4096
+
+    reasoning_options = list(entry.get("reasoning_options") or []) if entry else []
+
+    source = "catalog"
+    if entry is None:
+        if _literal_context(clean_name) is not None or _has_marker(clean_name, REASONING_MARKERS) or _has_marker(clean_name, VISION_MARKERS):
+            source = "literal"
+        elif (provider or "").lower().strip() in PROVIDER_FALLBACKS:
+            source = "provider"
+        else:
+            source = "default"
 
     return ModelSpec(
         name=clean_name,
@@ -517,24 +616,6 @@ def inspect_model(model_name: str, provider: str = "") -> ModelSpec:
         supports_tools=True,
         supports_vision=detect_vision_support(clean_name, provider),
         supports_video=_model_supports_video(clean_name, provider),
+        reasoning_options=reasoning_options,
+        source=source,
     )
-
-
-# Provider families that accept native video input alongside images.
-VIDEO_CAPABLE_PROVIDERS = ("gemini", "google", "anthropic", "nvidia", "nim")
-
-
-def _model_supports_video(model_name: str, provider: str) -> bool:
-    """Video input requires a provider that natively accepts media blobs.
-
-    Gemini (inline_data), Anthropic (base64 video blocks), and NVIDIA NIM
-    (``input_video`` content) all accept inline video. Generic OpenAI-style
-    completions endpoints have no standard video schema, so they opt out.
-    """
-    prov = (provider or "").lower().strip()
-    if prov in VIDEO_CAPABLE_PROVIDERS:
-        return True
-    name = (model_name or "").lower()
-    if prov in ("openrouter",) and "gemini" in name and ("video" in name or "gemini-2" in name):
-        return True
-    return False

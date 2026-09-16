@@ -13,6 +13,7 @@ from rich.text import Text
 from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.table import Table
+from harness.providers.base import probe_effort_options
 from harness.themes import Theme, get_theme, THEMES, render_theme_preview
 from harness.sysinfo import get_ram_usage_mb
 
@@ -534,23 +535,34 @@ class TerminalRenderer:
 
     def print_models_catalog(self, provider_name: str, models_data: List[Dict[str, Any]]):
         """Display catalog of available models for provider."""
-        table = Table(title=f"🤖 Models for Provider: {provider_name.upper()}", border_style=self.theme.border)
-        table.add_column("Model Name", style=f"bold {self.theme.primary}")
-        table.add_column("Context Window", justify="right")
-        table.add_column("Max Output", justify="right")
+        table = Table(title=f"Models for Provider: {provider_name.upper()}", border_style=self.theme.border)
+        table.add_column("Model", style=f"bold {self.theme.primary}", no_wrap=False)
+        table.add_column("Context", justify="right")
+        table.add_column("Output", justify="right")
         table.add_column("Vision", justify="center")
-        table.add_column("Thinking Support", justify="center")
-        table.add_column("Reasoning Format", style="dim")
+        table.add_column("Thinking", justify="center")
+        table.add_column("Effort Levels", justify="left")
+        table.add_column("Budget", justify="center")
 
         for m in models_data:
-            c_win = f"{m['context']:,} tokens"
-            vision_badge = "[bold cyan]👁 Yes[/bold cyan]" if m.get("vision") else "[dim]No[/dim]"
-            th_badge = "[bold green]✔ Yes[/bold green]" if m["thinking"] else "[dim]No[/dim]"
-            ttype = m["thinking_type"] or "-"
-            table.add_row(m["name"], c_win, f"{m['output']:,}", vision_badge, th_badge, ttype)
+            c_win = f"{m['context']:,}"
+            vision_badge = "[bold cyan]Yes[/bold cyan]" if m.get("vision") else "[dim]No[/dim]"
+            th_badge = "[bold green]Yes[/bold green]" if m["thinking"] else "[dim]No[/dim]"
+            ttype = m.get("thinking_type")
+
+            # Dynamically probe what effort names this dialect accepts
+            if not m["thinking"]:
+                effort_str = "-"
+                budget_badge = "-"
+            else:
+                options = probe_effort_options(ttype)
+                effort_str = ", ".join(options) if options else "-"
+                budget_badge = "[bold yellow]Yes[/bold yellow]" if "<n>" in options else "[dim]No[/dim]"
+
+            table.add_row(m["name"], c_win, f"{m['output']:,}", vision_badge, th_badge, effort_str, budget_badge)
 
         self.console.print(table)
-        self.console.print(f"[dim]Switch model: `/model <name>`[/dim]\n")
+        self.console.print(f"[dim]Switch: /model <name> | Effort: /effort <level>[/dim]\n")
 
     def print_markdown(self, md_text: str):
         self.console.print(Markdown(md_text, code_theme=self.theme.code_theme))
