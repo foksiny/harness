@@ -414,13 +414,27 @@ class Compactor:
         text = None
         if self._use_llm_summary():
             try:
-                text = self.summarize_fn(group)  # type: ignore[misc]
+                text = self.summarize_fn([self._strip_reasoning(m) for m in group])  # type: ignore[misc]
             except Exception:
                 text = None
         if not text or not text.strip():
             text = self._digest_group_heuristic(group)
         header = f"### [CONTEXT SUMMARY: {len(group)} prior message(s) compacted]\n\n"
         return {"role": "assistant", "content": header + text.strip()}
+
+    @staticmethod
+    def _strip_reasoning(msg: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a copy of ``msg`` with verbose ``reasoning_content`` removed.
+
+        Reasoning is high-volume and low-value once a turn is being summarized;
+        the digest preserves the user goal, tool decisions and outcomes, so the
+        raw chain-of-thought adds little for the cost.
+        """
+        if "reasoning_content" not in msg:
+            return msg
+        out = dict(msg)
+        out["reasoning_content"] = None
+        return out
 
     def _digest_group_heuristic(self, group: List[Dict[str, Any]]) -> str:
         info = self._extract(group)

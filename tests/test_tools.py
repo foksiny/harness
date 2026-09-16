@@ -86,17 +86,34 @@ class TestTools(unittest.TestCase):
         self.assertIn("code 0", res)
 
     def test_run_command_delivers_full_output_without_truncation(self):
-        # Agent-facing results must NOT be truncated in the tool layer — display
-        # truncation happens only in the TUI renderer.
+        # Default behavior caps runaway output at the context-budget limit (16k
+        # chars) with a transparent marker; the agent can recover the full output
+        # by passing max_chars.
         pm = PermissionManager(PermissionLevel.FULL)
         cmd_tool = RunCommandTool(pm)
         res = cmd_tool.execute(
             "for i in $(seq 1 5000); do printf 'L%05d_abcdefghij\\n' $i; done"
         )
-        # Old cap was 15000 chars; full output must be preserved for the agent.
-        self.assertGreater(len(res), 15000)
         self.assertIn("L00001_abcdefghij", res)
-        self.assertIn("L05000_abcdefghij", res)
+        # Default cap kicked in — head preserved, tail elided with a marker.
+        self.assertIn("output truncated by context budget", res)
+        self.assertNotIn("L05000_abcdefghij", res)
+
+        # Explicit max_chars recovers the full output (agent opt-in).
+        full = cmd_tool.execute(
+            "for i in $(seq 1 5000); do printf 'L%05d_abcdefghij\\n' $i; done",
+            max_chars=10 ** 7,
+        )
+        self.assertGreater(len(full), 20000)
+        self.assertIn("L00001_abcdefghij", full)
+        self.assertIn("L05000_abcdefghij", full)
+
+    def test_run_command_short_output_untouched(self):
+        pm = PermissionManager(PermissionLevel.FULL)
+        cmd_tool = RunCommandTool(pm)
+        res = cmd_tool.execute("echo 'short output'")
+        self.assertIn("short output", res)
+        self.assertNotIn("output truncated", res)
 
     def test_todo_lifecycle(self):
         mgr = TodoManager()

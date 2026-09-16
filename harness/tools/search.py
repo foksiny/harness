@@ -9,6 +9,9 @@ import subprocess
 from pathlib import Path
 from typing import Dict, Any, Optional
 from harness.tools.base import Tool
+from harness.core.context_budget import DEFAULT_OUTPUT_LIMITS, truncate_output
+
+_GREP_MAX_CHARS = int(DEFAULT_OUTPUT_LIMITS.get("grep_search", 8000))
 
 def find_rg_binary() -> Optional[str]:
     """Locate rg in PATH or ~/.cargo/bin."""
@@ -32,11 +35,12 @@ class GrepSearchTool(Tool):
             "path": {"type": "string", "description": "Directory or file to search within (default: '.')."},
             "case_sensitive": {"type": "boolean", "description": "Case-sensitive search (default: false)."},
             "max_results": {"type": "integer", "description": "Maximum number of results to return (default: 50)."},
+            "max_chars": {"type": "integer", "description": "Max chars of output to return (default ~8000)."},
         },
         "required": ["query"],
     }
 
-    def execute(self, query: str, path: str = ".", case_sensitive: bool = False, max_results: int = 50, **kwargs) -> str:
+    def execute(self, query: str, path: str = ".", case_sensitive: bool = False, max_results: int = 50, max_chars: Optional[int] = None, **kwargs) -> str:
         target = Path(path).expanduser().resolve()
         rg_bin = find_rg_binary()
 
@@ -53,7 +57,7 @@ class GrepSearchTool(Tool):
                     if len(lines) > max_results * 2:
                         lines = lines[:max_results * 2]
                         lines.append(f"... (truncated at {max_results} results)")
-                    return "\n".join(lines)
+                    return self._limit("\n".join(lines), max_chars)
                 return f"No matches found for '{query}' in '{path}'."
             except Exception:
                 pass # Fallback to python search
@@ -85,6 +89,16 @@ class GrepSearchTool(Tool):
 
             if not matches:
                 return f"No matches found for '{query}' in '{path}'."
-            return f"Found {len(matches)} match(es):\n" + "\n".join(matches)
+            return self._limit(f"Found {len(matches)} match(es):\n" + "\n".join(matches), max_chars)
         except Exception as ex:
             return f"Error executing search: {str(ex)}"
+
+    def _limit(self, text: str, max_chars: Optional[int] = None) -> str:
+        cap = _GREP_MAX_CHARS if max_chars is None else int(max_chars)
+        if cap > 0 and len(text) > cap:
+            return truncate_output(text, cap, marker_note=(
+                f"...[output truncated by context budget: was {len(text)} chars, "
+                f"keeping first {cap}]... (pass max_chars={len(text)} to this "
+                f"grep_search call for the full result)"
+            ))
+        return text

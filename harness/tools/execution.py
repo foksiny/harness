@@ -8,6 +8,9 @@ import subprocess
 from typing import Dict, Any, Optional
 from harness.tools.base import Tool
 from harness.core.permissions import PermissionManager, RiskLevel, analyze_command_risk
+from harness.core.context_budget import DEFAULT_OUTPUT_LIMITS, truncate_output
+
+_RUN_MAX_CHARS = int(DEFAULT_OUTPUT_LIMITS.get("run_command", 16000))
 
 class RunCommandTool(Tool):
     name = "run_command"
@@ -20,6 +23,7 @@ class RunCommandTool(Tool):
             "command": {"type": "string", "description": "The exact bash command line to execute."},
             "timeout": {"type": "integer", "description": "Timeout in seconds (default: 60, max: 300)."},
             "cwd": {"type": "string", "description": "Working directory for the command (optional)."},
+            "max_chars": {"type": "integer", "description": "Max chars of combined output to return (default ~16000; pass a larger value to capture verbose output in full)."},
         },
         "required": ["command"],
     }
@@ -27,7 +31,7 @@ class RunCommandTool(Tool):
     def __init__(self, permission_manager: Optional[PermissionManager] = None):
         self.permission_manager = permission_manager
 
-    def execute(self, command: str, timeout: int = 60, cwd: Optional[str] = None, **kwargs) -> str:
+    def execute(self, command: str, timeout: int = 60, cwd: Optional[str] = None, max_chars: Optional[int] = None, **kwargs) -> str:
         cmd = command.strip()
         work_dir = cwd or os.getcwd()
 
@@ -79,9 +83,17 @@ class RunCommandTool(Tool):
             if not out and not err:
                 res.append("(No output produced)")
 
-            # Full output is delivered to the agent untouched — display-level
-            # truncation happens only in the TUI renderer.
-            return "\n".join(res)
+            combined = "\n".join(res)
+            # Proactive context-budget cap. The agent can pass max_chars to
+            # capture verbose output in full (e.g. test suites / benchmarks).
+            cap = _RUN_MAX_CHARS if max_chars is None else int(max_chars)
+            if cap > 0 and len(combined) > cap:
+                return truncate_output(combined, cap, marker_note=(
+                    f"...[output truncated by context budget: was {len(combined)} chars, "
+                    f"keeping first {cap}]... (pass max_chars={len(combined)} to this "
+                    f"run_command call to capture the full output)"
+                ))
+            return combined
 
         except subprocess.TimeoutExpired:
             return f"Error: Command timed out after {t_limit} seconds: `{cmd}`"

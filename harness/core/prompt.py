@@ -7,8 +7,9 @@ import os
 import platform
 import time
 import subprocess
+import threading
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from harness.core.modes import Mode
 from harness.core.permissions import PermissionLevel
 
@@ -56,8 +57,23 @@ Agent swarms are ACTIVE. You are expected to delegate aggressively but sensibly.
 
 """
 
+_git_cache_lock = threading.Lock()
+_git_cache: Dict[str, Tuple[float, str]] = {}
+
+# TTL for the cached git summary — long enough to avoid subprocess churn on every
+# single turn (git status can be surprisingly slow on big repos), short enough to
+# stay truthful when the agent is actively editing files.
+_GIT_CACHE_TTL = 2.0
+
+
 def get_git_info() -> str:
-    """Retrieve active git branch and status if inside repository."""
+    """Retrieve active git branch and status if inside repository (cached)."""
+    cwd = os.getcwd()
+    now = time.monotonic()
+    with _git_cache_lock:
+        cached = _git_cache.get(cwd)
+        if cached and now - cached[0] < _GIT_CACHE_TTL:
+            return cached[1]
     try:
         branch = subprocess.check_output(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -68,9 +84,18 @@ def get_git_info() -> str:
             stderr=subprocess.DEVNULL, timeout=1
         ).decode().strip()
         diff_count = len([l for l in status.split("\n") if l.strip()])
-        return f"Git: branch `{branch}` ({diff_count} uncommitted changes)"
+        result = f"Git: branch `{branch}` ({diff_count} uncommitted changes)"
     except Exception:
-        return "Git: not a repository or git unavailable"
+        result = "Git: not a repository or git unavailable"
+    with _git_cache_lock:
+        _git_cache[cwd] = (time.monotonic(), result)
+    return result
+
+
+def clear_git_info_cache() -> None:
+    """Invalidate the cached git summary (used in tests / after big mutations)."""
+    with _git_cache_lock:
+        _git_cache.clear()
 
 def load_project_rules() -> str:
     """Load project-specific custom instructions if available."""
@@ -105,7 +130,14 @@ class SystemPromptBuilder:
         custom_instructions: Optional[str] = None,
         swarm_enabled: bool = False,
         learned_lessons: str = "",
+        degrade_verbose: bool = False,
     ) -> str:
+        """Assemble the system prompt.
+
+        ``degrade_verbose`` drops the low-value-but-verbose MCP tool summaries
+        when the model is nearly out of context, so the system prompt cannot
+        itself starve the context window in a tight budget.
+        """
         cwd = workspace_dir or os.getcwd()
         now_str = time.strftime("%Y-%m-%d %H:%M:%S %Z")
         git_info = get_git_info()
@@ -173,6 +205,10 @@ class SystemPromptBuilder:
 
         # 5. MCP Servers
         if mcp_tools_summary:
+            if degrade_verbose:
+                # In tight budgets drop the verbose per-tool MCP summaries,
+                # keeping only a one-line existence note.
+                mcp_tools_summary = self._shrink_mcp(mcp_tools_summary)
             sections.append(f"\n## MODEL CONTEXT PROTOCOL (MCP) INTEGRATION:\n{mcp_tools_summary}")
 
         # 6. Active To-Dos
@@ -188,3 +224,9 @@ class SystemPromptBuilder:
             sections.append(f"\n## USER OVERRIDE INSTRUCTIONS:\n{custom_instructions}")
 
         return "\n".join(sections)
+
+    @staticmethod
+    def _shrink_mcp(mcp_summary: str) -> str:
+        """Collapse an MCP integration summary to a minimal existence note."""
+        first_line = mcp_summary.strip().splitlines()[0] if mcp_summary.strip() else "MCP servers configured"
+        return f"{first_line}\n- (tool summaries elided to conserve context budget)"

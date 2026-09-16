@@ -17,6 +17,9 @@ from typing import Dict, Any, Optional, Tuple, List
 from harness.tools.base import Tool
 from harness.core.permissions import PermissionManager, RiskLevel
 from harness.computer.sandbox import execute_sandboxed, detect_sandbox_backend, SandboxResult
+from harness.core.context_budget import DEFAULT_OUTPUT_LIMITS, truncate_output
+
+_PYEXEC_MAX_CHARS = int(DEFAULT_OUTPUT_LIMITS.get("execute_python", 16000))
 
 # AST safety flags (informational - sandbox provides real isolation)
 DANGEROUS_MODULES = {
@@ -109,6 +112,7 @@ class ExecutePythonTool(Tool):
             "code": {"type": "string", "description": "The Python code to execute."},
             "timeout": {"type": "integer", "description": "Execution timeout in seconds (default: 30, max: 120)."},
             "network": {"type": "boolean", "description": "Allow network access (default: false)."},
+            "max_chars": {"type": "integer", "description": "Max chars of combined output to return (default ~16000)."},
         },
         "required": ["code"],
     }
@@ -116,7 +120,7 @@ class ExecutePythonTool(Tool):
     def __init__(self, permission_manager: Optional[PermissionManager] = None):
         self.permission_manager = permission_manager
 
-    def execute(self, code: str, timeout: int = 30, network: bool = False, **kwargs) -> str:
+    def execute(self, code: str, timeout: int = 30, network: bool = False, max_chars: Optional[int] = None, **kwargs) -> str:
         code_str = code.strip()
         if not code_str:
             return "Error: Empty Python code provided."
@@ -163,4 +167,13 @@ class ExecutePythonTool(Tool):
         if flags:
             res.append(f"--- AST FLAGS ---\n{chr(10).join(flags)}")
 
-        return "\n".join(res)
+        combined = "\n".join(res)
+        # Proactive context-budget cap; the agent can request the full output.
+        cap = _PYEXEC_MAX_CHARS if max_chars is None else int(max_chars)
+        if cap > 0 and len(combined) > cap:
+            return truncate_output(combined, cap, marker_note=(
+                f"...[output truncated by context budget: was {len(combined)} chars, "
+                f"keeping first {cap}]... (pass max_chars={len(combined)} to this "
+                f"execute_python call to capture the full output)"
+            ))
+        return combined

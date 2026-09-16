@@ -1,7 +1,7 @@
 # Harness ⚡
 
 > **The Premier Agentic AI Engineering Harness & CLI**
-> Built for developers, autonomous AI workflows, and software engineers who demand speed, low memory (<25MB RAM), subagent orchestration, and multi-provider intelligence.
+> Built for developers, autonomous AI workflows, and software engineers who demand speed, low memory (~24MB RAM), subagent orchestration, and multi-provider intelligence.
 
 ```
 ██╗  ██╗ █████╗ ██████╗ ███╗   ██╗███████╗███████╗███████╗
@@ -16,7 +16,7 @@
 
 ## ✨ Key Features
 
-- 🏎️ **Ultra-Fast & Low Memory**: Benchmarked **~88ms cold start**, **~24MB RSS** — no heavy framework bloat.
+- 🏎️ **Ultra-Fast & Low Memory**: Benchmarked **~60ms cold start**, **~24MB RSS** — no heavy framework bloat.
 - 🧠 **Dynamic Thinking Effort & Context Window Detection**:
   - Resolves context window limits and reasoning parameters for **any current or future model** via 5-level priority: explicit registry (200+ models) → provider `/models` endpoint → model name tokens (`-1m`, `-128k`) → model family heuristics → safe default (128k). Registry covers GPT-5, Claude 4.5, Gemini 2.5, Grok 4, DeepSeek V4, and Command-A generations.
   - Provider-aware **thinking dialects**: Claude budget tokens, Gemini thinking budget (incl. `includeThoughts`), OpenAI/xAI/Mistral/Groq/Perplexity/DeepSeek reasoning effort, OpenRouter `reasoning` object, Together hybrid reasoning toggle, NVIDIA NIM DeepSeek-V4 `chat_template_kwargs`, and Cohere `thinking.token_budget`.
@@ -91,8 +91,8 @@ When a delegation finishes, the report you receive already includes each agent's
 - 📋 **Integrated To-Do Tracking (`todo_create`, `todo_update`, `todo_list`)**:
   - Real-time task planning and HUD progress reporting (`3/5 completed`).
   - **Persistent across sessions**: task state is saved into the session file on every save and restored on resume, so long-running projects survive restarts.
-- 🧩 **Extensible Skills & 11 Built-in Skills**:
-  - Discovers skills from `~/.harness/skills/` and `.harness/skills/`.
+- 🧩 **Extensible Skills & 10 Built-in Skills**:
+  - Discovers skills from `~/.harness/skills/` and `.harness/skills/` on top of the 10 built-ins.
   - Includes specialized **`skill_creator`** (generates and installs new skills on user request) and **`mcp_integrator`** (connects and configures MCP servers on user request).
 - 🧠 **Continuous Learning & Self-Improvement**:
   - The agent transparently learns across sessions: `learn_record` / `learn_recall` / `learn_promote` let it (and you, via `/learn`) persist reusable lessons, inject top matches into every system prompt, and promote matured lessons into real skills.
@@ -101,9 +101,15 @@ When a delegation finishes, the report you receive already includes each agent's
   - Supports `stdio` and `sse` JSON-RPC 2.0 servers configured in `mcp.json`.
 - 🎨 **14 Handcrafted Visual Themes**:
   - `cyberpunk` (default neon), `dracula`, `nord`, `monokai`, `catppuccin`, `matrix`, `minimal`, `amber_crt`, `gruvbox`, `one_dark`, `rose_pine`, `solarized_dark`, `synthwave`, `tokyo_night`.
+- 🧠 **Proactive Context-Budget Management**:
+  - Beyond reactive compaction, Harness now guards the window **proactively** so it is much harder for the agent to fill its own context log:
+    - **Per-tool output caps** clamp runaway results at the source (`view_file` ~8k chars, `run_command` ~16k, `grep_search` ~8k, `execute_python` ~16k, …) with a transparent truncation marker. The agent can still request the full payload by passing an explicit `max_chars`.
+    - **Pre-send pressure check** runs before every provider call. When usage approaches the threshold it compacts *before* the model is asked to respond (and emergency-trims at the hard cap) — not only at turn boundaries.
+    - **Reasoning-stripping**: verbose `reasoning_content` from old turns being summarized is stripped, recovering large amounts of tokens; the recent working set keeps its reasoning verbatim.
+    - **Context-aware system prompt**: verbose MCP tool summaries are elided when the window is tight, and `git status` lookups are cached (2s TTL) so prompt assembly stays fast.
 - 📦 **Smart Auto-Compaction**:
   - Budget-driven, graduated context compaction. When usage crosses the warning threshold (default 75%), the sampler dials back pressure in three sweeps: oversized verbatim tool payloads are collapsed to head/tail digests, the oldest turn-groups are condensed into structured memory checkpoints down to the target budget (default 60%), and a single global checkpoint is emitted if the window is still hot. Recently-used turns stay verbatim, and undo/redo (`/checkpoint`) can restore the pre-compaction history.
-  - Uses the LLM itself to summarize when a provider is live (`compact_summary`), falling back to a heuristic extractor otherwise. A peak-hold hysteresis guard prevents re-firing every turn, and a mid-turn emergency trim collapses old blobs (never current-turn text) if usage races past the hard cap (~95%). Inspect everything with `/compact` and `/tokens`.
+  - Uses the LLM itself to summarize when a provider is live (`compact_summary`), falling back to a heuristic extractor otherwise. A peak-hold hysteresis guard prevents re-firing every turn, and the proactive pre-send gauge plus a mid-turn emergency trim collapse old blobs (never current-turn text) if usage races past the hard cap (~95%). Inspect everything with `/compact` and `/tokens`.
 
 ---
 
@@ -175,7 +181,7 @@ cat logs/error.log | harness "Diagnose this stack trace"
 
 ---
 
-## 🛠️ Built-in Skills (11 Total)
+## 🛠️ Built-in Skills (10 Total)
 
 1. **`skill_creator`**: Autonomous skill generator — writes and registers new skills on user request.
 2. **`mcp_integrator`**: Autonomous MCP configurator — connects and verifies external MCP servers.
@@ -187,6 +193,10 @@ cat logs/error.log | harness "Diagnose this stack trace"
 8. **`docker_deploy`**: Multi-stage Dockerfiles and container orchestration.
 9. **`performance_profiler`**: Latency, memory leak diagnosis, and caching strategies.
 10. **`documentation_writer`**: Architecture RFCs, user guides, and API references.
+
+> Note: the catalog also auto-discovers **workspace** (`~/.harness/skills/`, `.harness/skills/`)
+> and **promoted global** skills on top of these 10 built-ins — on this machine it currently
+> resolves to **15 total** skills (see `/skills`).
 
 ---
 
@@ -308,20 +318,23 @@ details, so you can configure everything without leaving Discord.
 
 ## 🧪 Testing
 
-Harness comes with an automated test suite (294+ tests across 21 files):
+Harness ships with a comprehensive automated test suite (**331 tests across 23 files**):
 ```bash
+python3 -m unittest discover -s tests -v      # primary runner (recommended)
+# or, equivalently:
 python3 -m pytest tests/ -v
 ```
 
-The suite verifies tools, sandboxed execution, model context window detection, provider payloads, compaction, subagent/swarm parallelism, checkpoints, skills, learning, and slash commands.
+The suite verifies tools, tool output caps / proactive context budgeting, sandboxed execution, model context window detection, provider payloads, graduated compaction + reasoning stripping, subagent/swarm parallelism, checkpoints, skills, learning, slash commands, and the Discord integration.
 
 ### Benchmarks
 
 Run `python3 benchmarks/bench_startup.py` to reproduce. Recent results:
-- Cold start: **88ms**
-- RSS (after imports): **23.8 MB**
-- Tool registration: **1.7ms** (26 tools)
-- Skill loading: **1.1ms** (12 skills)
+- Cold start: **~60ms**
+- RSS (after imports): **~24.1 MB**
+- Tool registration: **~0.7ms** (26 tools)
+- Skill loading: **~0.5ms** (15 skills)
+- Model detection: **~0.5ms** (8 models)
 
 ---
 

@@ -9,11 +9,15 @@ from typing import Dict, Any, Optional
 from harness.tools.base import Tool
 from harness.core.checkpoints import get_checkpoint_manager
 from harness.core.security import enforce_workspace_boundary
+from harness.core.context_budget import DEFAULT_OUTPUT_LIMITS, truncate_output
 
 
 def _check_boundary(path: str, operation: str = "access") -> Optional[str]:
     """Return error message if path is outside workspace, else None."""
     return enforce_workspace_boundary(path, operation)
+
+
+_VIEW_MAX_CHARS = int(DEFAULT_OUTPUT_LIMITS.get("view_file", 8000))
 
 class ViewFileTool(Tool):
     name = "view_file"
@@ -26,11 +30,12 @@ class ViewFileTool(Tool):
             "path": {"type": "string", "description": "Relative or absolute path to the file."},
             "start_line": {"type": "integer", "description": "1-indexed starting line number (optional)."},
             "end_line": {"type": "integer", "description": "1-indexed ending line number (optional)."},
+            "max_chars": {"type": "integer", "description": "Max characters to return (default keeps ~8000 chars of the requested span; pass your file's total length to view it fully)."},
         },
         "required": ["path"],
     }
 
-    def execute(self, path: str, start_line: Optional[int] = None, end_line: Optional[int] = None, **kwargs) -> str:
+    def execute(self, path: str, start_line: Optional[int] = None, end_line: Optional[int] = None, max_chars: Optional[int] = None, **kwargs) -> str:
         err = _check_boundary(path, "read")
         if err:
             return err
@@ -56,7 +61,19 @@ class ViewFileTool(Tool):
                 output_lines.append(f"{i:5d} | {lines[i - 1].rstrip()}")
 
             header = f"--- [{p.name}] Lines {s}-{e} of {total_lines} ---"
-            return header + "\n" + "\n".join(output_lines)
+            body = "\n".join(output_lines)
+            full = header + "\n" + body
+            # Proactive budget cap: keep the line-numbered head, inform the agent it
+            # can pass max_chars=N (capped at the file's full length) for the rest.
+            cap = _VIEW_MAX_CHARS if max_chars is None else int(max_chars)
+            if cap > 0 and len(full) > cap:
+                tail_marker = (
+                    f"\n...[output truncated by context budget: was {len(full)} chars, "
+                    f"keeping first {cap} from {total_lines} lines]...\n"
+                    f"(pass max_chars={len(full)} to this view_file call for the complete file)"
+                )
+                return full[:cap] + tail_marker
+            return full
         except Exception as ex:
             return f"Error reading file '{path}': {str(ex)}"
 

@@ -12,6 +12,7 @@ from harness.core.modes import Mode
 from harness.core.permissions import PermissionManager, PermissionLevel
 from harness.core.prompt import SystemPromptBuilder
 from harness.core.compaction import Compactor, TokenStats
+from harness.core.context_budget import ContextBudget, PRESSURE_WARNING, PRESSURE_CRITICAL
 from harness.core.todo import TodoManager, TaskItem
 from harness.core.session import Session, SessionManager
 from harness.core.checkpoints import CheckpointManager, get_checkpoint_manager, set_checkpoint_manager
@@ -96,6 +97,12 @@ class HarnessAgent:
             summarize_fn=self._summarize_block,
             summary_mode=config.compact_summary,
         )
+        # Proactive context-budget: real-time pressure gauge + per-tool output caps.
+        self.context_budget = ContextBudget(
+            context_window=model_spec.context_window,
+            threshold_ratio=config.compact_threshold,
+            cap_ratio=config.compact_cap_ratio,
+        )
         self.event_callback = event_callback
         self.prompt_builder = SystemPromptBuilder(self.mode, self.permission_manager.level)
         self.is_running = False
@@ -176,6 +183,11 @@ class HarnessAgent:
         self.compactor.context_window = model_spec.context_window
         if self.config.compact_max_message_tokens == 0:
             self.compactor.max_message_tokens = int(model_spec.context_window * 0.15)
+        self.context_budget.rebind(
+            context_window=model_spec.context_window,
+            threshold_ratio=self.config.compact_threshold,
+            cap_ratio=self.config.compact_cap_ratio,
+        )
         self.config.model = new_model
         self.emit("provider_change", {"provider": provider_name, "model": new_model})
 
@@ -709,6 +721,12 @@ class HarnessAgent:
 
             yield AgentEvent("step_start", {"step": current_loop, "mode": self.mode.value})
 
+            # Proactive budget: compact BEFORE sending so the model never sees a
+            # window that is about to overflow. Yields a compaction event when it
+            # acts so the caller can surface it.
+            for ev in self._proactive_budget_check(sys_prompt):
+                yield ev
+
             for chunk in self.provider.stream_chat(
                 messages=self.session.messages,
                 model=self.session.model,
@@ -922,6 +940,47 @@ class HarnessAgent:
         self._maybe_auto_learn(user_prompt)
         yield AgentEvent("turn_complete", {"messages_count": len(self.session.messages)})
 
+    def _proactive_budget_check(self, sys_prompt: str):
+        """Inspect context pressure before the next provider send and compact if
+        needed. Prevents the window from ever filling up mid-turn, which the
+        boundary-only auto-compaction could not stop once a long tool loop runs.
+
+        Yields zero or more AgentEvents (a compaction event when it acts, plus a
+        pressure_warning event as an early UX signal when usage first crosses the
+        threshold).
+        """
+        budget = self.context_budget
+        status = budget.check(self.session.messages, sys_prompt)
+        if status.pressure == PRESSURE_CRITICAL:
+            # Hard cap reached mid-turn: collapse oversized *old* payloads behind
+            # the current turn so the next prompt is guaranteed to fit.
+            if self.config.auto_compact:
+                old_msgs = list(self.session.messages)
+                trimmed, estats = self.compactor.emergency_trim(
+                    self.session.messages, sys_prompt, before_index=len(self.session.messages)
+                )
+                if estats and trimmed != old_msgs:
+                    self._record_message_span_change(old_msgs, trimmed)
+                    self.session.messages = trimmed
+                    yield AgentEvent("pressure_warning", {
+                        "pressure": status.pressure,
+                        "usage_ratio": round(status.usage_ratio, 4),
+                    })
+                    yield AgentEvent("compaction", estats)
+            return
+        if status.pressure == PRESSURE_WARNING and self.config.auto_compact:
+            if self.compactor.should_compact(self.session.messages, sys_prompt):
+                old_msgs = list(self.session.messages)
+                compacted_msgs, stats = self.compactor.compact(self.session.messages, sys_prompt)
+                if stats.get("compacted") and compacted_msgs != old_msgs:
+                    self._record_message_span_change(old_msgs, compacted_msgs)
+                    self.session.messages = compacted_msgs
+                    yield AgentEvent("pressure_warning", {
+                        "pressure": status.pressure,
+                        "usage_ratio": round(status.usage_ratio, 4),
+                    })
+                    yield AgentEvent("compaction", stats)
+
     def _last_assistant_text(self, start_index: int = 0) -> str:
         """Return the most recent non-empty assistant text at/after ``start_index``."""
         for i in range(len(self.session.messages) - 1, max(0, start_index) - 1, -1):
@@ -1003,12 +1062,20 @@ class HarnessAgent:
         todos_md = self.todo_manager.format_markdown()
         swarm_enabled = self.config.swarm_enabled or self.mode == Mode.SUPER
         learned_lessons = self.learning_manager.format_top(current_query or "") if self.config.learning_enabled else ""
+        # Context pressure feeds back into prompt assembly: when we're already
+        # deep into the window, elide the verbose MCP tool summaries so the
+        # system prompt doesn't crowd out the working history.
+        degrade_verbose = False
+        if self.session is not None and self.session.messages:
+            budget = self.context_budget.check(self.session.messages, "")
+            degrade_verbose = budget.usage_ratio >= self.context_budget.threshold_ratio
         return self.prompt_builder.build(
             mcp_tools_summary=mcp_summary,
             active_todos=todos_md,
             custom_instructions=self.config.custom_system_prompt,
             swarm_enabled=swarm_enabled,
             learned_lessons=learned_lessons,
+            degrade_verbose=degrade_verbose,
         )
 
     def _summarize_block(self, messages: List[Dict[str, Any]]) -> Optional[str]:
