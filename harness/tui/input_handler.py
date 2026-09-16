@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from typing import List, Optional, Iterator
 
 SLASH_COMMANDS = [
-    "/help", "/goal", "/mode", "/perm", "/theme",
+    "/help", "/goal", "/stop", "/mode", "/perm", "/theme",
     "/provider", "/model", "/models", "/config", "/keys", "/setup",
     "/effort", "/todo", "/skills", "/reload", "/mcp",
     "/subagent", "/agents", "/agent", "/back",
@@ -77,6 +77,21 @@ def no_echo_stdin(fd: Optional[int] = None) -> Iterator[None]:
     except Exception:
         yield
         return
+
+    # Foreground-process-group guard: termios.tcsetattr on a TTY from a
+    # background process group raises SIGTTOU, which STOPs the whole process
+    # (all threads) until someone resumes it — hanging the TUI forever. This
+    # happens when harness runs /goal etc. in a background job (e.g. `harness &
+    #`, CI, or test runners attached to a controlling terminal). Only manipulate
+    # the terminal when we are actually in its foreground process group.
+    try:
+        if os.tcgetpgrp(fd) != os.getpgrp():
+            yield
+            return
+    except Exception:
+        # No controlling terminal / not a real tty — safe to proceed only if
+        # tcgetattr works, which the next block verifies anyway.
+        pass
 
     try:
         old = termios.tcgetattr(fd)

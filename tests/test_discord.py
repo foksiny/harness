@@ -7,17 +7,19 @@ import unittest
 import tempfile
 import json
 import os
+import time
 from pathlib import Path
 
 from harness.config import HarnessConfig, save_config, load_config, mask_key
 from harness import secure_store
+from harness.core.agent import HarnessAgent
 from harness.discord.renderer import (
     DiscordRenderState,
     DiscordOutgoing,
     chunk_message,
     chunk_quote,
 )
-from harness.discord.sync import MessageRelay, get_relay
+from harness.discord.sync import MessageRelay, get_relay, SyncBus, MESSAGE, OUTPUT, STATE, STOP
 
 
 class _EV:
@@ -284,6 +286,7 @@ class TestDiscordBotFlow(unittest.IsolatedAsyncioTestCase):
                 self.channel_id = 4242
                 self.data = {}
                 self.response = _Response()
+                self.channel = None
                 self.followup = _Followup()
                 self.user = _User()
 
@@ -358,6 +361,545 @@ class TestMessageRelay(unittest.TestCase):
         r1 = get_relay()
         r2 = get_relay()
         self.assertIs(r1, r2)
+
+    def test_state_publish_reaches_listeners(self):
+        relay = MessageRelay()
+        seen = []
+        relay.register_state_listener(lambda payload, origin: seen.append((payload, origin)))
+        relay.publish_state({"mode": "super"}, origin="discord")
+        self.assertEqual(seen, [({"mode": "super"}, "discord")])
+        # Also mirrored onto the bus
+        cursor = relay.bus.new_cursor()
+        # cursor starts at end-of-file; poll from a fresh cursor reading all
+        events = SyncBus(path=relay.bus.path).poll(SyncBus.__new__(SyncBus) if False else _FreshCursor(relay.bus.path))
+        self.assertTrue(any(ev.get("kind") == STATE and ev.get("payload", {}).get("mode") == "super" for ev in events))
+
+    def test_relay_output_published_to_bus(self):
+        relay = MessageRelay()
+        relay.relay_output("agent answer", origin="discord")
+        events = _all_bus_events(relay.bus.path)
+        self.assertTrue(any(
+            ev.get("kind") == OUTPUT and ev.get("text") == "agent answer" and ev.get("origin") == "discord"
+            for ev in events
+        ))
+
+    def test_publish_stop(self):
+        relay = MessageRelay()
+        relay.publish_stop(origin="discord")
+        events = _all_bus_events(relay.bus.path)
+        self.assertTrue(any(ev.get("kind") == STOP and ev.get("origin") == "discord" for ev in events))
+
+    def test_publish_state_recorded_in_history(self):
+        relay = MessageRelay()
+        relay.publish_state({"provider": "mock"}, origin="cli")
+        h = relay.get_history()
+        self.assertTrue(any(e.get("kind") == "state" and e.get("payload", {}).get("provider") == "mock" for e in h))
+
+
+def _all_bus_events(path):
+    """Read every (fresh) event from a bus file for assertions."""
+    bus = SyncBus(path=path)
+    cursor = SyncBus.SyncCursor(offset=0, start_ts=0) if hasattr(SyncBus, "SyncCursor") else None
+    # Simpler: craft a cursor that reads from the beginning with no TTL filter.
+    from harness.discord.sync import SyncCursor
+    cur = SyncCursor(offset=0, start_ts=time.time() - 3600)
+    return bus.poll(cur, limit=1000)
+
+
+class _FreshCursor:
+    def __init__(self, path):
+        from harness.discord.sync import SyncCursor
+        self._cur = SyncCursor(offset=0, start_ts=time.time() - 3600)
+
+    def __getattr__(self, item):
+        return getattr(self._cur, item)
+
+
+class TestSyncBus(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.bus = SyncBus(path=Path(self._tmp.name) / "bus.jsonl")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _fresh_cursor(self):
+        from harness.discord.sync import SyncCursor
+        return SyncCursor(offset=0, start_ts=time.time() - 3600)
+
+    def test_publish_then_poll(self):
+        self.bus.publish({"kind": MESSAGE, "origin": "cli", "text": "ping"})
+        events = self.bus.poll(self._fresh_cursor())
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["text"], "ping")
+        self.assertTrue(events[0].get("id"))  # auto-assigned UUID
+
+    def test_cursor_advances_no_replay(self):
+        self.bus.publish({"kind": MESSAGE, "origin": "cli", "text": "one"})
+        cur = self.bus.new_cursor()  # end-of-file cursor
+        self.assertEqual(self.bus.poll(cur), [])  # nothing new yet
+        self.bus.publish({"kind": MESSAGE, "origin": "cli", "text": "two"})
+        events = self.bus.poll(cur)
+        self.assertEqual([e["text"] for e in events], ["two"])
+        # second poll with same cursor → no duplicates
+        self.assertEqual(self.bus.poll(cur), [])
+
+    def test_stale_events_dropped(self):
+        self.bus.publish({"kind": MESSAGE, "origin": "cli", "text": "old", "ts": time.time() - 10_000})
+        self.assertEqual(self.bus.poll(self._fresh_cursor()), [])
+
+    def test_new_cursor_ignores_backlog(self):
+        self.bus.publish({"kind": MESSAGE, "origin": "cli", "text": "backlog"})
+        cur = self.bus.new_cursor()
+        self.assertEqual(self.bus.poll(cur), [])
+
+    def test_corrupt_lines_ignored(self):
+        with open(self.bus.path, "a", encoding="utf-8") as f:
+            f.write("not json at all\n")
+        self.bus.publish({"kind": MESSAGE, "origin": "cli", "text": "good"})
+        events = self.bus.poll(self._fresh_cursor())
+        self.assertEqual([e["text"] for e in events], ["good"])
+
+    def test_missing_file_poll_safe(self):
+        bus = SyncBus(path=Path(self._tmp.name) / "missing.jsonl")
+        self.assertEqual(bus.poll(self._fresh_cursor()), [])
+
+    def test_publish_never_raises_on_bad_path(self):
+        bus = SyncBus(path=Path("/proc/definitely/not/writable/bus.jsonl"))
+        bus.publish({"kind": MESSAGE, "origin": "cli", "text": "x"})  # must not raise
+
+
+class TestAgentCooperativeStop(unittest.TestCase):
+
+    def _agent(self):
+        cfg = HarnessConfig()
+        cfg.provider = "mock"
+        cfg.learning_enabled = False
+        return HarnessAgent(cfg)
+
+    def test_request_stop_flags_and_clear(self):
+        agent = self._agent()
+        self.assertFalse(agent.stop_requested())
+        agent.request_stop()
+        self.assertTrue(agent.stop_requested())
+        agent.clear_stop()
+        self.assertFalse(agent.stop_requested())
+
+    def test_step_clears_stale_stop_at_start(self):
+        agent = self._agent()
+        agent.request_stop()
+        events = list(agent.step("say hi"))
+        # The stale stop must NOT abort the fresh turn.
+        self.assertTrue(any(ev.type == "turn_complete" for ev in events))
+        self.assertFalse(agent.stop_requested())
+
+    def test_stop_between_tool_calls_interrupts_turn(self):
+        from harness.providers.mock_provider import MockProvider
+        from harness.providers.base import LLMChunk, ToolCallDelta
+
+        cfg = HarnessConfig()
+        cfg.provider = "mock"
+        cfg.learning_enabled = False
+        agent = HarnessAgent(cfg)
+
+        class _Scripted(MockProvider):
+            def __init__(self):
+                super().__init__(responses=[])
+                self.calls = 0
+
+            def stream_chat(self, messages, model=None, thinking_effort="high", tools=None, system_prompt=None, **kw):
+                self.calls += 1
+                if self.calls == 1:
+                    # Two tool calls in one assistant turn.
+                    yield LLMChunk(tool_calls=[
+                        ToolCallDelta(index=0, id="c1", name="list_dir", arguments_delta='{"path": "."}'),
+                        ToolCallDelta(index=1, id="c2", name="list_dir", arguments_delta='{"path": ".."}'),
+                    ])
+                else:
+                    yield LLMChunk(delta_text="never reached", finish_reason="stop")
+
+        agent.provider = _Scripted()
+        # Request the stop AFTER the provider's first call (so the mock turn is
+        # already being consumed) but before the second tool runs. The seam:
+        # arm the stop only once the model's own tool calls start executing.
+        original_execute = agent.tool_registry.execute
+        state = {"model_tools": 0}
+
+        def _execute_then_stop(name, args, mode):
+            if name == "list_dir":
+                state["model_tools"] += 1
+                if state["model_tools"] == 1:
+                    agent.request_stop()  # interrupt after the first real tool runs
+            return original_execute(name, args, mode)
+
+        agent.tool_registry.execute = _execute_then_stop
+        events = list(agent.step("do two things"))
+
+        # Turn ends via the interrupted path, not a second provider call.
+        self.assertEqual(agent.provider.calls, 1)
+        self.assertTrue(any(ev.type == "step_end" and ev.data.get("complete") for ev in events))
+        interrupted_msgs = [
+            m for m in agent.session.messages
+            if m.get("role") == "tool" and "interrupted by user" in str(m.get("content", ""))
+        ]
+        # The first list_dir ran; the second got the synthetic interrupted result.
+        self.assertEqual(len(interrupted_msgs), 1)
+        self.assertFalse(agent.stop_requested())
+
+
+class TestCliDiscordStateSync(unittest.TestCase):
+
+    def _agent(self):
+        cfg = HarnessConfig()
+        cfg.provider = "mock"
+        cfg.learning_enabled = False
+        return HarnessAgent(cfg)
+
+    def test_apply_remote_state_mode_and_permission(self):
+        from harness.tui.interactive import _apply_remote_state
+        agent = self._agent()
+        _apply_remote_state(agent, {"mode": "plan", "permission": "secure"}, origin="discord")
+        self.assertEqual(agent.mode.value, "plan")
+        self.assertEqual(agent.permission_manager.level.value, "secure")
+
+    def test_apply_remote_state_ignores_cli_origin(self):
+        from harness.tui.interactive import _apply_remote_state
+        agent = self._agent()
+        _apply_remote_state(agent, {"mode": "plan"}, origin="cli")
+        self.assertEqual(agent.mode.value, "build")  # unchanged
+
+    def test_apply_remote_state_bad_payload_safe(self):
+        from harness.tui.interactive import _apply_remote_state
+        agent = self._agent()
+        _apply_remote_state(agent, {"mode": 12345, "provider": {"weird": True}}, origin="discord")
+        self.assertEqual(agent.mode.value, "build")
+
+    def test_cli_commands_publish_state_to_bus(self):
+        import harness.config as config_mod
+        from harness.commands.registry import CommandRegistry
+        from harness.tui.terminal import TerminalRenderer
+        from harness.discord.sync import MessageRelay
+
+        with tempfile.TemporaryDirectory() as td:
+            old_user = config_mod.USER_CONFIG_PATH
+            config_mod.USER_CONFIG_PATH = Path(td) / "config.json"
+            relay = MessageRelay(bus_path=Path(td) / "bus.jsonl")
+            try:
+                # Point the global relay at the temp bus for this test.
+                import harness.discord.sync as sync_mod
+                old_relay = sync_mod._global_relay
+                sync_mod._global_relay = relay
+                agent = self._agent()
+                registry = CommandRegistry()
+                registry.handle("/mode super", agent, TerminalRenderer("cyberpunk"))
+                events = _all_bus_events(relay.bus.path)
+                self.assertTrue(any(
+                    ev.get("kind") == STATE and ev.get("payload", {}).get("mode") == "super"
+                    for ev in events
+                ))
+            finally:
+                sync_mod._global_relay = old_relay
+                config_mod.USER_CONFIG_PATH = old_user
+
+    def test_goal_command_publishes_state(self):
+        import harness.config as config_mod
+        from harness.commands.registry import CommandRegistry
+        from harness.tui.terminal import TerminalRenderer
+        import harness.discord.sync as sync_mod
+        from harness.discord.sync import MessageRelay
+
+        with tempfile.TemporaryDirectory() as td:
+            old_user = config_mod.USER_CONFIG_PATH
+            config_mod.USER_CONFIG_PATH = Path(td) / "config.json"
+            old_relay = sync_mod._global_relay
+            relay = MessageRelay(bus_path=Path(td) / "bus.jsonl")
+            sync_mod._global_relay = relay
+            try:
+                agent = self._agent()
+                registry = CommandRegistry()
+                registry.handle("/goal make all tests pass", agent, TerminalRenderer("cyberpunk"))
+                events = _all_bus_events(relay.bus.path)
+                self.assertTrue(any(
+                    ev.get("kind") == STATE and ev.get("payload", {}).get("goal") == "make all tests pass"
+                    for ev in events
+                ))
+                self.assertEqual(agent.mode.value, "super")
+            finally:
+                sync_mod._global_relay = old_relay
+                config_mod.USER_CONFIG_PATH = old_user
+
+    def test_stop_command_registered(self):
+        from harness.commands.registry import CommandRegistry
+        registry = CommandRegistry()
+        self.assertIn("stop", registry.commands)
+
+
+try:
+    import discord  # noqa: F401
+    _HAS_DISCORD_LIB = True
+except ImportError:
+    _HAS_DISCORD_LIB = False
+
+
+@unittest.skipUnless(_HAS_DISCORD_LIB, "discord.py not installed")
+class TestDiscordBotGoalStopAsk(unittest.IsolatedAsyncioTestCase):
+    """New bot features: /goal flow, /stop semantics, and the ask_user view."""
+
+    def setUp(self):
+        pass
+
+    def _cfg(self):
+        cfg = HarnessConfig()
+        cfg.provider = "mock"
+        cfg.model = "mock-harness-model"
+        cfg.discord_permission = "full"
+        return cfg
+
+    def test_ask_user_view_resolves_via_callback(self):
+        # Production semantics: the handler blocks the agent's *worker thread*,
+        # while the Discord event loop resolves the future (simulated instantly
+        # by a stubbed view).
+        import asyncio
+        import concurrent.futures
+        import threading
+        from harness.discord.bot import HarnessDiscordBot
+
+        bot = HarnessDiscordBot(self._cfg(), token="fake")
+        loop = asyncio.new_event_loop()
+
+        class _Interaction:
+            class _Followup:
+                async def send(self, *a, **kw):
+                    return None
+
+            def __init__(self):
+                self.followup = _Interaction._Followup()
+                self.channel_id = 1
+
+        from harness.discord import bot as bot_mod
+        real_view = bot_mod._AskUserView
+
+        class _FakeView:
+            def __init__(self, future, question, options, allow_custom, recommended):
+                future.set_result("my custom answer")
+
+            def build_children(self):
+                pass
+
+        def run_case(stub_view):
+            bot_mod._AskUserView = stub_view
+            handler = bot._make_ask_handler(_Interaction(), loop)
+            result = {}
+
+            def worker():
+                result["answer"] = handler("Pick one?", ["a", "b"], True, "a")
+
+            t = threading.Thread(target=worker)
+            t.start()
+            try:
+                loop.run_until_complete(
+                    asyncio.wait_for(asyncio.sleep(0.5), timeout=2)
+                )
+            finally:
+                t.join(timeout=10)
+            return result.get("answer")
+
+        try:
+            asyncio.set_event_loop(loop)
+            answer = run_case(_FakeView)
+        finally:
+            bot_mod._AskUserView = real_view
+            asyncio.set_event_loop(None)
+            loop.close()
+        self.assertEqual(answer, "User replied: my custom answer")
+
+    async def test_cmd_goal_runs_super_turn_and_publishes(self):
+        from harness.discord.bot import HarnessDiscordBot
+
+        cfg = self._cfg()
+        bot = HarnessDiscordBot(cfg, token="fake")
+
+        sent = []
+
+        class _Response:
+            def __init__(self):
+                self._done = False
+
+            def is_done(self):
+                return self._done
+
+            async def defer(self, thinking=False):
+                self._done = True
+
+            async def send_message(self, content, ephemeral=False):
+                self._done = True
+                sent.append(content)
+
+        class _Followup:
+            async def send(self, content, ephemeral=False):
+                sent.append(content)
+
+        class _User:
+            id = 1
+
+        class _Interaction:
+            def __init__(self):
+                self.channel_id = 77
+                self.data = {}
+                self.response = _Response()
+                self.channel = None
+                self.followup = _Followup()
+                self.user = _User()
+
+        interaction = _Interaction()
+        import harness.discord.sync as sync_mod
+        from harness.discord.sync import MessageRelay, STATE
+        old_relay = sync_mod._global_relay
+        relay = MessageRelay()
+        sync_mod._global_relay = relay
+        try:
+            await bot._cmd_goal(interaction, "achieve the objective")
+        finally:
+            sync_mod._global_relay = old_relay
+
+        self.assertEqual(bot.config.mode, "super")
+        joined = "\n".join(sent)
+        self.assertIn("SUPER MODE ACTIVATED", joined)
+        events = _all_bus_events(relay.bus.path)
+        self.assertTrue(any(
+            ev.get("kind") == STATE and ev.get("payload", {}).get("mode") == "super"
+            for ev in events
+        ))
+
+    def test_stop_requests_agent_interrupt(self):
+        from harness.discord.bot import HarnessDiscordBot
+        from harness.core.agent import HarnessAgent
+
+        cfg = self._cfg()
+        cfg.learning_enabled = False
+        bot = HarnessDiscordBot(cfg, token="fake")
+        agent = HarnessAgent(cfg)
+        agent.is_running = True
+        agent.request_stop()
+        self.assertTrue(agent.stop_requested())
+
+    async def test_stop_command_interrupts_and_publishes(self):
+        from harness.discord.bot import HarnessDiscordBot
+
+        cfg = self._cfg()
+        bot = HarnessDiscordBot(cfg, token="fake")
+
+        sent = []
+
+        class _Response:
+            def __init__(self):
+                self._done = False
+
+            def is_done(self):
+                return self._done
+
+            async def defer(self, thinking=False, ephemeral=False):
+                self._done = True
+
+            async def send_message(self, content, ephemeral=False):
+                self._done = True
+                sent.append(content)
+
+        class _Followup:
+            async def send(self, content, ephemeral=False):
+                sent.append(content)
+
+        class _User:
+            id = 1
+
+        class _Interaction:
+            def __init__(self):
+                self.channel_id = 77
+                self.data = {}
+                self.response = _Response()
+                self.channel = None
+                self.followup = _Followup()
+                self.user = _User()
+
+        interaction = _Interaction()
+        import harness.discord.sync as sync_mod
+        from harness.discord.sync import MessageRelay, STOP
+        old_relay = sync_mod._global_relay
+        relay = MessageRelay()
+        sync_mod._global_relay = relay
+        try:
+            # Invoke the registered /stop command through the command tree.
+            cmd = next(
+                (c for c in bot.tree.get_commands() if c.name == "stop"), None
+            )
+            self.assertIsNotNone(cmd, "expected a /stop command")
+            await cmd._callback(interaction)
+        finally:
+            sync_mod._global_relay = old_relay
+        self.assertTrue(any("Stop requested" in m or "No agent" in m for m in sent))
+        events = _all_bus_events(relay.bus.path)
+        self.assertTrue(any(ev.get("kind") == STOP for ev in events))
+
+    def test_goal_command_registered_in_tree(self):
+        from harness.discord.bot import HarnessDiscordBot
+        bot = HarnessDiscordBot(self._cfg(), token="fake")
+        names = {c.name for c in bot.tree.get_commands()}
+        self.assertIn("goal", names)
+        self.assertIn("stop", names)
+
+    def test_ask_user_handler_timeout_returns_skip(self):
+        # Timeout path: a 1-second ask timeout + a never-resolving view.
+        # The worker thread (a real thread, like production) waits, times out,
+        # and reports the skip string — no global monkeypatching involved.
+        import asyncio
+        import threading
+        from harness.discord.bot import HarnessDiscordBot
+
+        cfg = self._cfg()
+        cfg.discord_ask_timeout = 1
+        bot = HarnessDiscordBot(cfg, token="fake")
+
+        class _Interaction:
+            class _Followup:
+                async def send(self, *a, **kw):
+                    return None
+
+            def __init__(self):
+                self.followup = _Interaction._Followup()
+                self.channel_id = 1
+
+        from harness.discord import bot as bot_mod
+        real_view = bot_mod._AskUserView
+
+        class _NeverResolvingView:
+            def __init__(self, future, question, options, allow_custom, recommended):
+                self._f = future  # never resolved: simulates no user clicking
+
+            def build_children(self):
+                pass
+
+        loop = asyncio.new_event_loop()
+        try:
+            bot_mod._AskUserView = _NeverResolvingView
+            handler = bot._make_ask_handler(_Interaction(), loop)
+            result = {}
+
+            def worker():
+                result["answer"] = handler("Q?", [], False, None)
+
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+            # Run the loop so the scheduled _post coroutine executes.
+            end = time.time() + 1.5
+            while time.time() < end:
+                loop.run_until_complete(asyncio.sleep(0.1))
+            t.join(timeout=10)
+        finally:
+            bot_mod._AskUserView = real_view
+            asyncio.set_event_loop(None)
+            loop.close()
+        self.assertIn("skipped", result.get("answer", ""))
 
 
 class TestSecureStoreValidation(unittest.TestCase):

@@ -94,6 +94,7 @@ class HarnessConfig:
     discord_whitelisted_channels: str = ""   # Comma-separated channel IDs the bot may operate in (when channel_mode=whitelist)
     discord_blacklisted_users: str = ""      # Comma-separated user IDs blocked from the bot (when user_mode=blacklist)
     discord_whitelisted_users: str = ""      # Comma-separated user IDs the bot may operate for (when user_mode=whitelist)
+    discord_ask_timeout: int = 900           # Seconds an ask_user prompt waits for a Discord answer
     api_keys: Dict[str, str] = field(default_factory=dict)
     base_urls: Dict[str, str] = field(default_factory=lambda: {
         "ollama": "http://localhost:11434",

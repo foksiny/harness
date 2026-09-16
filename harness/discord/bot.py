@@ -107,6 +107,92 @@ if HAS_DISCORD:
         async def _deny(self, interaction: discord.Interaction, button: discord.ui.Button):
             await self._resolve(interaction, False)
 
+    # ── ask_user interactive UI ──────────────────────────────────────────
+
+    class _AskUserView(discord.ui.View):
+        """Options for an ``ask_user`` tool call, resolved via button clicks.
+
+        Handles up to 20 options (Discord's component limit); extras fall back to
+        the follow-up modal. A timeout auto-defaults so the agent never hangs.
+        """
+
+        def __init__(
+            self,
+            future: concurrent.futures.Future,
+            question: str,
+            options: List[str],
+            allow_custom: bool,
+            recommended: Optional[str],
+        ):
+            super().__init__(timeout=900)
+            self._future = future
+            self._question = question
+            self._options = options
+            self._allow_custom = allow_custom
+            self._recommended = recommended
+            self.message = None
+
+        async def _answer(self, interaction: discord.Interaction, value: str) -> None:
+            if not self._future.done():
+                self._future.set_result(value)
+            for child in self.children:
+                child.disabled = True
+            try:
+                await interaction.response.edit_message(view=self)
+            except discord.HTTPException:
+                pass
+            try:
+                await interaction.followup.send(f"✅ Answered: **{value}**", ephemeral=True)
+            except discord.HTTPException:
+                pass
+
+        async def _custom(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+            await interaction.response.send_modal(
+                _CustomAnswerModal(self, self._question)
+            )
+
+        async def on_timeout(self) -> None:
+            if not self._future.done():
+                self._future.set_result("")
+
+        def build_children(self) -> None:
+            for i, opt in enumerate(self._options[:20]):
+                label = opt[:80]
+                style = discord.ButtonStyle.primary
+                if self._recommended and self._recommended.lower() in opt.lower():
+                    style = discord.ButtonStyle.success
+                btn = discord.ui.Button(label=label, style=style, row=i // 5)
+                btn.callback = self._make_callback(opt)
+                self.add_item(btn)
+            if self._allow_custom:
+                custom_btn = discord.ui.Button(label="✏️ Custom answer", style=discord.ButtonStyle.secondary, row=4)
+                custom_btn.callback = self._custom
+                self.add_item(custom_btn)
+
+        def _make_callback(self, value: str):
+            async def _cb(interaction: discord.Interaction, button: discord.ui.Button) -> None:
+                await self._answer(interaction, value)
+            return _cb
+
+    class _CustomAnswerModal(discord.ui.Modal):
+        """Free-form answer input for ``ask_user`` when custom replies are allowed."""
+
+        def __init__(self, view: "_AskUserView", question: str):
+            super().__init__(title="Custom answer"[:45])
+            self._view = view
+            self._question = question
+            self.answer = discord.ui.TextInput(
+                label="Your answer"[:45],
+                style=discord.TextStyle.paragraph,
+                placeholder="Type your answer…",
+                max_length=1000,
+            )
+            self.add_item(self.answer)
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            value = (self.answer.value or "").strip()
+            await self._view._answer(interaction, value)
+
     # ── Per-channel runtime ──────────────────────────────────────────────
 
     class _ChannelRuntime:
@@ -122,6 +208,8 @@ if HAS_DISCORD:
             self.config = config
             self.agent: Optional[HarnessAgent] = None
             self.lock = threading.Lock()
+            # Channels (discord channel IDs) currently running an agent turn.
+            self.active_channels: set = set()
 
         def ensure_agent(self) -> HarnessAgent:
             if self.agent is None:
@@ -160,6 +248,14 @@ if HAS_DISCORD:
             # Per-channel runtimes — each channel keeps its own conversation.
             self._runtimes: Dict[int, _ChannelRuntime] = {}
 
+            # CLI ↔ Discord synchronization (best-effort; never blocks Discord).
+            self._relay = get_relay()
+            self._sync_cursor = self._relay.bus.new_cursor()
+            self._agent_lock = threading.Lock()
+            self._loop: Optional[asyncio.AbstractEventLoop] = None
+            self._bus_task = None
+            self._wire_sync()
+
             # Suppress discord.py noisy logging in background mode
             if quiet:
                 logging.getLogger("discord").setLevel(logging.CRITICAL)
@@ -169,12 +265,204 @@ if HAS_DISCORD:
             self._register_events()
             self._register_commands()
 
+        # ── CLI ↔ Discord synchronization ──────────────────────────────
+
+        def _wire_sync(self) -> None:
+            """Register in-process listeners + start the cross-process bus poller."""
+            try:
+                self._relay.register_state_listener(self._on_state_event)
+                self._relay.register_cli(self._on_cli_message)
+            except Exception:
+                log.debug("Sync wiring failed (relay unavailable)", exc_info=True)
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # No running event loop (e.g. constructing in tests): the bus
+                # poller starts lazily in on_ready() instead.
+                self._bus_task = None
+                return
+            self._bus_task = loop.create_task(self._bus_poller())
+
+        async def _bus_poller(self) -> None:
+            """Periodically consume cross-process bus events (separate CLI process)."""
+            while True:
+                try:
+                    for ev in self._relay.bus.poll(self._sync_cursor, limit=32):
+                        await self._handle_bus_event(ev)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.debug("Bus poll failed", exc_info=True)
+                await asyncio.sleep(0.75)
+
+        async def _handle_bus_event(self, ev: dict) -> None:
+            kind = ev.get("kind")
+            origin = ev.get("origin", "")
+            if origin == "discord":
+                return  # our own publish — applied locally before publishing
+            try:
+                if kind == "state":
+                    await self._apply_state(ev.get("payload", {}), source=origin)
+                elif kind == "stop":
+                    await self._stop_all(reason=f"requested by {origin}")
+                elif kind == "message":
+                    # A prompt typed in the TUI was executed there; mirror as activity.
+                    await self._broadcast_activity(f"⌨️ CLI: {str(ev.get('text', ''))[:400]}")
+            except Exception:
+                log.debug("Failed handling sync event", exc_info=True)
+
+        def _on_cli_message(self, text: str) -> None:
+            """In-process: text typed in the TUI (prompt or command) — show in allowed channels."""
+            if self._loop is None:
+                return
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._broadcast_activity(f"⌨️ CLI: {text[:400]}"), self._loop
+                )
+                fut.result(timeout=2)
+            except Exception:
+                pass
+
+        def _on_state_event(self, payload: dict, origin: str) -> None:
+            """In-process: state changed on the CLI side — apply to all channel agents."""
+            if origin == "discord":
+                return
+            applied = self._apply_state_to_agents(payload)
+            # Mirror config-level settings so CLI and bot stay consistent.
+            try:
+                for key in ("mode", "permission", "provider", "model", "thinking_effort"):
+                    if key in payload:
+                        setattr(self.config, key, payload[key])
+            except Exception:
+                pass
+            if not applied:
+                return
+            if self._loop is not None:
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self._notify_state_applied(applied, source=origin), self._loop
+                    )
+                    fut.result(timeout=2)
+                except Exception:
+                    pass
+            else:
+                # No event loop yet (bot not connected): save config inline so
+                # the state change still persists for when the bot comes up.
+                try:
+                    from harness.config import save_config
+                    save_config(self.config)
+                except Exception:
+                    pass
+
+        def _apply_state_to_agents(self, payload: dict) -> List[str]:
+            """Synchronously apply a state payload to every channel agent.
+
+            Returns a list of human-readable change descriptions (empty if the
+            payload matched nothing or no agents exist).
+            """
+            applied: List[str] = []
+            with self._agent_lock:
+                for rt in list(self._runtimes.values()):
+                    if rt.agent is None:
+                        continue
+                    agent = rt.agent
+                    try:
+                        if "mode" in payload:
+                            from harness.core.modes import Mode
+                            m = Mode.from_string(str(payload["mode"]))
+                            agent.set_mode(m)
+                            agent.config.mode = m.value
+                            applied.append(f"mode→{m.value}")
+                        if "permission" in payload:
+                            agent.config.permission = str(payload["permission"])
+                        if "provider" in payload:
+                            try:
+                                agent.set_provider(str(payload["provider"]), model_name=payload.get("model") or None)
+                                applied.append(f"provider→{payload['provider']}")
+                            except Exception:
+                                log.warning("Failed to switch provider to %s", payload.get("provider"))
+                        elif "model" in payload:
+                            try:
+                                nm = str(payload["model"])
+                                if agent.session is not None:
+                                    agent.session.model = nm
+                                agent.config.model = nm
+                                spec = agent.provider.get_model_spec(nm)
+                                agent.compactor.context_window = spec.context_window
+                                applied.append(f"model→{nm}")
+                            except Exception:
+                                log.warning("Failed to switch model to %s", payload.get("model"))
+                        if "thinking_effort" in payload:
+                            agent.config.thinking_effort = str(payload["thinking_effort"])
+                        if payload.get("session_action") in ("create", "resume", "fork"):
+                            sid = payload.get("session_id")
+                            if sid:
+                                loaded = agent.session_manager.load(sid)
+                                if loaded is not None:
+                                    agent.session = loaded
+                                    applied.append(f"session→{loaded.id}")
+                    except Exception:
+                        log.debug("Failed applying state to a channel agent", exc_info=True)
+            return applied
+
+        async def _apply_state(self, payload: dict, source: str = "cli") -> None:
+            """Cross-process variant: apply a state payload and notify channels."""
+            applied = self._apply_state_to_agents(payload)
+            try:
+                for key in ("mode", "permission", "provider", "model", "thinking_effort"):
+                    if key in payload:
+                        setattr(self.config, key, payload[key])
+                if applied and source == "cli":
+                    await self._async_save_config()
+            except Exception:
+                pass
+            if applied and source == "cli":
+                await self._notify_state_applied(applied, source=source)
+
+        async def _notify_state_applied(self, applied: List[str], source: str = "cli") -> None:
+            """Tell the channels what changed after a remote state sync."""
+            await self._broadcast_activity(f"🔄 Synced from {source.upper()}: {', '.join(applied[:8])}")
+
+        async def _stop_all(self, reason: str = "requested") -> None:
+            """Request a cooperative stop on every running channel agent."""
+            stopped = 0
+            with self._agent_lock:
+                for rt in list(self._runtimes.values()):
+                    if rt.agent is not None and rt.agent.is_running:
+                        rt.agent.request_stop()
+                        stopped += 1
+            if stopped:
+                await self._broadcast_activity(f"⏹ Stop {reason} — interrupting {stopped} channel(s).")
+            else:
+                await self._broadcast_activity("⏹ No agent is currently running; stop flag set for safety.")
+
+        async def _broadcast_activity(self, text: str) -> None:
+            """Send an activity/status line to every allowed channel (best-effort)."""
+            sent = 0
+            for channel_id in list(self._runtimes.keys()):
+                try:
+                    if not self._channel_allowed(channel_id):
+                        continue
+                    ch = self.bot.get_channel(channel_id)
+                    if ch is None:
+                        continue
+                    for chunk in chunk_message(text, self.max_message_len):
+                        await ch.send(chunk)
+                    sent += 1
+                except Exception:
+                    continue
+            return sent
+
         # ── Startup hooks ───────────────────────────────────────────────
 
         def _register_events(self) -> None:
             @self.bot.event
             async def on_ready() -> None:
                 log.info("Bot connected as %s (ID: %s)", self.bot.user, self.bot.user.id)
+                self._loop = asyncio.get_running_loop()
+                if self._bus_task is None or self._bus_task.done():
+                    # Start the cross-process sync poller now that the loop runs.
+                    self._bus_task = self._loop.create_task(self._bus_poller())
                 guild_id = self.config.discord_guild_id.strip()
                 try:
                     # Always sync globally — our commands are registered globally
@@ -249,6 +537,56 @@ if HAS_DISCORD:
                     except discord.HTTPException:
                         pass
 
+            @_cmd(name="goal", description="Start an autonomous Super Mode loop toward a goal.")
+            @app_commands.describe(goal="High-level objective to autonomously accomplish.")
+            async def goal_cmd(interaction: discord.Interaction, goal: str):
+                try:
+                    if not (goal and goal.strip()):
+                        await interaction.response.send_message(
+                            "⚠️ Please provide a goal. Usage: `/goal <objective>`", ephemeral=True,
+                        )
+                        return
+                    await self._cmd_goal(interaction, goal)
+                except Exception as exc:
+                    log.exception("Unhandled crash in /goal handler")
+                    try:
+                        if interaction.response.is_done():
+                            await interaction.followup.send(f"❌ Bot error: {exc}", ephemeral=True)
+                        else:
+                            await interaction.response.send_message(f"❌ Bot error: {exc}", ephemeral=True)
+                    except discord.HTTPException:
+                        pass
+
+            @_cmd(name="stop", description="Interrupt the currently running agent turn.")
+            async def stop_cmd(interaction: discord.Interaction):
+                try:
+                    if not self._channel_allowed(interaction.channel_id):
+                        await interaction.response.send_message("⛔ Channel not allowed.", ephemeral=True)
+                        return
+                    if not self._user_allowed(interaction.user.id):
+                        await interaction.response.send_message("⛔ You are not allowed.", ephemeral=True)
+                        return
+                    await interaction.response.defer(thinking=True, ephemeral=True)
+                    rt = self._get_runtime(interaction.channel_id)
+                    agent = rt.ensure_agent()
+                    if agent.is_running:
+                        agent.request_stop()
+                        await interaction.followup.send("⏹ Stop requested — the current turn is being interrupted.", ephemeral=True)
+                    else:
+                        agent.clear_stop()
+                        await interaction.followup.send("ℹ️ No agent is currently running in this channel.", ephemeral=True)
+                    # Also interrupt turns running on other channels / the CLI.
+                    self._relay.publish_stop(origin="discord", channel_id=interaction.channel_id)
+                except Exception as exc:
+                    log.exception("Unhandled crash in /stop handler")
+                    try:
+                        if interaction.response.is_done():
+                            await interaction.followup.send(f"❌ Bot error: {exc}", ephemeral=True)
+                        else:
+                            await interaction.response.send_message(f"❌ Bot error: {exc}", ephemeral=True)
+                    except discord.HTTPException:
+                        pass
+
             @_cmd(name="help", description="Harness help (use 'discord' topic for the setup guide).")
             @app_commands.describe(topic="Topic: 'discord' for the configuration guide, empty for general help.")
             async def help_cmd(interaction: discord.Interaction, topic: Optional[str] = None):
@@ -281,7 +619,14 @@ if HAS_DISCORD:
                 try:
                     m = HarnessMode.from_string(mode)
                     self.config.mode = m.value
+                    rt = self._get_runtime(interaction.channel_id)
+                    agent = rt.ensure_agent()
+                    agent.set_mode(m)
+                    for other in self._runtimes.values():
+                        if other.agent is not None:
+                            other.agent.set_mode(m)
                     await self._async_save_config()
+                    self._relay.publish_state({"mode": m.value}, origin="discord")
                     await interaction.response.send_message(f"✅ Mode switched to: **{m.value.upper()}**")
                 except Exception:
                     await interaction.response.send_message(
@@ -308,7 +653,22 @@ if HAS_DISCORD:
                 pname = name.lower().strip()
                 if pname in provs:
                     self.config.provider = pname
+                    rt = self._get_runtime(interaction.channel_id)
+                    agent = rt.ensure_agent()
+                    try:
+                        agent.set_provider(pname)
+                    except Exception:
+                        log.warning("Failed to switch channel agent to provider %s", pname)
+                    for other in self._runtimes.values():
+                        if other.agent is not None:
+                            try:
+                                other.agent.set_provider(pname)
+                            except Exception:
+                                pass
                     await self._async_save_config()
+                    self._relay.publish_state(
+                        {"provider": pname, "model": self.config.model}, origin="discord"
+                    )
                     await interaction.response.send_message(f"✅ Switched provider to: **{provs[pname]}** (`{pname}`)")
                 else:
                     await interaction.response.send_message(
@@ -326,9 +686,22 @@ if HAS_DISCORD:
                         f"**Current model:** `{self.config.model}`\nUsage: `/model <model_name>`"
                     )
                     return
-                self.config.model = name.strip()
+                new_model = name.strip()
+                self.config.model = new_model
+                rt = self._get_runtime(interaction.channel_id)
+                agent = rt.ensure_agent()
+                try:
+                    if agent.session is not None:
+                        agent.session.model = new_model
+                    spec = agent.provider.get_model_spec(new_model)
+                    agent.compactor.context_window = spec.context_window
+                except Exception:
+                    log.warning("Failed to switch channel agent to model %s", new_model)
                 await self._async_save_config()
-                await interaction.response.send_message(f"✅ Model switched to: **{name.strip()}**")
+                self._relay.publish_state(
+                    {"provider": self.config.provider, "model": new_model}, origin="discord"
+                )
+                await interaction.response.send_message(f"✅ Model switched to: **{new_model}**")
 
             @_cmd(name="session", description="Manage sessions: list, create, resume.")
             @app_commands.describe(action="list, create, or resume", arg="Session ID or title")
@@ -358,17 +731,75 @@ if HAS_DISCORD:
                         thinking_effort=agent.config.thinking_effort,
                         title=title,
                     )
+                    agent.session = ns
+                    self._relay.publish_state({
+                        "session_id": ns.id, "session_title": ns.title, "session_action": "create",
+                    }, origin="discord")
                     await interaction.response.send_message(f"✅ Created session: `{ns.id}` ({ns.title})")
                 elif action == "resume" and arg:
                     loaded = agent.session_manager.load(arg)
                     if loaded:
                         agent.session = loaded
+                        self._relay.publish_state({
+                            "session_id": loaded.id, "session_title": loaded.title, "session_action": "resume",
+                        }, origin="discord")
                         await interaction.response.send_message(f"✅ Resumed session `{loaded.id}`: {loaded.title}")
                     else:
                         await interaction.response.send_message(f"❌ Session `{arg}` not found.", ephemeral=True)
+                elif action == "fork":
+                    if agent.session is None:
+                        await interaction.response.send_message(
+                            "ℹ️ No active session to fork. Send a message first.", ephemeral=True
+                        )
+                        return
+                    forked = agent.session_manager.fork(agent.session.id, arg or None)
+                    if forked:
+                        agent.session = forked
+                        self._relay.publish_state({
+                            "session_id": forked.id, "session_title": forked.title, "session_action": "fork",
+                        }, origin="discord")
+                        await interaction.response.send_message(f"✅ Forked session: `{forked.id}` ({forked.title})")
+                    else:
+                        await interaction.response.send_message("❌ Fork failed.", ephemeral=True)
+                elif action == "delete" and arg:
+                    if agent.session is not None and arg == agent.session.id:
+                        await interaction.response.send_message(
+                            "❌ Cannot delete the currently active session. Switch first.", ephemeral=True
+                        )
+                        return
+                    if agent.session_manager.delete(arg):
+                        self._relay.publish_state({
+                            "session_id": arg, "session_action": "delete",
+                        }, origin="discord")
+                        await interaction.response.send_message(f"✅ Deleted session: `{arg}`")
+                    else:
+                        await interaction.response.send_message(f"❌ Session `{arg}` not found.", ephemeral=True)
+                elif action == "rename" and arg:
+                    parts = arg.split(" ", 1)
+                    sid = parts[0]
+                    new_title = parts[1] if len(parts) > 1 else ""
+                    if not new_title:
+                        await interaction.response.send_message(
+                            "Usage: `/session rename <session_id> <new_title>`", ephemeral=True
+                        )
+                        return
+                    session = agent.session_manager.load(sid)
+                    if not session:
+                        await interaction.response.send_message(f"❌ Session `{sid}` not found.", ephemeral=True)
+                        return
+                    session.title = new_title
+                    agent.session_manager.save(session)
+                    if agent.session is not None and sid == agent.session.id:
+                        agent.session = session
+                    self._relay.publish_state({
+                        "session_id": sid, "session_title": new_title, "session_action": "rename",
+                    }, origin="discord")
+                    await interaction.response.send_message(f"✅ Renamed session `{sid}` to: `{new_title}`")
                 else:
                     await interaction.response.send_message(
-                        "Usage: `/session list`, `/session create [title]`, `/session resume <id>`", ephemeral=True
+                        "Usage: `/session list`, `/session create [title]`, `/session resume <id>`, "
+                        "`/session fork [title]`, `/session delete <id>`, `/session rename <id> <title>`",
+                        ephemeral=True,
                     )
 
             @_cmd(name="todo", description="Manage tasks: list, add, clear.")
@@ -819,6 +1250,60 @@ if HAS_DISCORD:
                 log.error("Failed to defer interaction: %s", exc)
                 return
 
+            await self._run_agent_turn(interaction, rt, prompt, file=file)
+
+        async def _cmd_goal(
+            self,
+            interaction: discord.Interaction,
+            goal: str,
+        ) -> None:
+            """``/goal``: autonomous Super Mode loop, mirroring the TUI's ``/goal``."""
+            if not self._channel_allowed(interaction.channel_id):
+                await interaction.response.send_message("⛔ Channel not allowed.", ephemeral=True)
+                return
+            if not self._user_allowed(interaction.user.id):
+                await interaction.response.send_message("⛔ You are not allowed.", ephemeral=True)
+                return
+            from harness.core.security import detect_injection
+            severity, _ = detect_injection(goal)
+            if severity == "block":
+                await interaction.response.send_message(
+                    "⛔ Goal blocked — potential prompt injection detected. Rephrase and try again.",
+                    ephemeral=True,
+                )
+                return
+
+            log.info("/goal received: channel=%s goal=%s", interaction.channel_id, goal[:80])
+            try:
+                await interaction.response.defer(thinking=True)
+            except discord.HTTPException as exc:
+                log.error("Failed to defer interaction: %s", exc)
+                return
+
+            rt = self._get_runtime(interaction.channel_id)
+            agent = rt.ensure_agent()
+            from harness.core.modes import Mode
+            agent.set_mode(Mode.SUPER)
+            self.config.mode = "super"
+            # Announce + sync the state change to the CLI side.
+            self._relay.publish_state({"mode": "super", "goal": goal}, origin="discord")
+            await self._send_fallback(interaction, f"🚀 **SUPER MODE ACTIVATED** — Autonomous Goal: {goal}")
+            await self._async_save_config()
+            await self._run_agent_turn(interaction, rt, f"AUTONOMOUS GOAL: {goal}")
+
+        async def _run_agent_turn(
+            self,
+            interaction: discord.Interaction,
+            rt: "_ChannelRuntime",
+            full_user_prompt: str,
+            file: Optional[str] = None,
+        ) -> None:
+            """Shared turn executor for /ask and /goal.
+
+            Serializes on the channel lock, runs ``agent.step()`` on a thread
+            pool, bridges events to Discord in real time, wires the permission
+            approver and the ask_user UI, and mirrors the exchange to the CLI.
+            """
             # Acquire the channel lock.  This serializes agent access so two
             # concurrent /ask commands on the same channel never corrupt state.
             # The lock is a threading.Lock (not asyncio) because agent.step()
@@ -835,24 +1320,25 @@ if HAS_DISCORD:
                 )
                 return
 
+            _typing_done = asyncio.Event()
+            typing_task = asyncio.ensure_future(asyncio.sleep(0))  # no-op placeholder
             try:
-                full_prompt = await self._build_prompt(interaction, prompt, file)
+                full_prompt = await self._build_prompt(interaction, full_user_prompt, file)
                 log.info("Prompt built, starting agent step...")
                 event_queue: queue.Queue = queue.Queue()
                 state = DiscordRenderState(max_message_len=self.max_message_len)
                 loop = asyncio.get_running_loop()
                 agent = rt.ensure_agent()
-                _typing_done = asyncio.Event()
-                typing_task = asyncio.ensure_future(asyncio.sleep(0))  # no-op placeholder
                 log.info("Agent ready: provider=%s model=%s", agent.config.provider, agent.session.model if agent.session else "none")
 
                 # ── Worker: runs on thread pool ──────────────────────────
-                # Temporarily swaps the agent's event callback and permission
-                # approver.  Restores them in a finally block so the agent
-                # is never left in a corrupted state.
+                # Temporarily swaps the agent's event callback, permission
+                # approver, and ask_user handler.  Restores them in a finally
+                # block so the agent is never left in a corrupted state.
                 def _worker() -> None:
                     old_cb = agent.event_callback
                     old_approver = agent.permission_manager.approver_callback
+                    old_ask = getattr(agent.tool_registry.get("ask_user"), "interactive_handler", None)
                     agent.event_callback = lambda ev: event_queue.put(ev)
 
                     perm = (self.config.discord_permission or DEFAULT_PERMISSION).lower()
@@ -860,6 +1346,10 @@ if HAS_DISCORD:
                         agent.permission_manager.approver_callback = self._make_approver(interaction, loop)
                     else:
                         agent.permission_manager.approver_callback = None
+
+                    ask_tool = agent.tool_registry.get("ask_user")
+                    if ask_tool is not None:
+                        ask_tool.interactive_handler = self._make_ask_handler(interaction, loop)
 
                     try:
                         for ev in agent.step(full_prompt):
@@ -870,11 +1360,15 @@ if HAS_DISCORD:
                     finally:
                         agent.event_callback = old_cb
                         agent.permission_manager.approver_callback = old_approver
+                        ask_tool = agent.tool_registry.get("ask_user")
+                        if ask_tool is not None:
+                            ask_tool.interactive_handler = old_ask
                         event_queue.put(_SENTINEL)
 
                 # Run the worker on a thread pool so the event loop stays
                 # responsive for Discord message sends and approval buttons.
                 log.info("Starting agent worker thread...")
+                rt.active_channels.add(interaction.channel_id)
                 worker_task = asyncio.get_event_loop().run_in_executor(None, _worker)
 
                 # ── Typing indicator: re-trigger every 8 seconds ─────────
@@ -905,8 +1399,8 @@ if HAS_DISCORD:
                 # Reads events from the queue and sends them to Discord in
                 # real time.
                 sent_any = False
-                relay = get_relay()
-                relay.relay_from_discord(prompt, interaction.channel_id)
+                relay = self._relay
+                relay.relay_from_discord(full_user_prompt, interaction.channel_id)
                 event_count = 0
 
                 while True:
@@ -936,11 +1430,15 @@ if HAS_DISCORD:
                     await self._send_out(interaction, out)
                     sent_any = True
 
+                if agent.stop_requested():
+                    await self._send_fallback(interaction, "⏹ Turn interrupted by /stop.")
+                    agent.clear_stop()
+
                 if not sent_any:
                     await self._send_fallback(interaction, "✅ Done (no output).")
 
             except Exception as exc:
-                log.exception("Unhandled error in /ask handler")
+                log.exception("Unhandled error in agent turn")
                 _typing_done.set()
                 try:
                     await typing_task
@@ -951,6 +1449,7 @@ if HAS_DISCORD:
                 except discord.HTTPException:
                     pass
             finally:
+                rt.active_channels.discard(interaction.channel_id)
                 rt.lock.release()
 
         # ── Permission approval ──────────────────────────────────────────
@@ -989,6 +1488,54 @@ if HAS_DISCORD:
                     return False
 
             return _approver
+
+        # ── ask_user interactive support ────────────────────────────────
+
+        def _make_ask_handler(self, interaction: discord.Interaction, loop: asyncio.AbstractEventLoop):
+            """Build an ask_user handler that posts the question to Discord as buttons.
+
+            The worker thread blocks on a ``concurrent.futures.Future`` until a
+            button (or the custom-answer modal) resolves it, so the agent loop
+            suspends exactly like it does for permission approvals.
+            """
+
+            ask_timeout = getattr(self.config, "discord_ask_timeout", 900) or 900
+
+            def _ask(question: str, options: list, allow_custom: bool, recommended: Optional[str]) -> str:
+                future: concurrent.futures.Future = concurrent.futures.Future()
+
+                async def _post() -> None:
+                    view = _AskUserView(future, question, options or [], allow_custom, recommended)
+                    view.build_children()
+                    header = f"🤖 **The agent is asking for your input**\n❓ {question}"
+                    if not (options or []):
+                        # No options → custom answer is the only path.
+                        header += "\n*(type your answer below)*"
+                    try:
+                        msg = await interaction.followup.send(header, view=view)
+                        view.message = msg
+                    except discord.HTTPException as exc:
+                        log.warning("Could not send ask_user question: %s", exc)
+                        if not future.done():
+                            future.set_result("")
+
+                # The handler runs on the agent's worker thread (never the loop
+                # thread): schedule the question onto the Discord loop and block
+                # this thread until a button/modal (or timeout) resolves it.
+                sched = asyncio.run_coroutine_threadsafe(_post(), loop)
+                try:
+                    answer = future.result(timeout=ask_timeout)
+                except concurrent.futures.TimeoutError:
+                    log.warning("ask_user timed out after %ss", ask_timeout)
+                    answer = ""
+                finally:
+                    sched.cancel()
+                answer = (answer or "").strip()
+                if not answer:
+                    return "User skipped / cancelled question prompt."
+                return f"User replied: {answer}"
+
+            return _ask
 
         # ── Prompt construction ──────────────────────────────────────────
 
@@ -1072,9 +1619,9 @@ if HAS_DISCORD:
                         await interaction.followup.send(content, ephemeral=False)
                     else:
                         await interaction.response.send_message(content, ephemeral=False)
-                    # Relay to CLI
+                    # Mirror agent output to the CLI side (display only)
                     try:
-                        get_relay().relay_from_cli(content)
+                        self._relay.relay_output(content, origin="discord", channel_id=interaction.channel_id)
                     except Exception:
                         pass
                     return

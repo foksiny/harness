@@ -21,6 +21,31 @@ class CommandContext:
         self.renderer = renderer
         self.args = raw_args.strip()
 
+def _publish_state(payload: Dict, ctx: CommandContext) -> None:
+    """Broadcast a state change to the Discord side (in-process + cross-process).
+
+    Best-effort: failures are swallowed because sync is an enhancement, never a
+    prerequisite for a command to work.
+    """
+    try:
+        from harness.discord.sync import get_relay
+        relay = get_relay()
+        if relay is not None:
+            relay.publish_state(payload, origin="cli")
+    except Exception:
+        pass
+
+
+def _publish_output(text: str, ctx: CommandContext) -> None:
+    """Mirror command output to the Discord side (display only)."""
+    try:
+        from harness.discord.sync import get_relay
+        relay = get_relay()
+        if relay is not None:
+            relay.relay_output(text, origin="cli")
+    except Exception:
+        pass
+
 class CommandRegistry:
     """Registry of slash commands."""
 
@@ -53,6 +78,7 @@ class CommandRegistry:
     def _register_builtins(self):
         self.register("help", self._cmd_help, "Show help directory of all commands and options.")
         self.register("goal", self._cmd_goal, "Initiate Super Mode autonomous loop toward an explicit goal.")
+        self.register("stop", self._cmd_stop, "Interrupt the running agent turn (works mid-stream, from CLI or Discord).")
         self.register("mode", self._cmd_mode, "Switch operational mode: plan, build, super.")
         self.register("perm", self._cmd_perm, "Switch permission profile: secure, default, full.")
         self.register("theme", self._cmd_theme, "Theme gallery, preview, and switching (14 themes available).")
@@ -93,10 +119,22 @@ class CommandRegistry:
             ctx.renderer.print_warning("Usage: /goal <high-level objective to autonomously accomplish>")
             return
         ctx.agent.set_mode(Mode.SUPER)
+        _publish_state({"mode": "super", "goal": ctx.args}, ctx)
         ctx.renderer.print_super_banner(ctx.args)
+        _publish_output(f"🚀 SUPER MODE ACTIVATED — Autonomous Goal: {ctx.args}", ctx)
         with no_echo_stdin():
             for ev in ctx.agent.step(f"AUTONOMOUS GOAL: {ctx.args}"):
                 ctx.renderer.render_agent_event(ev)
+
+    def _cmd_stop(self, ctx: CommandContext):
+        """Cooperatively interrupt the running turn from the CLI side."""
+        was_running = ctx.agent.is_running
+        ctx.agent.request_stop()
+        if was_running:
+            ctx.renderer.print_warning("⏹ Stop requested — interrupting current execution…")
+        else:
+            ctx.renderer.print_info("⏹ Stop flag set.")
+            ctx.agent.clear_stop()
 
     def _cmd_mode(self, ctx: CommandContext):
         if not ctx.args:
@@ -107,6 +145,7 @@ class CommandRegistry:
             ctx.agent.set_mode(m)
             ctx.agent.config.mode = m.value
             save_config(ctx.agent.config)
+            _publish_state({"mode": m.value}, ctx)
             ctx.renderer.print_success(f"Mode switched to: {m.value.upper()}")
         except Exception:
             ctx.renderer.print_error("Invalid mode. Choose from: plan, build, super.")
@@ -120,6 +159,7 @@ class CommandRegistry:
             ctx.agent.set_permission(p)
             ctx.agent.config.permission = p.value
             save_config(ctx.agent.config)
+            _publish_state({"permission": p.value}, ctx)
             ctx.renderer.print_success(f"Permission profile switched to: {p.value.upper()}")
         except Exception:
             ctx.renderer.print_error("Invalid permission. Choose from: secure, default, full.")
@@ -291,6 +331,7 @@ class CommandRegistry:
             current_model = ctx.agent.session.model if ctx.agent.session is not None else ctx.agent.provider.default_model
             ctx.agent.config.model = current_model
             save_config(ctx.agent.config)
+            _publish_state({"provider": pname, "model": current_model}, ctx)
             ctx.renderer.print_success(f"Switched provider to: {provs[pname]} (Model: {current_model})")
         else:
             ctx.renderer.print_error(f"Unknown provider '{pname}'. Use /provider to view supported list.")
@@ -307,6 +348,7 @@ class CommandRegistry:
         save_config(ctx.agent.config)
         spec = ctx.agent.provider.get_model_spec(new_model)
         ctx.agent.compactor.context_window = spec.context_window
+        _publish_state({"provider": ctx.agent.provider.name, "model": new_model}, ctx)
         ctx.renderer.print_success(
             f"Switched model to: {new_model}\n"
             f"Detected context window: {spec.context_window:,} tokens | Thinking supported: {spec.supports_thinking}"
@@ -318,6 +360,7 @@ class CommandRegistry:
             return
         ctx.agent.config.thinking_effort = ctx.args.strip()
         save_config(ctx.agent.config)
+        _publish_state({"thinking_effort": ctx.args.strip()}, ctx)
         ctx.renderer.print_success(f"Thinking effort set to: {ctx.args.strip()}")
 
     def _cmd_todo(self, ctx: CommandContext):
@@ -522,6 +565,7 @@ class CommandRegistry:
             for s in sessions[:15]:
                 lines.append(f"- `{s['id']}`: {s['title']} ({s['model']}, {s['turns']} turns)")
             ctx.renderer.print_markdown("\n".join(lines))
+            _publish_output("\n".join(lines), ctx)
         elif action == "create":
             # Explicit session creation — allowed even before a first message.
             title = arg.strip() if arg else "New Session"
@@ -534,6 +578,7 @@ class CommandRegistry:
                 title=title,
             )
             ctx.agent.session = new_session
+            _publish_state({"session_id": new_session.id, "session_title": new_session.title, "session_action": "create"}, ctx)
             ctx.renderer.print_success(f"Created new session: `{new_session.id}` ({new_session.title})")
         elif action == "delete":
             if not arg:
@@ -566,6 +611,7 @@ class CommandRegistry:
             ctx.agent.session_manager.save(session)
             if ctx.agent.session is not None and session_id == ctx.agent.session.id:
                 ctx.agent.session = session
+            _publish_state({"session_id": session_id, "session_title": new_title, "session_action": "rename"}, ctx)
             ctx.renderer.print_success(f"Renamed session `{session_id}` to: `{new_title}`")
         elif action == "fork":
             if ctx.agent.session is None:
@@ -574,11 +620,13 @@ class CommandRegistry:
             forked = ctx.agent.session_manager.fork(ctx.agent.session.id, arg or None)
             if forked:
                 ctx.agent.session = forked
+                _publish_state({"session_id": forked.id, "session_title": forked.title, "session_action": "fork"}, ctx)
                 ctx.renderer.print_success(f"Forked session to new branch: `{forked.id}` ({forked.title})")
         elif action == "resume" and arg:
             loaded = ctx.agent.session_manager.load(arg)
             if loaded:
                 ctx.agent.session = loaded
+                _publish_state({"session_id": loaded.id, "session_title": loaded.title, "session_action": "resume"}, ctx)
                 ctx.renderer.print_success(f"Resumed session `{loaded.id}`: {loaded.title}")
             else:
                 ctx.renderer.print_error(f"Session '{arg}' not found.")

@@ -5,6 +5,7 @@ and session state persistence.
 """
 import json
 import os
+import threading
 import time
 from typing import Dict, Any, List, Optional, Callable, Generator, Tuple
 from harness.core.modes import Mode
@@ -98,6 +99,9 @@ class HarnessAgent:
         self.event_callback = event_callback
         self.prompt_builder = SystemPromptBuilder(self.mode, self.permission_manager.level)
         self.is_running = False
+        # Cooperative stop: set from any thread (TUI Ctrl-C handler, Discord
+        # /stop) to interrupt the running turn at the next safe checkpoint.
+        self._stop_requested = threading.Event()
 
         # Wire concurrent swarm workers: each worker thread builds its own provider
         # for the currently selected provider/model, propagates the parent's mode so
@@ -112,6 +116,24 @@ class HarnessAgent:
     def emit(self, event_type: str, data: Any = None):
         if self.event_callback:
             self.event_callback(AgentEvent(event_type, data))
+
+    def request_stop(self) -> None:
+        """Request a cooperative interrupt of the current turn (thread-safe).
+
+        Safe to call from any thread (TUI, Discord /stop, timers). The running
+        ``step()`` generator notices it at the next safe checkpoint — between
+        provider chunks, between tool calls, or right before a new provider
+        request — and winds down cleanly: pending tool calls are answered with a
+        synthetic "interrupted" result so the transcript stays consistent.
+        """
+        self._stop_requested.set()
+
+    def stop_requested(self) -> bool:
+        return self._stop_requested.is_set()
+
+    def clear_stop(self) -> None:
+        """Clear a pending stop request before starting a new turn."""
+        self._stop_requested.clear()
 
     def ensure_session(self) -> Session:
         """Create the active session on the user's first message."""
@@ -154,6 +176,7 @@ class HarnessAgent:
         self.compactor.context_window = model_spec.context_window
         if self.config.compact_max_message_tokens == 0:
             self.compactor.max_message_tokens = int(model_spec.context_window * 0.15)
+        self.config.model = new_model
         self.emit("provider_change", {"provider": provider_name, "model": new_model})
 
     def _run_subagent_task(
@@ -489,6 +512,7 @@ class HarnessAgent:
     def step(self, user_prompt: Optional[str] = None) -> Generator[AgentEvent, None, None]:
         """Execute a single or multi-step agent turn, yielding live events."""
         self.is_running = True
+        self.clear_stop()
         tools_executed_this_turn = 0
 
         if user_prompt is not None and not user_prompt.strip():
@@ -671,6 +695,10 @@ class HarnessAgent:
         self.checkpoint_manager.create_checkpoint(f"Turn {len(self.session.messages) // 2 + 1} start")
 
         while self.is_running:
+            if self._stop_requested.is_set():
+                yield AgentEvent("text_delta", "\n[Harness] Turn interrupted by user.\n")
+                yield AgentEvent("step_end", {"step": current_loop, "complete": True})
+                break
             current_loop += 1
             active_tools = self.tool_registry.get_openai_schemas(self.mode)
 
@@ -713,6 +741,9 @@ class HarnessAgent:
                         tool_calls_accumulator[idx]["name"] = tc.name
                     if tc.arguments_delta:
                         tool_calls_accumulator[idx]["arguments"] += tc.arguments_delta
+
+                if self._stop_requested.is_set():
+                    break
 
             # Guard against a model/provider returning a dead-end response (no text, no tool
             # calls) — common with local reasoning endpoints. Nudge before giving up. If the
@@ -766,8 +797,6 @@ class HarnessAgent:
                 break
 
             empty_streak = 0
-
-            # Append assistant turn to history
             assistant_msg: Dict[str, Any] = {
                 "role": "assistant",
                 "content": text_accumulator or None,
@@ -796,6 +825,7 @@ class HarnessAgent:
             # Execute tool calls
             stop_requested = False
             finish_summary = ""
+            interrupted = self._stop_requested.is_set()
             for v in tool_calls_accumulator.values():
                 tool_name = v["name"]
                 raw_args = v["arguments"]
@@ -803,6 +833,18 @@ class HarnessAgent:
                     args = json.loads(raw_args) if raw_args.strip() else {}
                 except Exception:
                     args = {}
+
+                # Cooperative stop: answer remaining tool calls with a synthetic
+                # "interrupted" result so the transcript stays consistent.
+                if self._stop_requested.is_set() and tool_name != "finish":
+                    self.session.messages.append({
+                        "role": "tool",
+                        "tool_call_id": v["id"],
+                        "name": tool_name,
+                        "content": "[Harness] Tool call skipped: turn interrupted by user.",
+                    })
+                    self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
+                    continue
 
                 yield AgentEvent("tool_call_start", {"name": tool_name, "arguments": args})
 
@@ -863,12 +905,18 @@ class HarnessAgent:
                 yield AgentEvent("step_end", {"step": current_loop, "complete": True})
                 break
 
+            if interrupted or self._stop_requested.is_set():
+                yield AgentEvent("text_delta", "\n[Harness] Turn interrupted by user.\n")
+                yield AgentEvent("step_end", {"step": current_loop, "complete": True})
+                break
+
             # Save session state
             self._sync_todos_to_session()
             self.session_manager.save(self.session)
             yield AgentEvent("step_end", {"step": current_loop, "complete": False})
 
         self.is_running = False
+        self.clear_stop()
         self._sync_todos_to_session()
         self.session_manager.save(self.session)
         self._maybe_auto_learn(user_prompt)
@@ -920,6 +968,11 @@ class HarnessAgent:
                 name = m.get("name", "")
                 if name == "learn_record":
                     used_learn_record = True
+                if name == "list_skills":
+                    # The skills-first catalog seeding is Harness machinery,
+                    # not model work — skill descriptions routinely contain the
+                    # word "error" and must never trigger a false lesson.
+                    continue
                 content = str(m.get("content") or "")
                 lowered = content.lower()
                 if any(tok in lowered for tok in ("error", "traceback", "failed", "failure", "not found", "exception")):
