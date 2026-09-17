@@ -119,6 +119,20 @@ def run_interactive(agent: HarnessAgent):
 
     view = VIEW_PARENT
 
+    # ── API server info (no peer mesh) ───────────────────────────────
+    api_server = None
+    try:
+        from harness.mesh.server import get_server, get_mesh
+        api_server = get_server() or get_mesh()
+        if api_server is None and getattr(agent.config, "server_enabled", getattr(agent.config, "mesh_enabled", True)):
+            # Server already started by CLI; just fetch it
+            from harness.mesh.server import start_server
+            api_server = start_server(workspace=__import__("os").getcwd(), agent_ref=lambda: agent, config=agent.config, enable=True)
+        if api_server is not None:
+            renderer.print_info(f"[api] API server at http://{api_server.host}:{api_server.port}  (POST /api/prompt, GET /health)")
+    except Exception:
+        api_server = None
+
     # ── Discord sync wiring ────────────────────────────────────────────
     # In-process (bot hosted by this CLI): callbacks deliver Discord activity
     # into a queue rendered between prompts. Cross-process (standalone
@@ -168,6 +182,39 @@ def run_interactive(agent: HarnessAgent):
             _poll_sync_bus(agent, renderer, sync_cursor, activity_queue)
             _drain_discord_activity(agent, renderer, activity_queue)
 
+        # ── API server external prompt queue (POST /api/prompt) ────
+        # External clients (curl, VPS) POST to /api/prompt. When queued, execute
+        # automatically as if the user typed them.
+        if api_server is not None:
+            try:
+                pending = api_server.drain_prompts(limit=1)
+                if pending:
+                    for item in pending:
+                        ext_prompt = str(item.get("prompt", "")).strip()
+                        if not ext_prompt:
+                            continue
+                        renderer.print_info(f"[api] External prompt on :{api_server.port} → {ext_prompt[:300]}")
+                        _mirror_prompt(agent, ext_prompt)
+                        try:
+                            with no_echo_stdin():
+                                for ev in agent.step(ext_prompt):
+                                    renderer.render_agent_event(ev)
+                            renderer.finish_markdown()
+                            renderer.finish_thinking()
+                        except KeyboardInterrupt:
+                            renderer.finish_markdown()
+                            renderer.finish_thinking()
+                            renderer.print_warning("\nAPI prompt interrupted.")
+                            agent.is_running = False
+                            agent.clear_stop()
+                        except Exception as ex:
+                            renderer.finish_markdown()
+                            renderer.finish_thinking()
+                            renderer.print_error(f"\nAPI prompt error: {ex}")
+                    continue
+            except Exception:
+                pass
+
         user_input = input_handler.get_input(plain_prompt, view)
         if user_input == SENTINEL_OPEN_AGENTS:
             view = VIEW_AGENTS
@@ -183,6 +230,15 @@ def run_interactive(agent: HarnessAgent):
             renderer.print_info("Saving session and shutting down Harness. Goodbye!")
             if agent.session is not None:
                 agent.session_manager.save(agent.session)
+            try:
+                from harness.mesh.server import stop_server
+                stop_server()
+            except Exception:
+                try:
+                    from harness.mesh.server import stop_mesh
+                    stop_mesh()
+                except Exception:
+                    pass
             break
 
         # Check slash command — but only for real commands; a prompt whose first
@@ -202,7 +258,7 @@ def run_interactive(agent: HarnessAgent):
             renderer.print_info("In the agents view. Use /agent <id>, /back, or ESC to return.")
             continue
 
-        # Free-text prompt → mirrored to Discord, then executed locally.
+        # Free-text prompt → mirrored to Discord
         _mirror_prompt(agent, user_input)
 
         # Execute agent step (echo suppressed so keypresses during the run

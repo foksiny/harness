@@ -266,6 +266,14 @@ def resolve_model_spec_dynamic(
             _set_provider_output(spec, m)
             break
 
+    # Post-correction: stale cache may have marked NVIDIA hybrid models as
+    # reasoning_toggle (previously stored before the nvidia guard). Normalize now
+    # so the spec never claims toggle for NVIDIA where the API rejects it.
+    if prov in ("nvidia", "nim") and spec.supports_thinking and spec.thinking_type == "reasoning_toggle":
+        if any(x in clean_lower for x in ("kimi-k3", "kimi_k3", "glm-5.2", "glm_5.2", "minimax-m2", "minimax-m3", "minimax_m2", "minimax_m3")) and "glm-5.3" not in clean_lower:
+            spec.supports_thinking = False
+            spec.thinking_type = None
+
     return spec
 
 

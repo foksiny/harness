@@ -317,9 +317,9 @@ KNOWN_MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "together/deepseek-v4-pro": _E(1048576, 16384, True, vision=False,
                                    ttype="reasoning_toggle", reasoning_options=["reasoning_toggle"]),
     "moonshotai/kimi-k3": _E(1048576, 16384, True, vision=False,
-                             ttype="reasoning_toggle", reasoning_options=["reasoning_toggle"]),
+                             reasoning_options=["reasoning_toggle", "reasoning_effort", "reasoning_object"]),
     "zai-org/glm-5.2": _E(524288, 16384, True, vision=False,
-                          ttype="reasoning_toggle", reasoning_options=["reasoning_toggle"]),
+                          reasoning_options=["reasoning_toggle", "reasoning_effort"]),
     "z-ai/glm-5.3": _E(1310720, 16384, True, vision=False,
                         ttype="chat_template_kwargs", reasoning_options=["chat_template_kwargs"]),
     "z-ai/glm-5.3-flash": _E(1310720, 16384, True, vision=False,
@@ -329,9 +329,9 @@ KNOWN_MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "zai-org/glm-5.3-flash": _E(1310720, 16384, True, vision=False,
                                 ttype="chat_template_kwargs", reasoning_options=["chat_template_kwargs"]),
     "minimaxai/minimax-m2.7": _E(524288, 16384, True, vision=False,
-                                 ttype="reasoning_toggle", reasoning_options=["reasoning_toggle"]),
+                                 reasoning_options=["reasoning_toggle", "reasoning_effort"]),
     "minimaxai/minimax-m3": _E(524288, 16384, True, vision=False,
-                               ttype="reasoning_toggle", reasoning_options=["reasoning_toggle"]),
+                               reasoning_options=["reasoning_toggle", "reasoning_effort"]),
 
     # ─── OpenRouter GPT-OSS (also on Groq / Together) ────────────────────────
     "openai/gpt-oss-120b": _E(131072, 65536, True, vision=True),
@@ -455,11 +455,18 @@ def _provider_dialect(thinking_type: Optional[str], name: str, provider: str,
     The dialect is a property of the *provider* (its request schema), never of
     the model family. A pinned ``thinking_type`` (server-advertised mechanism)
     always wins; otherwise the provider map applies.
+
+    Special-case: Together-hosted hybrid models (kimi-k3, glm-5.2, minimax-m2/m3)
+    use the reasoning toggle dialect even though Together's default is
+    reasoning_effort. Detect those model ids explicitly.
     """
     if thinking_type and thinking_type in THINKING_DIALECTS:
         return thinking_type
 
     prov = (provider or "").lower().strip()
+    nlow = (name or "").lower()
+    if prov == "together" and any(x in nlow for x in ("kimi-k3", "kimi_k3", "glm-5.2", "glm_5.2", "minimax-m2", "minimax-m3", "minimax_m2", "minimax_m3")):
+        return "reasoning_toggle"
     if prov in PROVIDER_DIALECTS:
         return PROVIDER_DIALECTS[prov]
     if thinking_type:
@@ -500,6 +507,15 @@ def detect_thinking_support(model_name: str, provider: str = "") -> Tuple[bool, 
     """
     name = (model_name or "").strip().lower()
     prov = (provider or "").lower().strip()
+
+    # NVIDIA NIM does not expose Together-style hybrid toggle models as reasoning
+    # models. Generic hybrid ids (kimi-k3, glm-5.2, minimax-m2/m3) are flagged
+    # as thinking only for providers that actually host them as reasoning models.
+    if prov in ("nvidia", "nim") and any(x in name for x in ("kimi-k3", "kimi_k3", "glm-5.2", "glm_5.2", "minimax-m2", "minimax-m3", "minimax_m2", "minimax_m3")):
+        # z-ai glm-5.3 family IS hosted on NIM as thinking via chat_template_kwargs
+        # (don't blanket-disable that family).
+        if "glm-5.3" not in name:
+            return False, None
 
     entry = _lookup_registry(model_name)
     if entry is not None:

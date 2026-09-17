@@ -4,6 +4,7 @@ Powers OpenAI, OpenRouter, NVIDIA NIM, OpenCode Zen, Groq, DeepSeek,
 Mistral, xAI, Ollama, Together, Fireworks, and Perplexity.
 """
 import json
+import time
 import urllib.request
 import urllib.error
 from typing import Dict, Any, List, Optional, Iterator
@@ -111,8 +112,10 @@ class OpenAICompatibleProvider(BaseProvider):
         api_key: Optional[str] = None,
         extra_headers: Optional[Dict[str, str]] = None,
         user_agent: str = DEFAULT_USER_AGENT,
+        max_retries: int = 3,
+        base_delay: float = 5.0,
     ):
-        super().__init__(api_key=api_key, base_url=base_url)
+        super().__init__(api_key=api_key, base_url=base_url, max_retries=max_retries, base_delay=base_delay)
         self.name = name
         self.display_name = display_name
         self.default_model = default_model
@@ -140,6 +143,34 @@ class OpenAICompatibleProvider(BaseProvider):
                 item["name"] = msg["name"]
             payload.append(item)
         return payload
+
+    @staticmethod
+    def _is_unsupported_param_error(text: str) -> bool:
+        """Return True when the provider complains about an unsupported thinking/reasoning param."""
+        low = (text or "").lower()
+        if "unsupported parameter" not in low and "unsupported" not in low:
+            return False
+        # Check that the complained param is one of the thinking/reasoning keys we might have sent.
+        # Be permissive: if the message says unsupported at all while we sent thinking params, retry.
+        return any(k in low for k in ("reason", "thinking", "chat_template"))
+
+    def _strip_thinking_params(self, body: Dict[str, Any]) -> None:
+        for k in ("reasoning", "reasoning_effort", "thinking", "thinking_config", "chat_template_kwargs"):
+            body.pop(k, None)
+
+    def _is_retryable_error_message(self, msg: str, code: Any = None) -> bool:
+        low = (msg or "").lower()
+        # Check explicit retryable phrases
+        if any(x in low for x in ("rate limit", "too many requests", "overloaded", "try again", "timeout", "temporarily unavailable", "service unavailable", "bad gateway", "gateway timeout", "internal server error")):
+            return True
+        # Check code
+        try:
+            c = int(str(code).strip().split()[0]) if code else None
+            if c and self._is_retryable_http_code(c):
+                return True
+        except Exception:
+            pass
+        return False
 
     def stream_chat(
         self,
@@ -187,115 +218,213 @@ class OpenAICompatibleProvider(BaseProvider):
         data_bytes = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(endpoint, data=data_bytes, headers=headers, method="POST")
 
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                buffer = ""
-                saw_payload = False
-                body_lines = []
-                for raw_line in resp:
-                    line = raw_line.decode("utf-8", errors="replace")
-                    body_lines.append(line)
-                    buffer += line
+        # ── Retry handling: unsupported param (immediate) + exponential backoff for transient errors ──
+        # Configurable retries: default 3 => waits 5s, 10s, 20s (base * 2^attempt)
+        max_retries = getattr(self, "max_retries", 3)
+        base_delay = getattr(self, "base_delay", 5.0)
+        # Track if we already stripped thinking params (only once)
+        thinking_stripped = False
+        # Total attempts = 1 initial + max_retries backoff retries + 1 extra for thinking strip if needed
+        # We use a manual loop with attempt counter for backoff
+        attempt = 0
+        while True:
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    buffer = ""
+                    saw_payload = False
+                    body_lines = []
+                    sse_error_msg: Optional[str] = None
+                    sse_retryable = False
+                    for raw_line in resp:
+                        line = raw_line.decode("utf-8", errors="replace")
+                        body_lines.append(line)
+                        buffer += line
 
-                    while "\n" in buffer:
-                        line_str, buffer = buffer.split("\n", 1)
-                        line_str = line_str.strip()
+                        while "\n" in buffer:
+                            line_str, buffer = buffer.split("\n", 1)
+                            line_str = line_str.strip()
 
-                        if not line_str or line_str.startswith(":"):
-                            continue
-
-                        if line_str.startswith("data: "):
-                            data_str = line_str[6:].strip()
-                            if data_str == "[DONE]":
-                                rem_text, rem_reasoning = think_parser.flush()
-                                if rem_text or rem_reasoning:
-                                    saw_payload = True
-                                    yield LLMChunk(delta_text=rem_text, delta_reasoning=rem_reasoning)
-                                yield LLMChunk(finish_reason="stop")
-                                return
-
-                            try:
-                                chunk_json = json.loads(data_str)
-                            except Exception:
-                                saw_payload = True
-                                yield LLMChunk(delta_text=f"\n[Error from {self.display_name}: {data_str[:500]}]\n", finish_reason="error")
-                                return
-
-                            if isinstance(chunk_json, dict) and "error" in chunk_json:
-                                err = chunk_json["error"]
-                                if isinstance(err, dict):
-                                    err_msg = err.get("message") or err.get("type") or str(err)
-                                else:
-                                    err_msg = str(err)
-                                saw_payload = True
-                                yield LLMChunk(delta_text=f"\n[Error from {self.display_name}: {err_msg}]\n", finish_reason="error")
-                                return
-
-                            choices = chunk_json.get("choices", [])
-                            if not choices:
+                            if not line_str or line_str.startswith(":"):
                                 continue
-                            choice = choices[0]
-                            delta = choice.get("delta", {})
-                            finish = choice.get("finish_reason")
 
-                            raw_text = delta.get("content") or ""
-                            raw_reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                            if line_str.startswith("data: "):
+                                data_str = line_str[6:].strip()
+                                if data_str == "[DONE]":
+                                    rem_text, rem_reasoning = think_parser.flush()
+                                    if rem_text or rem_reasoning:
+                                        saw_payload = True
+                                        yield LLMChunk(delta_text=rem_text, delta_reasoning=rem_reasoning)
+                                    yield LLMChunk(finish_reason="stop")
+                                    return
 
-                            if raw_reasoning:
-                                reasoning_delta = raw_reasoning
-                                text_delta = raw_text
-                            elif raw_text:
-                                text_delta, reasoning_delta = think_parser.process(raw_text)
+                                try:
+                                    chunk_json = json.loads(data_str)
+                                except Exception:
+                                    saw_payload = True
+                                    yield LLMChunk(delta_text=f"\n[Error from {self.display_name}: {data_str[:500]}]\n", finish_reason="error")
+                                    return
+
+                                if isinstance(chunk_json, dict) and "error" in chunk_json:
+                                    err = chunk_json["error"]
+                                    if isinstance(err, dict):
+                                        err_msg = err.get("message") or err.get("type") or str(err)
+                                        err_code = err.get("code") or err.get("status") or ""
+                                    else:
+                                        err_msg = str(err)
+                                        err_code = ""
+                                    # Check for unsupported param (immediate, no backoff)
+                                    if not saw_payload and not thinking_stripped and thinking_params and self._is_unsupported_param_error(err_msg):
+                                        sse_error_msg = err_msg
+                                        sse_retryable = False
+                                        buffer = ""
+                                        break
+                                    # Check for retryable error in SSE payload (e.g. overloaded)
+                                    if not saw_payload and self._is_retryable_error_message(err_msg, err_code) and attempt < max_retries:
+                                        sse_error_msg = err_msg
+                                        sse_retryable = True
+                                        buffer = ""
+                                        break
+                                    saw_payload = True
+                                    yield LLMChunk(delta_text=f"\n[Error from {self.display_name}: {err_msg}]\n", finish_reason="error")
+                                    return
+
+                                choices = chunk_json.get("choices", [])
+                                if not choices:
+                                    continue
+                                choice = choices[0]
+                                delta = choice.get("delta", {})
+                                finish = choice.get("finish_reason")
+
+                                raw_text = delta.get("content") or ""
+                                raw_reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+
+                                if raw_reasoning:
+                                    reasoning_delta = raw_reasoning
+                                    text_delta = raw_text
+                                elif raw_text:
+                                    text_delta, reasoning_delta = think_parser.process(raw_text)
+                                else:
+                                    text_delta = ""
+                                    reasoning_delta = ""
+
+                                tool_calls = []
+                                if isinstance(delta.get("tool_calls"), list):
+                                    for tc in delta["tool_calls"]:
+                                        fn = tc.get("function", {})
+                                        tool_calls.append(ToolCallDelta(
+                                            index=tc.get("index", 0),
+                                            id=tc.get("id"),
+                                            name=fn.get("name"),
+                                            arguments_delta=fn.get("arguments", ""),
+                                        ))
+
+                                if text_delta or reasoning_delta or tool_calls or finish:
+                                    saw_payload = True
+                                    yield LLMChunk(
+                                        delta_text=text_delta,
+                                        delta_reasoning=reasoning_delta,
+                                        tool_calls=tool_calls,
+                                        finish_reason=finish,
+                                        usage=chunk_json.get("usage"),
+                                    )
+                        if sse_error_msg is not None:
+                            break
+
+                    if sse_error_msg is not None:
+                        if not sse_retryable:
+                            # Unsupported param → strip and retry immediately
+                            self._strip_thinking_params(body)
+                            thinking_params = {}
+                            thinking_stripped = True
+                            data_bytes = json.dumps(body).encode("utf-8")
+                            req = urllib.request.Request(endpoint, data=data_bytes, headers=headers, method="POST")
+                            # Do not increment backoff attempt for this, retry immediately
+                            continue
+                        else:
+                            # Retryable SSE error → backoff
+                            if attempt < max_retries:
+                                delay = self._retry_delay(attempt)
+                                time.sleep(delay)
+                                attempt += 1
+                                continue
                             else:
-                                text_delta = ""
-                                reasoning_delta = ""
+                                yield LLMChunk(delta_text=f"\n[Error from {self.display_name}: {sse_error_msg}]\n", finish_reason="error")
+                                return
 
-                            tool_calls = []
-                            if isinstance(delta.get("tool_calls"), list):
-                                for tc in delta["tool_calls"]:
-                                    fn = tc.get("function", {})
-                                    tool_calls.append(ToolCallDelta(
-                                        index=tc.get("index", 0),
-                                        id=tc.get("id"),
-                                        name=fn.get("name"),
-                                        arguments_delta=fn.get("arguments", ""),
-                                    ))
-
-                            if text_delta or reasoning_delta or tool_calls or finish:
-                                saw_payload = True
-                                yield LLMChunk(
-                                    delta_text=text_delta,
-                                    delta_reasoning=reasoning_delta,
-                                    tool_calls=tool_calls,
-                                    finish_reason=finish,
-                                    usage=chunk_json.get("usage"),
-                                )
-
-                # Stream ended without any usable SSE content — surface the raw body as the error.
-                if not saw_payload:
-                    body_text = "".join(body_lines).strip()[:1000]
-                    if body_text:
-                        try:
-                            body_json = json.loads(body_text)
-                            err_obj = body_json.get("error") if isinstance(body_json, dict) else None
-                            if isinstance(err_obj, dict):
-                                err_msg = err_obj.get("message") or err_obj.get("type") or str(err_obj)
-                            elif isinstance(err_obj, str):
-                                err_msg = err_obj
-                            elif isinstance(body_json, dict):
-                                err_msg = body_json.get("message") or body_json.get("type") or str(body_json)
-                            else:
+                    # Stream ended without any usable SSE content — surface the raw body as the error.
+                    if not saw_payload:
+                        body_text = "".join(body_lines).strip()[:1000]
+                        if body_text:
+                            try:
+                                body_json = json.loads(body_text)
+                                err_obj = body_json.get("error") if isinstance(body_json, dict) else None
+                                if isinstance(err_obj, dict):
+                                    err_msg = err_obj.get("message") or err_obj.get("type") or str(err_obj)
+                                    err_code = err_obj.get("code") or ""
+                                elif isinstance(err_obj, str):
+                                    err_msg = err_obj
+                                    err_code = ""
+                                elif isinstance(body_json, dict):
+                                    err_msg = body_json.get("message") or body_json.get("type") or str(body_json)
+                                    err_code = ""
+                                else:
+                                    err_msg = body_text
+                                    err_code = ""
+                            except Exception:
                                 err_msg = body_text
-                        except Exception:
-                            err_msg = body_text
-                        yield LLMChunk(delta_text=f"\n[Error from {self.display_name}: {err_msg}]\n", finish_reason="error")
-                    else:
-                        yield LLMChunk(delta_text=f"\n[Error from {self.display_name}: stream ended without a response]\n", finish_reason="error")
+                                err_code = ""
+                            # Check unsupported param first (no backoff)
+                            if not thinking_stripped and thinking_params and self._is_unsupported_param_error(err_msg):
+                                self._strip_thinking_params(body)
+                                thinking_params = {}
+                                thinking_stripped = True
+                                data_bytes = json.dumps(body).encode("utf-8")
+                                req = urllib.request.Request(endpoint, data=data_bytes, headers=headers, method="POST")
+                                continue
+                            if self._is_retryable_error_message(err_msg, err_code) and attempt < max_retries:
+                                delay = self._retry_delay(attempt)
+                                time.sleep(delay)
+                                attempt += 1
+                                continue
+                            yield LLMChunk(delta_text=f"\n[Error from {self.display_name}: {err_msg}]\n", finish_reason="error")
+                        else:
+                            yield LLMChunk(delta_text=f"\n[Error from {self.display_name}: stream ended without a response]\n", finish_reason="error")
+                    return
 
-        except urllib.error.HTTPError as he:
-            err_body = he.read().decode("utf-8", errors="ignore")
-            yield LLMChunk(delta_text=f"\n[HTTP Error {he.code} from {self.display_name}: {err_body}]\n", finish_reason="error")
-        except urllib.error.URLError as ue:
-            yield LLMChunk(delta_text=f"\n[Connection Error with {self.display_name}: {str(ue)}]\n", finish_reason="error")
-        except Exception as ex:
-            yield LLMChunk(delta_text=f"\n[Unexpected Error from {self.display_name}: {str(ex)}]\n", finish_reason="error")
+            except urllib.error.HTTPError as he:
+                err_body = he.read().decode("utf-8", errors="ignore") if hasattr(he, "read") else str(he)
+                # Unsupported param → immediate retry (no backoff, doesn't count towards max_retries)
+                if not thinking_stripped and thinking_params and self._is_unsupported_param_error(err_body):
+                    self._strip_thinking_params(body)
+                    thinking_params = {}
+                    thinking_stripped = True
+                    data_bytes = json.dumps(body).encode("utf-8")
+                    req = urllib.request.Request(endpoint, data=data_bytes, headers=headers, method="POST")
+                    continue
+                # Retryable HTTP codes → exponential backoff
+                if self._is_retryable_http_code(he.code) and attempt < max_retries:
+                    # Respect Retry-After header if present
+                    delay = self._retry_delay(attempt)
+                    try:
+                        retry_after = he.headers.get("Retry-After") if hasattr(he, "headers") and he.headers else None
+                        if retry_after:
+                            delay = max(delay, float(retry_after))
+                    except Exception:
+                        pass
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
+                yield LLMChunk(delta_text=f"\n[HTTP Error {he.code} from {self.display_name}: {err_body}]\n", finish_reason="error")
+                return
+            except urllib.error.URLError as ue:
+                if attempt < max_retries:
+                    delay = self._retry_delay(attempt)
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
+                yield LLMChunk(delta_text=f"\n[Connection Error with {self.display_name}: {str(ue)}]\n", finish_reason="error")
+                return
+            except Exception as ex:
+                # Don't retry on non-retryable unexpected errors
+                yield LLMChunk(delta_text=f"\n[Unexpected Error from {self.display_name}: {str(ex)}]\n", finish_reason="error")
+                return

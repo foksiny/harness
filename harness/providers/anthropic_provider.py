@@ -4,6 +4,7 @@ Full support for Claude 3.7 Sonnet, Claude 3.5 Sonnet, Claude 3.5 Haiku,
 dynamic thinking budget tokens, and native tool calling.
 """
 import json
+import time
 import urllib.request
 import urllib.error
 from typing import Dict, Any, List, Optional, Iterator
@@ -15,8 +16,8 @@ class AnthropicProvider(BaseProvider):
     display_name = "Anthropic Claude"
     default_model = "claude-3-7-sonnet"
 
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
-        super().__init__(api_key=api_key, base_url=base_url or "https://api.anthropic.com/v1")
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, max_retries: int = 3, base_delay: float = 5.0):
+        super().__init__(api_key=api_key, base_url=base_url or "https://api.anthropic.com/v1", max_retries=max_retries, base_delay=base_delay)
 
     @staticmethod
     def _anthropic_user_content(content):
@@ -130,65 +131,91 @@ class AnthropicProvider(BaseProvider):
         current_tool_name = None
         current_tool_idx = 0
 
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                buffer = ""
-                for raw_line in resp:
-                    line = raw_line.decode("utf-8", errors="replace")
-                    buffer += line
+        for attempt in range(self.max_retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    buffer = ""
+                    saw_payload = False
+                    for raw_line in resp:
+                        line = raw_line.decode("utf-8", errors="replace")
+                        buffer += line
 
-                    while "\n" in buffer:
-                        line_str, buffer = buffer.split("\n", 1)
-                        line_str = line_str.strip()
+                        while "\n" in buffer:
+                            line_str, buffer = buffer.split("\n", 1)
+                            line_str = line_str.strip()
 
-                        if not line_str or line_str.startswith(":"):
-                            continue
-
-                        if line_str.startswith("data: "):
-                            data_str = line_str[6:].strip()
-                            try:
-                                ev = json.loads(data_str)
-                                ev_type = ev.get("type")
-
-                                if ev_type == "content_block_start":
-                                    block = ev.get("content_block", {})
-                                    if block.get("type") == "tool_use":
-                                        current_tool_id = block.get("id")
-                                        current_tool_name = block.get("name")
-                                        current_tool_idx = ev.get("index", 0)
-
-                                elif ev_type == "content_block_delta":
-                                    delta = ev.get("delta", {})
-                                    dtype = delta.get("type")
-
-                                    if dtype == "text_delta":
-                                        yield LLMChunk(delta_text=delta.get("text", ""))
-                                    elif dtype == "thinking_delta":
-                                        yield LLMChunk(delta_reasoning=delta.get("thinking", ""))
-                                    elif dtype == "input_json_delta":
-                                        yield LLMChunk(
-                                            tool_calls=[ToolCallDelta(
-                                                index=current_tool_idx,
-                                                id=current_tool_id,
-                                                name=current_tool_name,
-                                                arguments_delta=delta.get("partial_json", ""),
-                                            )]
-                                        )
-
-                                elif ev_type == "message_delta":
-                                    delta = ev.get("delta", {})
-                                    yield LLMChunk(
-                                        finish_reason=delta.get("stop_reason"),
-                                        usage=ev.get("usage"),
-                                    )
-
-                            except Exception:
+                            if not line_str or line_str.startswith(":"):
                                 continue
 
-        except urllib.error.HTTPError as he:
-            err_body = he.read().decode("utf-8", errors="ignore")
-            yield LLMChunk(delta_text=f"\n[HTTP Error {he.code} from Anthropic: {err_body}]\n", finish_reason="error")
-        except urllib.error.URLError as ue:
-            yield LLMChunk(delta_text=f"\n[Connection Error with Anthropic: {str(ue)}]\n", finish_reason="error")
-        except Exception as ex:
-            yield LLMChunk(delta_text=f"\n[Unexpected Error from Anthropic: {str(ex)}]\n", finish_reason="error")
+                            if line_str.startswith("data: "):
+                                data_str = line_str[6:].strip()
+                                try:
+                                    ev = json.loads(data_str)
+                                    ev_type = ev.get("type")
+
+                                    if ev_type == "content_block_start":
+                                        block = ev.get("content_block", {})
+                                        if block.get("type") == "tool_use":
+                                            current_tool_id = block.get("id")
+                                            current_tool_name = block.get("name")
+                                            current_tool_idx = ev.get("index", 0)
+
+                                    elif ev_type == "content_block_delta":
+                                        delta = ev.get("delta", {})
+                                        dtype = delta.get("type")
+
+                                        if dtype == "text_delta":
+                                            saw_payload = True
+                                            yield LLMChunk(delta_text=delta.get("text", ""))
+                                        elif dtype == "thinking_delta":
+                                            saw_payload = True
+                                            yield LLMChunk(delta_reasoning=delta.get("thinking", ""))
+                                        elif dtype == "input_json_delta":
+                                            saw_payload = True
+                                            yield LLMChunk(
+                                                tool_calls=[ToolCallDelta(
+                                                    index=current_tool_idx,
+                                                    id=current_tool_id,
+                                                    name=current_tool_name,
+                                                    arguments_delta=delta.get("partial_json", ""),
+                                                )]
+                                            )
+
+                                    elif ev_type == "message_delta":
+                                        delta = ev.get("delta", {})
+                                        saw_payload = True
+                                        yield LLMChunk(
+                                            finish_reason=delta.get("stop_reason"),
+                                            usage=ev.get("usage"),
+                                        )
+
+                                except Exception:
+                                    continue
+                    return
+            except urllib.error.HTTPError as he:
+                err_body = he.read().decode("utf-8", errors="ignore") if hasattr(he, "read") else str(he)
+                if not he.code or not self._is_retryable_http_code(he.code) or attempt >= self.max_retries:
+                    yield LLMChunk(delta_text=f"\n[HTTP Error {he.code} from Anthropic: {err_body}]\n", finish_reason="error")
+                    return
+                # Retryable — exponential backoff
+                delay = self._retry_delay(attempt)
+                try:
+                    retry_after = he.headers.get("Retry-After") if hasattr(he, "headers") and he.headers else None
+                    if retry_after:
+                        delay = max(delay, float(retry_after))
+                except Exception:
+                    pass
+                time.sleep(delay)
+                continue
+            except urllib.error.URLError as ue:
+                if attempt >= self.max_retries:
+                    yield LLMChunk(delta_text=f"\n[Connection Error with Anthropic: {str(ue)}]\n", finish_reason="error")
+                    return
+                delay = self._retry_delay(attempt)
+                time.sleep(delay)
+                continue
+            except Exception as ex:
+                yield LLMChunk(delta_text=f"\n[Unexpected Error from Anthropic: {str(ex)}]\n", finish_reason="error")
+                return
+        # Exhausted retries (should not reach here, but fallback)
+        yield LLMChunk(delta_text=f"\n[Error from Anthropic: exhausted {self.max_retries} retries]\n", finish_reason="error")

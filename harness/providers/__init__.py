@@ -119,10 +119,25 @@ def get_provider(provider_name: str, config: Optional[HarnessConfig] = None) -> 
 
     api_key = config.get_api_key(pname) if config else None
     base_url = (config.get_base_url(pname) if config else None) or cfg_entry["base_url"]
+    # Retry config (default 3 retries, 5s base -> 5,10,20)
+    max_retries = getattr(config, "provider_max_retries", 3) if config else 3
+    base_delay = getattr(config, "provider_retry_base_delay", 5.0) if config else 5.0
+    # Env overrides (useful for VPS)
+    import os as _os
+    if _os.environ.get("HARNESS_PROVIDER_RETRIES"):
+        try:
+            max_retries = int(_os.environ["HARNESS_PROVIDER_RETRIES"])
+        except Exception:
+            pass
+    if _os.environ.get("HARNESS_PROVIDER_RETRY_DELAY"):
+        try:
+            base_delay = float(_os.environ["HARNESS_PROVIDER_RETRY_DELAY"])
+        except Exception:
+            pass
 
     cls = cfg_entry["class"]
     if cls is AnthropicProvider or cls is GeminiProvider:
-        return cls(api_key=api_key, base_url=base_url)
+        return cls(api_key=api_key, base_url=base_url, max_retries=max_retries, base_delay=base_delay)
     elif cls is MockProvider:
         return MockProvider()
     else:
@@ -139,6 +154,8 @@ def get_provider(provider_name: str, config: Optional[HarnessConfig] = None) -> 
             api_key=api_key,
             user_agent=cfg_entry.get("user_agent"),
             extra_headers=extra_headers,
+            max_retries=max_retries,
+            base_delay=base_delay,
         )
 
 def list_providers() -> Dict[str, str]:

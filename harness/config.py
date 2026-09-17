@@ -79,9 +79,20 @@ class HarnessConfig:
     max_subagents: int = 4
     timeout_seconds: int = 120
     swarm_enabled: bool = False      # Enable agent swarms (always active in SUPER mode)
+    provider_max_retries: int = 3    # Number of retries for provider errors (exponential backoff)
+    provider_retry_base_delay: float = 5.0  # Base delay in seconds for first retry (doubles each retry: 5,10,20...)
     force_media_attach: bool = False # Force-attach images even when the model isn't flagged vision-capable
     vfb_provider: str = "" # Vision fallback provider; when set, degraded media get described via this provider
     vfb_model: str = ""    # Vision fallback model; empty => the provider's default model
+    # API server (replaces old mesh peer network) — localhost by default, 0.0.0.0 for VPS
+    server_enabled: bool = True      # Enable HTTP API server (also started when harness TUI opens)
+    server_host: str = "127.0.0.1"    # Bind host: 127.0.0.1 (local) or 0.0.0.0 (VPS)
+    server_port: int = 0             # 0 => auto hash-based (base*100+idx), else explicit port
+    server_token: str = ""           # Optional bearer token for API auth (or HARNESS_API_TOKEN env)
+    # Backward compat: old mesh_* aliases
+    mesh_enabled: bool = True        # Deprecated: use server_enabled
+    mesh_host: str = "127.0.0.1"      # Deprecated: use server_host
+    mesh_auto_connect: bool = False  # Deprecated: no longer used (peer mesh removed)
     discord_bot_token: str = ""   # Discord bot token (stored in the secure store; DISCORD_BOT_TOKEN env fallback)
     discord_channel_ids: str = "" # Deprecated: use discord_blacklisted_channels / discord_whitelisted_channels
     discord_guild_id: str = ""    # Guild ID to sync slash commands to instantly (optional; otherwise global)
@@ -205,9 +216,32 @@ class HarnessConfig:
     def set_base_url(self, provider_name: str, url: str) -> None:
         self.base_urls[provider_name.lower().strip()] = normalize_provider_base_url(provider_name, url.strip())
 
+    def is_server_enabled(self) -> bool:
+        """Effective server enabled (supports old mesh_enabled alias)."""
+        # If either is explicitly False, server is disabled
+        if not self.server_enabled:
+            return False
+        if not self.mesh_enabled:
+            return False
+        return True
+
+    def get_server_token(self) -> Optional[str]:
+        if self.server_token:
+            return self.server_token.strip()
+        # Fallback to env
+        env = os.environ.get("HARNESS_API_TOKEN") or os.environ.get("HARNESS_SERVER_TOKEN")
+        if env:
+            return env.strip()
+        return None
+
     def set_field(self, key: str, value: str) -> bool:
         """Update any configuration field with automatic type conversion."""
         k = key.lower().strip()
+        # Alias old mesh_* to server_*
+        if k == "mesh_enabled":
+            k = "server_enabled"
+        elif k == "mesh_host":
+            k = "server_host"
         if not hasattr(self, k):
             return False
 
@@ -280,6 +314,18 @@ def load_config() -> HarnessConfig:
         if not stored:
             secure_store.set_key("discord", config.discord_bot_token)
         config.discord_bot_token = stored or config.discord_bot_token
+
+    # Backward compat: sync old mesh_* to new server_* if server_* not explicitly set
+    # (If user set mesh_enabled=false in config, respect it)
+    try:
+        # If config file had mesh_enabled=false, ensure server_enabled reflects it
+        # We can't know if it was explicitly set, so if mesh_enabled is False, force server_enabled False
+        if not config.mesh_enabled:
+            config.server_enabled = False
+        if config.mesh_host != "127.0.0.1" and config.server_host == "127.0.0.1":
+            config.server_host = config.mesh_host
+    except Exception:
+        pass
 
     # Enforce restrictive file permissions on config files
     secure_store.ensure_file_permissions()

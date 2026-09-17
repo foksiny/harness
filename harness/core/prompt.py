@@ -131,6 +131,7 @@ class SystemPromptBuilder:
         swarm_enabled: bool = False,
         learned_lessons: str = "",
         degrade_verbose: bool = False,
+        mesh_info: str = "",
     ) -> str:
         """Assemble the system prompt.
 
@@ -218,6 +219,10 @@ class SystemPromptBuilder:
         # 6b. Learned lessons (persistent agent memory, matched to current task)
         if learned_lessons:
             sections.append(f"\n## LEARNED LESSONS (PRIOR MEMORY):\n{learned_lessons}")
+
+        # 6c. API server (replaces old mesh)
+        if mesh_info:
+            sections.append(f"\n## API SERVER:\n{mesh_info}")
 
         # 7. Custom instructions
         if custom_instructions:

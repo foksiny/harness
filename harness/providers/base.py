@@ -30,9 +30,19 @@ class BaseProvider(ABC):
     display_name: str
     default_model: str
 
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, max_retries: int = 3, base_delay: float = 5.0):
         self.api_key = api_key
         self.base_url = base_url
+        self.max_retries = max(0, int(max_retries))
+        self.base_delay = max(0.1, float(base_delay))
+
+    def _is_retryable_http_code(self, code: int) -> bool:
+        # Retry on rate limit and transient server errors
+        return code in (408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529)
+
+    def _retry_delay(self, attempt: int) -> float:
+        # Exponential backoff: base * 2^attempt  (attempt 0 => 5s, 1=>10s, 2=>20s)
+        return self.base_delay * (2 ** attempt)
 
     def get_model_spec(self, model_name: Optional[str] = None) -> ModelSpec:
         """Resolve model specifications using model-specific dynamic detection and discovery."""
@@ -52,6 +62,11 @@ class BaseProvider(ABC):
             return {}
 
         ttype = model_spec.thinking_type or "reasoning_effort"
+        # NVIDIA NIM does not support the Together-style reasoning toggle.
+        # For models wrongly marked toggle but hosted on NVIDIA, silently disable
+        # reasoning so we never send {"reasoning": {"enabled": true}} to NIM.
+        if ttype == "reasoning_toggle" and getattr(self, "name", "") == "nvidia":
+            return {}
         eff = effort_setting.lower().strip()
         off = eff in ("off", "none", "false", "disabled", "no", "0", "disable", "stop", "cancel")
 

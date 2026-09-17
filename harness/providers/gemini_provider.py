@@ -3,6 +3,7 @@ Google Gemini Provider for Harness.
 Supports Gemini 2.5 Pro, 2.5 Flash, 2.0 Flash, thinking budget, and function declarations.
 """
 import json
+import time
 import urllib.request
 import urllib.error
 from typing import Dict, Any, List, Optional, Iterator
@@ -14,8 +15,8 @@ class GeminiProvider(BaseProvider):
     display_name = "Google Gemini"
     default_model = "gemini-2.5-pro"
 
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
-        super().__init__(api_key=api_key, base_url=base_url or "https://generativelanguage.googleapis.com/v1beta")
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, max_retries: int = 3, base_delay: float = 5.0):
+        super().__init__(api_key=api_key, base_url=base_url or "https://generativelanguage.googleapis.com/v1beta", max_retries=max_retries, base_delay=base_delay)
 
     def _user_parts(self, content):
         """Convert canonical content (str or block list) to Gemini parts."""
@@ -121,58 +122,82 @@ class GeminiProvider(BaseProvider):
         data_bytes = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(endpoint, data=data_bytes, headers=headers, method="POST")
 
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                buffer = ""
-                for raw_line in resp:
-                    line = raw_line.decode("utf-8", errors="replace")
-                    buffer += line
+        for attempt in range(self.max_retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    buffer = ""
+                    saw_payload = False
+                    for raw_line in resp:
+                        line = raw_line.decode("utf-8", errors="replace")
+                        buffer += line
 
-                    while "\n" in buffer:
-                        line_str, buffer = buffer.split("\n", 1)
-                        line_str = line_str.strip()
+                        while "\n" in buffer:
+                            line_str, buffer = buffer.split("\n", 1)
+                            line_str = line_str.strip()
 
-                        if not line_str or line_str.startswith(":"):
-                            continue
-
-                        if line_str.startswith("data: "):
-                            data_str = line_str[6:].strip()
-                            try:
-                                chunk = json.loads(data_str)
-                                candidates = chunk.get("candidates", [])
-                                if not candidates:
-                                    continue
-                                cand = candidates[0]
-                                content_part = cand.get("content", {})
-                                parts = content_part.get("parts", [])
-
-                                for p in parts:
-                                    if p.get("thought"):
-                                        yield LLMChunk(delta_reasoning=p.get("text", ""))
-                                    elif "text" in p:
-                                        yield LLMChunk(delta_text=p["text"])
-                                    elif "functionCall" in p:
-                                        fc = p["functionCall"]
-                                        yield LLMChunk(
-                                            tool_calls=[ToolCallDelta(
-                                                index=0,
-                                                id=f"gemini_call_{fc.get('name')}",
-                                                name=fc.get("name"),
-                                                arguments_delta=json.dumps(fc.get("args", {})),
-                                            )]
-                                        )
-
-                                finish = cand.get("finishReason")
-                                if finish:
-                                    yield LLMChunk(finish_reason=finish)
-
-                            except Exception:
+                            if not line_str or line_str.startswith(":"):
                                 continue
 
-        except urllib.error.HTTPError as he:
-            err_body = he.read().decode("utf-8", errors="ignore")
-            yield LLMChunk(delta_text=f"\n[HTTP Error {he.code} from Gemini: {err_body}]\n", finish_reason="error")
-        except urllib.error.URLError as ue:
-            yield LLMChunk(delta_text=f"\n[Connection Error with Gemini: {str(ue)}]\n", finish_reason="error")
-        except Exception as ex:
-            yield LLMChunk(delta_text=f"\n[Unexpected Error from Gemini: {str(ex)}]\n", finish_reason="error")
+                            if line_str.startswith("data: "):
+                                data_str = line_str[6:].strip()
+                                try:
+                                    chunk = json.loads(data_str)
+                                    candidates = chunk.get("candidates", [])
+                                    if not candidates:
+                                        continue
+                                    cand = candidates[0]
+                                    content_part = cand.get("content", {})
+                                    parts = content_part.get("parts", [])
+
+                                    for p in parts:
+                                        if p.get("thought"):
+                                            saw_payload = True
+                                            yield LLMChunk(delta_reasoning=p.get("text", ""))
+                                        elif "text" in p:
+                                            saw_payload = True
+                                            yield LLMChunk(delta_text=p["text"])
+                                        elif "functionCall" in p:
+                                            saw_payload = True
+                                            fc = p["functionCall"]
+                                            yield LLMChunk(
+                                                tool_calls=[ToolCallDelta(
+                                                    index=0,
+                                                    id=f"gemini_call_{fc.get('name')}",
+                                                    name=fc.get("name"),
+                                                    arguments_delta=json.dumps(fc.get("args", {})),
+                                                )]
+                                            )
+
+                                    finish = cand.get("finishReason")
+                                    if finish:
+                                        saw_payload = True
+                                        yield LLMChunk(finish_reason=finish)
+
+                                except Exception:
+                                    continue
+                    return
+            except urllib.error.HTTPError as he:
+                err_body = he.read().decode("utf-8", errors="ignore") if hasattr(he, "read") else str(he)
+                if not he.code or not self._is_retryable_http_code(he.code) or attempt >= self.max_retries:
+                    yield LLMChunk(delta_text=f"\n[HTTP Error {he.code} from Gemini: {err_body}]\n", finish_reason="error")
+                    return
+                delay = self._retry_delay(attempt)
+                try:
+                    retry_after = he.headers.get("Retry-After") if hasattr(he, "headers") and he.headers else None
+                    if retry_after:
+                        delay = max(delay, float(retry_after))
+                except Exception:
+                    pass
+                time.sleep(delay)
+                continue
+            except urllib.error.URLError as ue:
+                if attempt >= self.max_retries:
+                    yield LLMChunk(delta_text=f"\n[Connection Error with Gemini: {str(ue)}]\n", finish_reason="error")
+                    return
+                delay = self._retry_delay(attempt)
+                time.sleep(delay)
+                continue
+            except Exception as ex:
+                yield LLMChunk(delta_text=f"\n[Unexpected Error from Gemini: {str(ex)}]\n", finish_reason="error")
+                return
+        yield LLMChunk(delta_text=f"\n[Error from Gemini: exhausted {self.max_retries} retries]\n", finish_reason="error")

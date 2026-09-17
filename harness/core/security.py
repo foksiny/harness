@@ -172,7 +172,6 @@ def enforce_workspace_boundary(path: str, operation: str = "access", workspace: 
     """Return an error message if the path is outside workspace, else None."""
     if not is_within_workspace(path, workspace):
         ws = Path(workspace or os.getcwd()).expanduser().resolve()
-        # Fix grammar: "write" -> "written", "delete" -> "deleted", etc.
         op_past = operation.rstrip("e") + "ed" if operation.endswith("e") else operation + "ed"
         if operation == "write":
             op_past = "written"
@@ -183,7 +182,7 @@ def enforce_workspace_boundary(path: str, operation: str = "access", workspace: 
         return (
             f"Error: {operation} denied — path '{path}' is outside the workspace ({ws}). "
             f"Only files within the project directory can be {op_past}. "
-            f"To access files outside the workspace, ask the user to adjust the workspace boundary."
+            f"To access files outside the workspace, restart harness in the correct directory or adjust the workspace."
         )
     return None
 

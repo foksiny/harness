@@ -21,8 +21,96 @@ from harness.commands.config_cmd import (
 )
 from harness.tools.git_tools import check_git_behind, get_git_update_command
 
+def handle_server_command(args: list, renderer: TerminalRenderer, config) -> None:
+    """Handle `harness serve` / `harness mesh` status."""
+    # Support both `harness serve` and legacy `harness mesh`
+    sub = args[0].lower()
+    if sub == "serve":
+        # `harness serve [--host HOST] [--port PORT] [--token TOKEN]`
+        # Run as headless API server (no TUI)
+        import argparse as _ap
+        p = _ap.ArgumentParser(prog="harness serve")
+        p.add_argument("--host", default=getattr(config, "server_host", "127.0.0.1"), help="Bind host (0.0.0.0 for VPS)")
+        p.add_argument("--port", type=int, default=int(getattr(config, "server_port", 0) or 0), help="Port (0=auto hash-based)")
+        p.add_argument("--token", default=getattr(config, "server_token", "") or "", help="Bearer token for auth")
+        try:
+            ns, _ = p.parse_known_args(args[1:])
+        except SystemExit:
+            return
+        host = ns.host
+        port = ns.port
+        token = ns.token
+        # Update config for this run
+        config.server_host = host
+        config.server_port = port
+        if token:
+            config.server_token = token
+        renderer.print_info(f"Starting Harness API server at http://{host}:{port if port else 'auto'} (workspace {__import__('os').getcwd()})...")
+        from harness.core.agent import HarnessAgent
+        from harness.mesh.server import start_server
+        import time as _time
+        agent = HarnessAgent(config=config)
+        srv = start_server(workspace=__import__("os").getcwd(), host=host, port=port if port else None, agent_ref=lambda: agent, config=config, enable=True)
+        if srv is None:
+            renderer.print_error("Failed to start API server.")
+            return
+        renderer.print_success(f"API server running at http://{srv.host}:{srv.port}")
+        renderer.print_info(f"  POST http://{srv.host}:{srv.port}/api/prompt {{\"prompt\": \"...\"}}")
+        renderer.print_info(f"  GET  http://{srv.host}:{srv.port}/health")
+        renderer.print_info(f"  Use HARNESS_API_TOKEN env or --token for auth. Press Ctrl+C to stop.")
+        try:
+            while True:
+                _time.sleep(1)
+        except KeyboardInterrupt:
+            renderer.print_info("Shutting down API server...")
+            try:
+                from harness.mesh.server import stop_server
+                stop_server()
+            except Exception:
+                pass
+        return
+
+    # Legacy `harness mesh` / `harness server status`
+    from harness.mesh.server import get_server, get_mesh
+    from harness.mesh.port import compute_base_port
+    import os, getpass
+    sub2 = args[1].lower() if len(args) > 1 else "status"
+    # Try new server first, fallback to old mesh
+    srv = None
+    try:
+        srv = get_server()
+    except Exception:
+        srv = None
+    if srv is None:
+        try:
+            srv = get_mesh()
+        except Exception:
+            srv = None
+    if sub2 in ("status", "info"):
+        if srv is None:
+            ws = os.getcwd()
+            user = getpass.getuser()
+            base = compute_base_port(ws, user)
+            renderer.print_info(
+                f"API server not active in this process.\n"
+                f"  Would bind to 127.0.0.1:{base}00-{base}99 (base {base} hash workspace+user).\n"
+                f"  Workspace: {ws}\n  User: {user}\n"
+                f"  Run `harness` to start TUI + API, or `harness serve --host 0.0.0.0 --port 8000` for VPS."
+            )
+        else:
+            st = srv.get_status()
+            renderer.print_info(
+                f"API server active at http://{st.get('host')}:{st.get('port')}\n"
+                f"  Workspace: {st.get('workspace')}\n"
+                f"  Model: {st.get('provider')}/{st.get('model')}  busy={st.get('is_busy')}\n"
+                f"  API: POST http://{st.get('host')}:{st.get('port')}/api/prompt"
+            )
+        return
+    else:
+        renderer.print_info("Usage: harness serve [--host HOST] [--port PORT] | harness mesh status")
+
 def handle_subcommands(args: list) -> bool:
-    """Handle CLI subcommands: config, keys, setup, theme, update."""
+    """Handle CLI subcommands: config, keys, setup, theme, update, serve, mesh."""
     if not args:
         return False
 
@@ -111,6 +199,10 @@ def handle_subcommands(args: list) -> bool:
         token = args[1] if len(args) > 1 and not args[1].startswith("--") else None
         return run_discord_bot(config, token=token)
 
+    elif sub in ("mesh", "serve", "server"):
+        handle_server_command(args, renderer, config)
+        return True
+
     return False
 
 
@@ -170,6 +262,68 @@ def handle_update_command(renderer: TerminalRenderer) -> None:
         renderer.print_error(f"Git error: {e.output.decode('utf-8', errors='ignore') if e.output else str(e)}")
     except Exception as ex:
         renderer.print_error(f"Update failed: {str(ex)}")
+
+def _maybe_start_server(config: HarnessConfig, agent=None, renderer=None) -> None:
+    """Start the HTTP API server if enabled (replaces old mesh peer network).
+
+    Binds to host/port from config (server_host/server_port) or auto hash-based
+    port. No peer detection — just a single API endpoint for external clients
+    and VPS usage. Best-effort: failure never blocks the CLI.
+    """
+    # Support both new server_* and old mesh_* config keys
+    enabled = getattr(config, "server_enabled", None)
+    if enabled is None:
+        enabled = getattr(config, "mesh_enabled", True)
+    if not enabled:
+        return
+    if getattr(config, "server_enabled", True) is False:
+        return
+    if getattr(config, "mesh_enabled", True) is False:
+        # Old mesh flag also disables server if explicitly false
+        # (but server_enabled takes precedence if set)
+        if getattr(config, "server_enabled", True) is True and config.mesh_enabled is False:
+            return
+    if "PYTEST_CURRENT_TEST" in __import__("os").environ:
+        return
+    if __import__("os").environ.get("HARNESS_NO_MESH") == "1" or __import__("os").environ.get("HARNESS_NO_SERVER") == "1":
+        return
+    try:
+        from harness.mesh.server import start_server
+        host = getattr(config, "server_host", None) or getattr(config, "mesh_host", "127.0.0.1") or "127.0.0.1"
+        port = getattr(config, "server_port", 0) or 0
+        # 0 => auto hash-based (base*100+idx)
+        srv = start_server(
+            workspace=__import__("os").getcwd(),
+            host=host,
+            port=port if port else None,
+            agent_ref=lambda: agent,
+            config=config,
+            enable=True,
+        )
+        if srv is None:
+            return
+        import atexit
+        atexit.register(lambda: __import__("harness.mesh.server", fromlist=["stop_server"]).stop_server())
+        if renderer:
+            # Show single line, no peer prompt
+            try:
+                renderer.print_info(f"[api] API server at http://{srv.host}:{srv.port}  (POST /api/prompt, GET /health)")
+            except Exception:
+                pass
+        else:
+            try:
+                print(f"[api] API server at http://{srv.host}:{srv.port}", flush=True)
+            except Exception:
+                pass
+    except Exception as ex:
+        try:
+            print(f"[api] startup warning: {ex}", file=__import__("sys").stderr)
+        except Exception:
+            pass
+
+# Backward compat alias
+def _maybe_start_mesh(config, agent=None, renderer=None):
+    return _maybe_start_server(config, agent, renderer)
 
 def _maybe_start_discord_bot(config: HarnessConfig) -> None:
     """Start the Discord bot in a background daemon thread if auto_start is enabled.
@@ -231,18 +385,17 @@ Subcommands:
   theme [list|preview]                  Browse or preview visual themes
   update                                Pull latest changes from upstream repository
   discord [token]                       Launch the Discord bot (bound to your Harness config)
+  serve [--host HOST] [--port PORT]     Run as headless HTTP API server (for VPS)
 
 Examples:
-  harness                               # Launch interactive TUI
+  harness                               # Launch interactive TUI (+ API at http://127.0.0.1:<port>/api/prompt)
   harness "Implement a caching layer"   # Run single-shot task
   harness --mode plan "Design system"   # Plan mode (read-only architectural analysis)
   harness --super "Fix all unit tests"  # Autonomous Super Mode loop
+  harness serve --host 0.0.0.0 --port 8000  # VPS mode
   harness keys set openai               # Set API key securely
   harness theme preview dracula         # View visual theme preview card
-  harness update                        # Update to latest version
-  harness keys set discord <token>      # Store your Discord bot token
-  harness discord                       # Start the Discord bot
-  cat error.log | harness "Debug error" # Read piped stdin input
+  curl -X POST http://127.0.0.1:PORT/api/prompt -H "Content-Type: application/json" -d '{"prompt":"hello"}'
         """,
     )
     parser.add_argument("prompt", nargs="?", help="Initial user prompt or instruction (optional).")
@@ -254,6 +407,10 @@ Examples:
     parser.add_argument("--theme", help="Color theme (14 available).")
     parser.add_argument("--effort", help="Thinking / reasoning effort (off, low, medium, high, or integer tokens).")
     parser.add_argument("--resume", help="Resume existing session by ID.")
+    parser.add_argument("--host", help="API server bind host (for serve mode, default 127.0.0.1)")
+    parser.add_argument("--port", type=int, help="API server port (0=auto)")
+    parser.add_argument("--no-mesh", action="store_true", help="Disable the API server (deprecated, use --no-server).")
+    parser.add_argument("--no-server", action="store_true", help="Disable the HTTP API server.")
     parser.add_argument("-v", "--version", action="version", version=f"Harness v{__version__}")
     return parser
 
@@ -263,10 +420,10 @@ def main():
     enable_windows_vt_processing()
     ensure_utf8_stdout()
 
-    # Intercept subcommands first
-    if len(sys.argv) > 1 and sys.argv[1] in ("config", "keys", "setup", "theme", "update", "discord"):
+    # Intercept subcommands first (serve/mesh handled here to avoid argparse)
+    if len(sys.argv) > 1 and sys.argv[1] in ("config", "keys", "setup", "theme", "update", "discord", "mesh", "serve", "server"):
         result = handle_subcommands(sys.argv[1:])
-        if isinstance(result, int):  # e.g. `harness discord` returns a process exit code
+        if isinstance(result, int):
             sys.exit(result)
         return
 
@@ -301,6 +458,13 @@ def main():
         config.theme = args.theme
     if args.effort:
         config.thinking_effort = args.effort
+    if args.no_mesh or args.no_server:
+        config.server_enabled = False
+        config.mesh_enabled = False
+    if args.host:
+        config.server_host = args.host
+    if args.port:
+        config.server_port = args.port
 
     # Detect piped stdin
     piped_content = ""
@@ -331,6 +495,9 @@ def main():
         config=config,
         session=session,
     )
+
+    # Start API server (best-effort, no peer mesh)
+    _maybe_start_server(config, agent=agent, renderer=TerminalRenderer(config.theme) if not full_prompt else None)
 
     if full_prompt:
         # Non-interactive / Headless single-shot execution

@@ -16,6 +16,7 @@ from harness.tools.git_tools import GitStatusTool, GitDiffTool
 from harness.tools.skill_tools import ListSkillsTool, ReadSkillTool
 from harness.tools.finish import FinishTool
 from harness.tools.learning_tools import LearnRecordTool, LearnRecallTool, LearnPromoteTool
+from harness.tools.mesh_tools import MeshStatusTool, MeshListPeersTool, MeshSendMessageTool, MeshBroadcastTool, MeshReadMessagesTool
 from harness.skills.loader import SkillsManager
 from harness.core.modes import Mode, is_tool_allowed_in_mode
 from harness.core.permissions import PermissionManager
@@ -94,6 +95,16 @@ class ToolRegistry:
             self.register(LearnRecordTool(self.learning_manager))
             self.register(LearnRecallTool(self.learning_manager))
             self.register(LearnPromoteTool(self.learning_manager))
+
+        # API server (no inter-instance mesh) — keep stubs for backward compat
+        try:
+            self.register(MeshStatusTool())
+            self.register(MeshListPeersTool())
+            self.register(MeshSendMessageTool())
+            self.register(MeshBroadcastTool())
+            self.register(MeshReadMessagesTool())
+        except Exception:
+            pass
 
     def register(self, tool: Tool) -> None:
         self.tools[tool.name] = tool

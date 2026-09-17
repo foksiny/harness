@@ -183,6 +183,7 @@ class CommandRegistry:
         self.register("back", self._cmd_back, "Return to the parent agent view (ESC).")
         self.register("compact", self._cmd_compact, "Trigger manual conversation context compaction.")
         self.register("session", self._cmd_session, "Manage sessions: /session list, create [title], delete <id>, rename <id> <title>, fork [title], resume <id>.")
+        self.register("mesh", self._cmd_mesh, "Mesh network: /mesh status, /mesh peers, /mesh send <port> <msg>, /mesh broadcast <msg>.")
         self.register("checkpoint", self._cmd_checkpoint, "Manage checkpoints: /checkpoint list, create [label], undo, redo.")
         self.register("tokens", self._cmd_tokens, "Display live token metrics, context window ratio, and RAM.")
         self.register("diff", self._cmd_diff, "Show uncommitted git changes.")
@@ -755,6 +756,50 @@ class CommandRegistry:
                 f"Compactions this session: `{len(ctx.agent.compactor.ledger)}`",
             ])
         )
+
+    def _cmd_mesh(self, ctx: CommandContext):
+        args = ctx.args.strip()
+        if not args or args.lower() in ("status", "info"):
+            res = ctx.agent.tool_registry.execute("mesh_status", {}, ctx.agent.mode)
+            ctx.renderer.print_info(res)
+            return
+        parts = args.split(" ", 2)
+        sub = parts[0].lower()
+        if sub == "peers":
+            res = ctx.agent.tool_registry.execute("mesh_list_peers", {}, ctx.agent.mode)
+            ctx.renderer.print_info(res)
+        elif sub == "send" and len(parts) >= 3:
+            try:
+                port = int(parts[1])
+                msg = parts[2]
+                res = ctx.agent.tool_registry.execute("mesh_send_message", {"port": port, "message": msg}, ctx.agent.mode)
+                ctx.renderer.print_info(res)
+            except Exception as ex:
+                ctx.renderer.print_error(f"Usage: /mesh send <port> <message> ({ex})")
+        elif sub == "broadcast":
+            msg = args[len("broadcast"):].strip() or (parts[1] if len(parts) > 1 else "")
+            if not msg:
+                ctx.renderer.print_error("Usage: /mesh broadcast <message>")
+                return
+            res = ctx.agent.tool_registry.execute("mesh_broadcast", {"message": msg}, ctx.agent.mode)
+            ctx.renderer.print_info(res)
+        elif sub == "read":
+            since = 0
+            try:
+                since = int(parts[1]) if len(parts) > 1 else 0
+            except Exception:
+                since = 0
+            res = ctx.agent.tool_registry.execute("mesh_read_messages", {"since_id": since}, ctx.agent.mode)
+            ctx.renderer.print_info(res)
+        else:
+            ctx.renderer.print_info(
+                "Mesh commands:\n"
+                "  /mesh status — show mesh port, block, peers, and API\n"
+                "  /mesh peers — list peers in this workspace+user\n"
+                "  /mesh send <port> <msg> — send to a specific peer\n"
+                "  /mesh broadcast <msg> — broadcast to all peers\n"
+                "  /mesh read [since_id] — read inbound messages"
+            )
 
     def _cmd_checkpoint(self, ctx: CommandContext):
         parts = ctx.args.split(" ", 1)

@@ -1062,6 +1062,41 @@ class HarnessAgent:
         todos_md = self.todo_manager.format_markdown()
         swarm_enabled = self.config.swarm_enabled or self.mode == Mode.SUPER
         learned_lessons = self.learning_manager.format_top(current_query or "") if self.config.learning_enabled else ""
+        # API server info (no peer mesh — single HTTP endpoint for remote/VPS)
+        mesh_info = ""
+        try:
+            if getattr(self.config, "server_enabled", getattr(self.config, "mesh_enabled", True)):
+                from harness.mesh.server import get_server, get_mesh
+                srv = None
+                try:
+                    srv = get_server()
+                except Exception:
+                    srv = None
+                if srv is None:
+                    try:
+                        srv = get_mesh()
+                    except Exception:
+                        srv = None
+                if srv is not None:
+                    mesh_info = (
+                        f"API server is running for this Harness instance.\n"
+                        f"- Endpoint: http://{srv.host}:{srv.port} (base {srv.base} => block {srv.base}00-{srv.base}99) — "
+                        f"POST /api/prompt {{\"prompt\": \"...\", \"session_id\": \"...\"}} -> {{\"response\": \"...\"}}\n"
+                        f"- Workspace: {srv.workspace} | User: {srv.username} | Token required: {bool(getattr(srv, 'server_token', None) or getattr(self.config, 'server_token', None))}\n"
+                        f"- Use mesh_status tool to see the endpoint, or curl from any client/VPS."
+                    )
+                else:
+                    import os as _os
+                    from harness.mesh.port import compute_base_port as _cbp
+                    _base = _cbp(_os.getcwd())
+                    mesh_info = (
+                        f"API server (HTTP) will start when harness opens (if server_enabled=true).\n"
+                        f"- Expected block: {_base}00-{_base}99 (base {_base} hash workspace+user) — POST /api/prompt for remote use.\n"
+                        f"- For VPS: `harness serve --host 0.0.0.0 --port 8000` and set HARNESS_API_TOKEN.\n"
+                        f"- Tool: mesh_status shows the live endpoint."
+                    )
+        except Exception:
+            mesh_info = ""
         # Context pressure feeds back into prompt assembly: when we're already
         # deep into the window, elide the verbose MCP tool summaries so the
         # system prompt doesn't crowd out the working history.
@@ -1076,6 +1111,7 @@ class HarnessAgent:
             swarm_enabled=swarm_enabled,
             learned_lessons=learned_lessons,
             degrade_verbose=degrade_verbose,
+            mesh_info=mesh_info,
         )
 
     def _summarize_block(self, messages: List[Dict[str, Any]]) -> Optional[str]:
