@@ -84,13 +84,13 @@ class HarnessConfig:
     force_media_attach: bool = False # Force-attach images even when the model isn't flagged vision-capable
     vfb_provider: str = "" # Vision fallback provider; when set, degraded media get described via this provider
     vfb_model: str = ""    # Vision fallback model; empty => the provider's default model
-    # API server (replaces old mesh peer network) — localhost by default, 0.0.0.0 for VPS
-    server_enabled: bool = True      # Enable HTTP API server (also started when harness TUI opens)
+    # API server — disabled by default for `harness`, requires explicit args to activate
+    server_enabled: bool = False     # Enable HTTP API server (requires --server / serve / --host/--port)
     server_host: str = "127.0.0.1"    # Bind host: 127.0.0.1 (local) or 0.0.0.0 (VPS)
     server_port: int = 0             # 0 => auto hash-based (base*100+idx), else explicit port
     server_token: str = ""           # Optional bearer token for API auth (or HARNESS_API_TOKEN env)
     # Backward compat: old mesh_* aliases
-    mesh_enabled: bool = True        # Deprecated: use server_enabled
+    mesh_enabled: bool = False       # Deprecated: use server_enabled
     mesh_host: str = "127.0.0.1"      # Deprecated: use server_host
     mesh_auto_connect: bool = False  # Deprecated: no longer used (peer mesh removed)
     discord_bot_token: str = ""   # Discord bot token (stored in the secure store; DISCORD_BOT_TOKEN env fallback)
@@ -218,12 +218,8 @@ class HarnessConfig:
 
     def is_server_enabled(self) -> bool:
         """Effective server enabled (supports old mesh_enabled alias)."""
-        # If either is explicitly False, server is disabled
-        if not self.server_enabled:
-            return False
-        if not self.mesh_enabled:
-            return False
-        return True
+        # New default is False; enable if either flag is True (backward compat)
+        return bool(self.server_enabled or self.mesh_enabled)
 
     def get_server_token(self) -> Optional[str]:
         if self.server_token:

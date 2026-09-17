@@ -409,6 +409,7 @@ Examples:
     parser.add_argument("--resume", help="Resume existing session by ID.")
     parser.add_argument("--host", help="API server bind host (for serve mode, default 127.0.0.1)")
     parser.add_argument("--port", type=int, help="API server port (0=auto)")
+    parser.add_argument("--server", action="store_true", help="Enable the HTTP API server (required for harness TUI; use serve for VPS).")
     parser.add_argument("--no-mesh", action="store_true", help="Disable the API server (deprecated, use --no-server).")
     parser.add_argument("--no-server", action="store_true", help="Disable the HTTP API server.")
     parser.add_argument("-v", "--version", action="version", version=f"Harness v{__version__}")
@@ -458,13 +459,28 @@ def main():
         config.theme = args.theme
     if args.effort:
         config.thinking_effort = args.effort
+    # Server activation: disabled by default for `harness` TUI, requires explicit flag
+    # `harness serve` subcommand always enables (handled separately), but for `harness`
+    # we enable only if --server or --host/--port is given, or config server_enabled=true
+    server_argv = sys.argv[1:]
+    wants_server = args.server or args.host is not None or args.port is not None
+    if wants_server:
+        config.server_enabled = True
+        config.mesh_enabled = True
     if args.no_mesh or args.no_server:
         config.server_enabled = False
         config.mesh_enabled = False
     if args.host:
         config.server_host = args.host
+        # --host implies server enabled unless explicitly disabled
+        if not args.no_server and not args.no_mesh:
+            config.server_enabled = True
+            config.mesh_enabled = True
     if args.port:
         config.server_port = args.port
+        if not args.no_server and not args.no_mesh:
+            config.server_enabled = True
+            config.mesh_enabled = True
 
     # Detect piped stdin
     piped_content = ""
