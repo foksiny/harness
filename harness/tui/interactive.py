@@ -108,11 +108,224 @@ def _poll_sync_bus(agent: HarnessAgent, renderer: TerminalRenderer, cursor, acti
         pass
 
 
+def _input_with_echo_visible(prompt: str) -> str:
+    """Read input with terminal echo forcibly restored.
+
+    The TUI wraps the entire agent turn in `no_echo_stdin()` which disables
+    ECHO via termios to avoid Ctrl-C/ESC leak. While that context is active
+    a plain `input()` would be invisible. This helper briefly restores echo,
+    reads, prints an explicit  ↳ You typed:  line, and lets the outer
+    no_echo re-apply.
+    """
+    import sys
+    restored = False
+    old_attrs = None
+    fd = None
+    try:
+        import termios
+        try:
+            fd = sys.stdin.fileno()
+            if sys.stdin.isatty():
+                old_attrs = termios.tcgetattr(fd)
+                import termios as _t
+                if not (old_attrs[3] & _t.ECHO):
+                    new_attrs = termios.tcgetattr(fd)
+                    new_attrs[3] |= _t.ECHO | _t.ECHOCTL | _t.ECHOE | _t.ECHOK
+                    termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
+                    restored = True
+        except Exception:
+            pass
+    except ImportError:
+        pass
+    try:
+        raw = input(prompt)
+        # Explicit echo line (input() already echoed, this is an extra confirmation)
+        try:
+            from rich.console import Console
+            Console().print(f"[dim]↳ You typed:[/dim] [bold cyan]{raw}[/bold cyan]")
+        except Exception:
+            print(f"↳ You typed: {raw}")
+        return raw
+    finally:
+        if restored and old_attrs is not None and fd is not None:
+            try:
+                import termios
+                termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
+            except Exception:
+                pass
+
+
+def _make_tui_ask_handler(renderer: TerminalRenderer, input_handler: InputHandler):
+    """Create an ask_user handler that shows rich details and echo-visible input."""
+    def handler(question: str, options: list, allow_custom: bool, recommended: str | None) -> str:
+        import time as _time
+        opts = options or []
+        # Rich detailed panel
+        try:
+            from rich.panel import Panel
+            from rich.table import Table
+            meta = [
+                f"[bold white]{question}[/bold white]",
+                "",
+                f"[dim]Time: {_time.strftime('%Y-%m-%d %H:%M:%S')}  |  Options: {len(opts)}  |  Custom: {'yes' if allow_custom else 'no'}[/dim]",
+            ]
+            if recommended:
+                meta.append(f"[yellow]★ Recommended: {recommended}[/yellow]")
+            renderer.console.print(Panel("\n".join(meta), title="🤖 HARNESS — Question", border_style="cyan", padding=(1, 2)))
+            if opts:
+                table = Table(show_header=False, box=None, padding=(0, 1))
+                table.add_column("No.", style="bold cyan", width=4)
+                table.add_column("Option", style="white")
+                table.add_column("Badge", style="yellow")
+                for idx, opt in enumerate(opts, 1):
+                    badge = "★ RECOMMENDED" if (recommended and recommended.lower() in opt.lower()) else ""
+                    table.add_row(f"[{idx}]", opt, badge)
+                if allow_custom:
+                    table.add_row("[0]", "[dim]Type a custom write-in response[/dim]", "")
+                renderer.console.print(table)
+                renderer.console.print("[dim]Tip: type number, or type your answer directly. Your typing will be shown as  ↳ You typed: ...[/dim]\n")
+            else:
+                renderer.console.print("[dim]Your typing will be echoed visibly.[/dim]\n")
+        except Exception:
+            # Fallback to plain prints
+            print("\n" + "=" * 60)
+            print(f"🤖 [HARNESS IS ASKING FOR YOUR INPUT]\n❓ {question}\n")
+            if opts:
+                for idx, opt in enumerate(opts, 1):
+                    print(f"  [{idx}] {opt}")
+                if allow_custom:
+                    print(f"  [0] Type a custom write-in response")
+
+        # Read with echo-visible input
+        try:
+            prompt = "Your selection (number or custom answer): " if opts else "Your answer: "
+            raw = _input_with_echo_visible(prompt).strip()
+            if opts and raw.isdigit():
+                val = int(raw)
+                if 1 <= val <= len(opts):
+                    ans = opts[val - 1]
+                    try:
+                        from rich.panel import Panel
+                        renderer.console.print(Panel(f"[bold green]✔ Selected option [{val}]:[/bold green]\n[white]{ans}[/white]", border_style="green"))
+                    except Exception:
+                        print(f"✔ Selected option [{val}]: {ans}")
+                    return f"User selected option [{val}]: {ans}"
+                elif val == 0 and allow_custom:
+                    # Custom write-in
+                    try:
+                        renderer.console.print("[dim]Custom write-in — please provide your answer:[/dim]")
+                    except Exception:
+                        print("Custom write-in — please provide your answer:")
+                    custom = _input_with_echo_visible("Enter your custom answer: ").strip()
+                    try:
+                        from rich.panel import Panel
+                        renderer.console.print(Panel(f"[bold green]✔ Custom response:[/bold green]\n[white]{custom}[/white]", border_style="green"))
+                    except Exception:
+                        print(f"✔ Custom response: {custom}")
+                    return f"User wrote custom response: {custom}"
+            if raw:
+                # Check exact match to an option
+                for idx, opt in enumerate(opts, 1):
+                    if raw.lower() == opt.lower():
+                        try:
+                            from rich.panel import Panel
+                            renderer.console.print(Panel(f"[bold green]✔ Matched option [{idx}]:[/bold green]\n[white]{opt}[/white]", border_style="green"))
+                        except Exception:
+                            print(f"✔ Matched option [{idx}]: {opt}")
+                        return f"User selected option [{idx}]: {opt}"
+                try:
+                    from rich.panel import Panel
+                    renderer.console.print(Panel(f"[bold green]✔ You replied:[/bold green]\n[white]{raw}[/white]", border_style="green"))
+                except Exception:
+                    print(f"✔ You replied: {raw}")
+                return f"User replied: {raw}"
+            # Fallback
+            def_ans = recommended or (opts[0] if opts else "")
+            if def_ans:
+                try:
+                    from rich.panel import Panel
+                    renderer.console.print(Panel(f"[yellow]⚠ No input — defaulting to:[/yellow]\n[white]{def_ans}[/white]", border_style="yellow"))
+                except Exception:
+                    print(f"No input — defaulting to: {def_ans}")
+                return f"User defaulted to: {def_ans}"
+            return "User provided no answer."
+        except (EOFError, KeyboardInterrupt):
+            try:
+                renderer.console.print("\n[dim]Skipped / cancelled.[/dim]")
+            except Exception:
+                print("\nSkipped / cancelled.")
+            return "User skipped / cancelled question prompt."
+    return handler
+
+
+def _make_tui_approver(renderer: TerminalRenderer):
+    """Create a permission approver that shows rich details and echo-visible input."""
+    def approver(message: str, details: dict) -> bool:
+        import time as _time
+        try:
+            from rich.panel import Panel
+            action = details.get("action_type") or details.get("type") or details.get("tool") or "action"
+            summary = details.get("summary") or details.get("command") or details.get("path") or str(details)[:120]
+            risk = details.get("risk") or ""
+            body_lines = [
+                f"[bold white]{message}[/bold white]",
+                "",
+                f"[dim]Time: {_time.strftime('%Y-%m-%d %H:%M:%S')}  |  Action: {action}  |  Risk: {risk or 'unknown'}[/dim]",
+                f"[dim]Details:[/dim] [white]{summary}[/white]",
+            ]
+            if len(str(details)) < 400 and details:
+                try:
+                    import json as _json
+                    pretty = _json.dumps(details, indent=2)[:500]
+                    if pretty and pretty != "{}":
+                        body_lines.append("")
+                        body_lines.append(f"[dim]Full details:[/dim]\n[dim]{pretty}[/dim]")
+                except Exception:
+                    pass
+            renderer.console.print(Panel("\n".join(body_lines), title="⚠️  PERMISSION REQUIRED", border_style="yellow", padding=(1, 2)))
+            renderer.console.print("[dim]Your typing will be shown as  ↳ You typed: ...  |  [y]es / [n]o  (default N)[/dim]")
+            raw = _input_with_echo_visible("Allow this action? [y/N]: ").strip().lower()
+            allowed = raw in ("y", "yes")
+            if allowed:
+                renderer.console.print(Panel(f"[bold green]✔ Approved[/bold green]\n[white]{message[:120]}[/white]", border_style="green"))
+            else:
+                renderer.console.print(Panel(f"[bold red]✖ Denied[/bold red]\n[white]{message[:120]}[/white]", border_style="red"))
+            return allowed
+        except (EOFError, KeyboardInterrupt):
+            try:
+                renderer.console.print("\n[dim]Denied (cancelled).[/dim]")
+            except Exception:
+                print("\nDenied (cancelled).")
+            return False
+        except Exception:
+            # Fallback
+            print(f"\n⚠️  [PERMISSION REQUIRED]: {message}")
+            try:
+                raw = _input_with_echo_visible("Allow this action? [y/N]: ").strip().lower()
+                return raw in ("y", "yes")
+            except Exception:
+                return False
+    return approver
+
+
 def run_interactive(agent: HarnessAgent):
     """Run interactive terminal session."""
     renderer = TerminalRenderer(agent.config.theme)
     commands = CommandRegistry()
     input_handler = InputHandler()
+
+    # Wire TUI-rich handlers for ask_user and permission prompts
+    # so typing is echo-visible even inside no_echo_stdin and shows rich details.
+    try:
+        ask_tool = agent.tool_registry.get("ask_user")
+        if ask_tool is not None:
+            ask_tool.interactive_handler = _make_tui_ask_handler(renderer, input_handler)
+    except Exception:
+        pass
+    try:
+        agent.permission_manager.approver_callback = _make_tui_approver(renderer)
+    except Exception:
+        pass
 
     renderer.clear_screen()
     renderer.print_banner()
