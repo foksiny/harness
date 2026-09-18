@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "harness-cli"
-version = "1.0.1"
-description = "Harness: The Ultimate Agentic AI Coding & Task Orchestration CLI"
+version = "0.10.0"
+description = "Harness: The Ultimate Agentic AI Coding & Task Orchestration CLI (Beta)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

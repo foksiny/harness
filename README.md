@@ -1,6 +1,6 @@
-# Harness ⚡
+# Harness ⚡ — v0.10.0 (Beta)
 
-> **The Premier Agentic AI Engineering Harness & CLI**
+> **The Premier Agentic AI Engineering Harness & CLI** — now in **v0.10.0 Beta**
 > Built for developers, autonomous AI workflows, and software engineers who demand speed, low memory (~24MB RAM), subagent orchestration, and multi-provider intelligence.
 
 ```
@@ -91,9 +91,9 @@ When a delegation finishes, the report you receive already includes each agent's
 - 📋 **Integrated To-Do Tracking (`todo_create`, `todo_update`, `todo_list`)**:
   - Real-time task planning and HUD progress reporting (`3/5 completed`).
   - **Persistent across sessions**: task state is saved into the session file on every save and restored on resume, so long-running projects survive restarts.
-- 🧩 **Extensible Skills & 10 Built-in Skills**:
-  - Discovers skills from `~/.harness/skills/` and `.harness/skills/` on top of the 10 built-ins.
-  - Includes specialized **`skill_creator`** (generates and installs new skills on user request) and **`mcp_integrator`** (connects and configures MCP servers on user request).
+- 🧩 **Extensible Skills & 11 Built-in Skills**:
+  - Discovers skills from `~/.harness/skills/` and `.harness/skills/` on top of the 11 built-ins.
+  - Includes specialized **`skill_creator`** (generates and installs new skills on user request), **`mcp_integrator`** (connects and configures MCP servers), and **`motion_graphics`** (professional motion graphics with anti-slop QA).
 - 🧠 **Continuous Learning & Self-Improvement**:
   - The agent transparently learns across sessions: `learn_record` / `learn_recall` / `learn_promote` let it (and you, via `/learn`) persist reusable lessons, inject top matches into every system prompt, and promote matured lessons into real skills.
   - **Global skill promotion**: When the agent finds a lesson broadly useful across projects (coding patterns, debugging techniques, tool tricks), it promotes it as a **global skill** (`~/.harness/skills/`) so it's available everywhere. Workspace-specific lessons stay scoped to `.harness/skills/`.
@@ -181,7 +181,7 @@ cat logs/error.log | harness "Diagnose this stack trace"
 
 ---
 
-## 🛠️ Built-in Skills (10 Total)
+## 🛠️ Built-in Skills (11 Total)
 
 1. **`skill_creator`**: Autonomous skill generator — writes and registers new skills on user request.
 2. **`mcp_integrator`**: Autonomous MCP configurator — connects and verifies external MCP servers.
@@ -193,10 +193,11 @@ cat logs/error.log | harness "Diagnose this stack trace"
 8. **`docker_deploy`**: Multi-stage Dockerfiles and container orchestration.
 9. **`performance_profiler`**: Latency, memory leak diagnosis, and caching strategies.
 10. **`documentation_writer`**: Architecture RFCs, user guides, and API references.
+11. **`motion_graphics`**: Professional motion graphics creation — animation principles, timing/easing, kinetic typography, composition, Remotion/GSAP/Lottie/Manim pipelines, and rigorous anti-slop QA.
 
 > Note: the catalog also auto-discovers **workspace** (`~/.harness/skills/`, `.harness/skills/`)
-> and **promoted global** skills on top of these 10 built-ins — on this machine it currently
-> resolves to **15 total** skills (see `/skills`).
+> and **promoted global** skills on top of these 11 built-ins — on this machine it currently
+> resolves to **16 total** skills (see `/skills`).
 
 ---
 
