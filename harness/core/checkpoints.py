@@ -83,6 +83,8 @@ class CheckpointManager:
         self._applicators: Dict[str, Callable] = {}
         self._last_apply_results: Dict[str, Any] = {}
         self._last_direction: str = "redo"
+        self._lock = __import__("threading").RLock()
+        self._session_id: Optional[str] = None
         
     def add_change_listener(self, listener: Callable):
         """Add a listener for change events (for UI updates)."""
@@ -92,82 +94,125 @@ class CheckpointManager:
         for listener in self._change_listeners:
             listener()
     
+    def bind_session(self, session_id: Optional[str]):
+        """Bind manager to a session for persistence. Loads existing checkpoints."""
+        with self._lock:
+            self._session_id = session_id
+            if session_id:
+                # Try to load existing checkpoints for this session
+                try:
+                    if not self.load(session_id):
+                        # No existing checkpoints for this session - start fresh
+                        self.checkpoints.clear()
+                        self.current_index = -1
+                        self._pending_changes = {
+                            "file_changes": [],
+                            "message_changes": [],
+                            "state_changes": [],
+                        }
+                except Exception:
+                    self.checkpoints.clear()
+                    self.current_index = -1
+                    self._pending_changes = {
+                        "file_changes": [],
+                        "message_changes": [],
+                        "state_changes": [],
+                    }
+            else:
+                self.clear()
+
+    def _auto_save(self):
+        """Persist current checkpoints if bound to a session."""
+        if self._session_id:
+            try:
+                self.save(self._session_id)
+            except Exception:
+                pass
+
     # ============================================================
     # Change Recording (called by tools/agent when changes happen)
     # ============================================================
     
     def record_file_create(self, path: str, content: str):
         """Record a file creation."""
-        self._pending_changes["file_changes"].append(FileChange(
-            path=path,
-            action="create",
-            new_content=content,
-        ))
+        with self._lock:
+            self._pending_changes["file_changes"].append(FileChange(
+                path=path,
+                action="create",
+                new_content=content,
+            ))
     
     def record_file_edit(self, path: str, old_content: str, new_content: str):
         """Record a file edit with diff."""
         diff = self._compute_diff(old_content, new_content)
-        self._pending_changes["file_changes"].append(FileChange(
-            path=path,
-            action="edit",
-            old_content=old_content,
-            new_content=new_content,
-            diff=diff,
-        ))
+        with self._lock:
+            self._pending_changes["file_changes"].append(FileChange(
+                path=path,
+                action="edit",
+                old_content=old_content,
+                new_content=new_content,
+                diff=diff,
+            ))
     
     def record_file_delete(self, path: str, old_content: str):
         """Record a file deletion."""
-        self._pending_changes["file_changes"].append(FileChange(
-            path=path,
-            action="delete",
-            old_content=old_content,
-        ))
+        with self._lock:
+            self._pending_changes["file_changes"].append(FileChange(
+                path=path,
+                action="delete",
+                old_content=old_content,
+            ))
     
     def record_message_append(self, index: int, message: Dict[str, Any]):
         """Record a message append."""
-        self._pending_changes["message_changes"].append(MessageChange(
-            action="append",
-            index=index,
-            new_message=message,
-        ))
+        with self._lock:
+            self._pending_changes["message_changes"].append(MessageChange(
+                action="append",
+                index=index,
+                new_message=message,
+            ))
     
     def record_message_truncate(self, start_index: int, count: int, removed_messages: List[Dict[str, Any]]):
         """Record a message truncation (e.g., compaction) as one atomic change."""
-        self._pending_changes["message_changes"].append(MessageChange(
-            action="truncate",
-            index=start_index,
-            count=count,
-            removed_messages=list(removed_messages),
-        ))
+        with self._lock:
+            self._pending_changes["message_changes"].append(MessageChange(
+                action="truncate",
+                index=start_index,
+                count=count,
+                removed_messages=list(removed_messages),
+            ))
     
     def record_message_replace(self, index: int, old_message: Dict[str, Any], new_message: Dict[str, Any]):
         """Record a message replacement."""
-        self._pending_changes["message_changes"].append(MessageChange(
-            action="replace",
-            index=index,
-            old_message=old_message,
-            new_message=new_message,
-        ))
-
+        with self._lock:
+            self._pending_changes["message_changes"].append(MessageChange(
+                action="replace",
+                index=index,
+                old_message=old_message,
+                new_message=new_message,
+            ))
+    
     def record_message_replace_span(self, index: int, old_messages: List[Dict[str, Any]], new_messages: List[Dict[str, Any]]):
         """Record an atomic swap of a contiguous span of messages (used for
         graduated compaction and mid-turn emergency trimming). Undo restores the
         old span; redo re-applies the new span."""
-        self._pending_changes["message_changes"].append(MessageChange(
-            action="span_replace",
-            index=index,
-            old_messages=list(old_messages),
-            new_messages=list(new_messages),
-        ))
+        with self._lock:
+            self._pending_changes["message_changes"].append(MessageChange(
+                action="span_replace",
+                index=index,
+                old_messages=list(old_messages),
+                new_messages=list(new_messages),
+            ))
     
     def record_state_change(self, key: str, old_value: Any, new_value: Any, action: str = "set"):
         """Record a state change (todos, config, etc.)."""
-        self._pending_changes["state_changes"].append(StateChange(
-            key=key,
-            action=action,
-            old_value=old_value,
-            new_value=new_value,
-        ))
+        with self._lock:
+            self._pending_changes["state_changes"].append(StateChange(
+                key=key,
+                action=action,
+                old_value=old_value,
+                new_value=new_value,
+            ))
     
     # ============================================================
     # Checkpoint Creation
@@ -178,41 +223,43 @@ class CheckpointManager:
         Create a checkpoint from all pending changes.
         Returns the created checkpoint.
         """
-        if not any(self._pending_changes.values()):
-            # No changes since last checkpoint
-            return self.checkpoints[self.current_index] if self.current_index >= 0 else None
-        
-        checkpoint = Checkpoint(
-            id=f"cp_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}",
-            label=label or f"Checkpoint {len(self.checkpoints) + 1}",
-            timestamp=time.time(),
-            file_changes=self._pending_changes["file_changes"],
-            message_changes=self._pending_changes["message_changes"],
-            state_changes=self._pending_changes["state_changes"],
-            parent_id=self.checkpoints[self.current_index].id if self.current_index >= 0 else None,
-        )
-        
-        # Truncate history after current index (for branching)
-        if self.current_index < len(self.checkpoints) - 1:
-            self.checkpoints = self.checkpoints[:self.current_index + 1]
-        
-        self.checkpoints.append(checkpoint)
-        self.current_index = len(self.checkpoints) - 1
-        
-        # Enforce max checkpoints (FIFO)
-        if len(self.checkpoints) > self.max_checkpoints:
-            self.checkpoints.pop(0)
-            self.current_index -= 1
-        
-        # Clear pending changes
-        self._pending_changes = {
-            "file_changes": [],
-            "message_changes": [],
-            "state_changes": [],
-        }
-        
-        self._notify_change()
-        return checkpoint
+        with self._lock:
+            if not any(self._pending_changes.values()):
+                # No changes since last checkpoint - don't create duplicate
+                return None
+            
+            checkpoint = Checkpoint(
+                id=f"cp_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}",
+                label=label or f"Checkpoint {len(self.checkpoints) + 1}",
+                timestamp=time.time(),
+                file_changes=list(self._pending_changes["file_changes"]),
+                message_changes=list(self._pending_changes["message_changes"]),
+                state_changes=list(self._pending_changes["state_changes"]),
+                parent_id=self.checkpoints[self.current_index].id if self.current_index >= 0 else None,
+            )
+            
+            # Truncate history after current index (for branching)
+            if self.current_index < len(self.checkpoints) - 1:
+                self.checkpoints = self.checkpoints[:self.current_index + 1]
+            
+            self.checkpoints.append(checkpoint)
+            self.current_index = len(self.checkpoints) - 1
+            
+            # Enforce max checkpoints (FIFO)
+            if len(self.checkpoints) > self.max_checkpoints:
+                self.checkpoints.pop(0)
+                self.current_index -= 1
+            
+            # Clear pending changes
+            self._pending_changes = {
+                "file_changes": [],
+                "message_changes": [],
+                "state_changes": [],
+            }
+            
+            self._notify_change()
+            self._auto_save()
+            return checkpoint
     
     def checkpoint_with_label(self, label: str) -> Checkpoint:
         """Create a checkpoint with a specific label."""
@@ -232,28 +279,36 @@ class CheckpointManager:
         """Undo to the previous checkpoint, reversing the current checkpoint's changes.
         Returns the checkpoint we're reverting TO.
         """
-        if not self.can_undo():
-            return None
-        
-        # Reverse the changes captured in the checkpoint we are leaving.
-        self._apply_checkpoint(self.checkpoints[self.current_index], undo=True)
-        self._last_direction = "undo"
-        self.current_index -= 1
-        self._notify_change()
-        return self.checkpoints[self.current_index] if self.current_index >= 0 else None
+        with self._lock:
+            # If there are pending un-checkpointed changes, auto-save them first
+            # so they are not lost - user can redo to get them back.
+            if any(self._pending_changes.values()):
+                self.create_checkpoint("auto-save before undo")
+            if not self.can_undo():
+                return None
+            
+            # Reverse the changes captured in the checkpoint we are leaving.
+            self._apply_checkpoint(self.checkpoints[self.current_index], undo=True)
+            self._last_direction = "undo"
+            self.current_index -= 1
+            self._notify_change()
+            self._auto_save()
+            return self.checkpoints[self.current_index] if self.current_index >= 0 else None
     
     def redo(self) -> Optional[Checkpoint]:
         """Redo to the next checkpoint, re-applying its changes.
         Returns the checkpoint we're reverting TO.
         """
-        if not self.can_redo():
-            return None
-        
-        self._apply_checkpoint(self.checkpoints[self.current_index + 1], undo=False)
-        self._last_direction = "redo"
-        self.current_index += 1
-        self._notify_change()
-        return self.checkpoints[self.current_index]
+        with self._lock:
+            if not self.can_redo():
+                return None
+            
+            self._apply_checkpoint(self.checkpoints[self.current_index + 1], undo=False)
+            self._last_direction = "redo"
+            self.current_index += 1
+            self._notify_change()
+            self._auto_save()
+            return self.checkpoints[self.current_index]
     
     def find_checkpoint_index(self, checkpoint_id: str) -> Optional[int]:
         """Locate a checkpoint by id, returning its index or None."""
@@ -419,7 +474,8 @@ class CheckpointManager:
     def save(self, session_id: str) -> bool:
         """Save checkpoints to disk for a session."""
         try:
-            file_path = self.storage_dir / f"{session_id}_checkpoints.json"
+            clean_id = session_id.replace("/", "_").replace("\\", "_")
+            file_path = self.storage_dir / f"{clean_id}_checkpoints.json"
             data = {
                 "checkpoints": [self._checkpoint_to_dict(cp) for cp in self.checkpoints],
                 "current_index": self.current_index,
@@ -434,14 +490,29 @@ class CheckpointManager:
     def load(self, session_id: str) -> bool:
         """Load checkpoints from disk for a session."""
         try:
-            file_path = self.storage_dir / f"{session_id}_checkpoints.json"
+            clean_id = session_id.replace("/", "_").replace("\\", "_")
+            file_path = self.storage_dir / f"{clean_id}_checkpoints.json"
             if not file_path.exists():
-                return False
+                # Try fuzzy match for legacy files
+                for p in self.storage_dir.glob("*.json"):
+                    if session_id in p.stem:
+                        file_path = p
+                        break
+                else:
+                    return False
+                if not file_path.exists():
+                    return False
             with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
-            self.checkpoints = [self._dict_to_checkpoint(d) for d in data.get("checkpoints", [])]
-            self.current_index = data.get("current_index", -1)
+            with self._lock:
+                self.checkpoints = [self._dict_to_checkpoint(d) for d in data.get("checkpoints", [])]
+                self.current_index = data.get("current_index", -1)
+                self._pending_changes = {
+                    "file_changes": [],
+                    "message_changes": [],
+                    "state_changes": [],
+                }
             return True
         except Exception:
             return False
@@ -470,14 +541,16 @@ class CheckpointManager:
     
     def clear(self):
         """Clear all checkpoints."""
-        self.checkpoints.clear()
-        self.current_index = -1
-        self._pending_changes = {
-            "file_changes": [],
-            "message_changes": [],
-            "state_changes": [],
-        }
-        self._notify_change()
+        with self._lock:
+            self.checkpoints.clear()
+            self.current_index = -1
+            self._pending_changes = {
+                "file_changes": [],
+                "message_changes": [],
+                "state_changes": [],
+            }
+            self._notify_change()
+            self._auto_save()
 
 
 # Global checkpoint manager instance (will be initialized by agent)

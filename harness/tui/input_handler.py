@@ -11,13 +11,51 @@ from contextlib import contextmanager
 from typing import List, Optional, Iterator
 
 SLASH_COMMANDS = [
-    "/help", "/goal", "/stop", "/mode", "/perm", "/theme",
+    "/help", "/goal", "/stop", "/queue", "/sidebar", "/status", "/mode", "/perm", "/theme",
     "/provider", "/model", "/models", "/config", "/keys", "/setup",
-    "/effort", "/todo", "/skills", "/reload", "/mcp",
+    "/effort", "/todo", "/skills", "/reload", "/mcp", "/update", "/discord",
     "/subagent", "/agents", "/agent", "/back",
     "/compact", "/session", "/checkpoint", "/tokens", "/diff", "/clear",
     "/learn", "/exit", "/quit"
 ]
+
+COMMAND_DESCRIPTIONS = {
+    "/help": "Show commands, hotkeys & usage reference",
+    "/goal": "Launch autonomous goal loop in Super Mode",
+    "/stop": "Interrupt running task (or '/stop all' to clear queue)",
+    "/queue": "View, drop, pause, resume or clear prompt queue",
+    "/sidebar": "Toggle or view workspace, session & model sidebar",
+    "/status": "Display full system, agent, budget & queue status",
+    "/update": "Check for and apply latest updates from Git / PyPI",
+    "/discord": "Manage Discord bot daemon and sync connection",
+    "/mode": "Switch execution mode (plan, build, super)",
+    "/perm": "Set permission level (secure, default, full)",
+    "/theme": "Browse or switch color themes",
+    "/provider": "Switch LLM provider (openai, anthropic, gemini, etc.)",
+    "/model": "Switch model name for current provider",
+    "/models": "Browse models catalog with token & thinking specs",
+    "/config": "Inspect or modify persistent configuration",
+    "/keys": "Manage provider API keys securely",
+    "/setup": "Run interactive configuration setup wizard",
+    "/effort": "Adjust thinking / reasoning effort level",
+    "/todo": "Inspect or update session task list",
+    "/skills": "Browse available agent skills catalog",
+    "/reload": "Reload custom skills and MCP tools",
+    "/mcp": "Manage Model Context Protocol servers",
+    "/subagent": "Spawn a specialized subagent worker",
+    "/agents": "Open interactive agent swarm board (F2)",
+    "/agent": "View detailed log for a specific agent",
+    "/back": "Return to parent conversation view (ESC)",
+    "/compact": "Trigger proactive context window compaction",
+    "/session": "Save, resume, fork, or export session",
+    "/checkpoint": "Manage undo/redo checkpoints",
+    "/tokens": "Inspect token consumption & context budget",
+    "/diff": "View git diff of workspace changes",
+    "/clear": "Clear terminal screen and redraw HUD",
+    "/learn": "Extract and save persistent knowledge lessons",
+    "/exit": "Save session and exit Harness",
+    "/quit": "Save session and exit Harness",
+}
 
 VIEW_PARENT = "parent"
 VIEW_AGENTS = "agents"
@@ -171,8 +209,9 @@ class InputHandler:
             from pathlib import Path
 
             class SlashAndMentionCompleter(Completer):
-                def __init__(self, slash_commands):
-                    self.slash_completer = WordCompleter(slash_commands, sentence=True)
+                def __init__(self, slash_commands, command_meta=None):
+                    self.slash_commands = slash_commands
+                    self.command_meta = command_meta or {}
 
                 def get_completions(self, document, complete_event):
                     text_before = document.text_before_cursor
@@ -197,7 +236,7 @@ class InputHandler:
                                 base_dir = Path.cwd() / base_dir
                             try:
                                 if base_dir.is_dir():
-                                    for entry in base_dir.iterdir():
+                                    for entry in sorted(base_dir.iterdir(), key=lambda e: e.name):
                                         entry_name = entry.name
                                         if entry_name.startswith(name_part):
                                             if dir_part:
@@ -214,52 +253,18 @@ class InputHandler:
                     # Slash command completion: check if the current token starts with /
                     word = document.get_word_before_cursor()
                     if word.startswith('/'):
-                        yield from self.slash_completer.get_completions(document, complete_event)
+                        for cmd in self.slash_commands:
+                            if cmd.startswith(word):
+                                meta = self.command_meta.get(cmd, "")
+                                yield Completion(
+                                    cmd,
+                                    start_position=-len(word),
+                                    display=cmd,
+                                    display_meta=meta if meta else None,
+                                )
                         return
-                        # Find last @ not preceded by whitespace? Simple rfind
-                        at_index = text_before.rfind('@')
-                        # Ensure the @ is part of current token (no whitespace after @)
-                        after_at = text_before[at_index+1:]
-                        if not any(c.isspace() for c in after_at):
-                            # We have a mention in progress
-                            # Extract the partial mention string
-                            mention = '@' + after_at
-                            # Determine base directory and prefix
-                            prefix = mention[1:]  # strip @
-                            if '/' in prefix:
-                                # Path with directory component
-                                # Find last slash
-                                dir_idx = prefix.rfind('/')
-                                dir_part = prefix[:dir_idx]
-                                name_part = prefix[dir_idx+1:]
-                                base_dir = Path(dir_part) if dir_part else Path('.')
-                            else:
-                                dir_part = ''
-                                name_part = prefix
-                                base_dir = Path('.')
-                            if not base_dir.is_absolute():
-                                base_dir = Path.cwd() / base_dir
-                            try:
-                                if base_dir.is_dir():
-                                    for entry in base_dir.iterdir():
-                                        entry_name = entry.name
-                                        if entry_name.startswith(name_part):
-                                            # Build display text
-                                            if dir_part:
-                                                display = '@' + dir_part + '/' + entry_name
-                                            else:
-                                                display = '@' + entry_name
-                                            if entry.is_dir():
-                                                display += '/'
-                                            # Replacement start position is -len(mention)
-                                            yield Completion(display, start_position=-len(mention))
-                            except Exception:
-                                pass
-                            return
-                    # Fallback to slash completer
-                    yield from self.slash_completer.get_completions(document, complete_event)
 
-            self._pt_completer = SlashAndMentionCompleter(SLASH_COMMANDS)
+            self._pt_completer = SlashAndMentionCompleter(SLASH_COMMANDS, COMMAND_DESCRIPTIONS)
             self._pt_history = InMemoryHistory()
             self._pt_session = PromptSession(completer=self._pt_completer, history=self._pt_history)
             self._has_prompt_toolkit = True
@@ -295,14 +300,28 @@ class InputHandler:
             def _back(event):
                 event.app.exit(result=SENTINEL_BACK)
 
+        from prompt_toolkit.styles import Style
+        pt_style = Style.from_dict({
+            "bottom-toolbar": "noreverse noinherit",
+            "bottom-toolbar.text": "noreverse noinherit",
+        })
+
         return PromptSession(
             completer=self._pt_completer,
             history=self._pt_history,
             key_bindings=kb,
+            style=pt_style,
         )
 
-    def get_input(self, prompt_text: str = "Harness> ", view: str = VIEW_PARENT) -> str:
-        """Read a line of input from user.
+    def get_input(
+        self,
+        prompt_text: str = "Harness> ",
+        view: str = VIEW_PARENT,
+        bottom_toolbar=None,
+        refresh_interval: Optional[float] = None,
+        placeholder: Optional[str] = None,
+    ) -> str:
+        """Read a line of input from user with toolbar and completion support.
 
         In the agent-swarm board view, ESC returns to the parent view; in the
         parent view, F2 (or Ctrl+G) opens the agents board.
@@ -310,22 +329,42 @@ class InputHandler:
         if self._has_prompt_toolkit:
             try:
                 session = self._create_session(view)
-                result = session.prompt(prompt_text).strip()
+                kwargs = {}
+                if bottom_toolbar is not None:
+                    kwargs["bottom_toolbar"] = bottom_toolbar
+                if refresh_interval is not None:
+                    kwargs["refresh_interval"] = refresh_interval
+                if placeholder:
+                    kwargs["placeholder"] = placeholder
+
+                from prompt_toolkit.patch_stdout import patch_stdout
+                with patch_stdout(raw=True):
+                    result = session.prompt(prompt_text, **kwargs).strip()
                 if result in (SENTINEL_OPEN_AGENTS, SENTINEL_BACK):
                     return result
                 return result
-            except (EOFError, KeyboardInterrupt):
-                return SENTINEL_BACK if view == VIEW_AGENTS else "/exit"
+            except EOFError:
+                return "/exit"
+            except KeyboardInterrupt:
+                return SENTINEL_BACK if view == VIEW_AGENTS else "/stop"
 
         # Fallback without prompt_toolkit: raw terminal reader so keybinds work,
         # falling back to plain input() when stdin is not an interactive TTY.
+        plain_str = str(prompt_text)
+        if not isinstance(prompt_text, str):
+            try:
+                from prompt_toolkit.formatted_text import to_plain_text
+                plain_str = to_plain_text(prompt_text)
+            except Exception:
+                plain_str = "│ "
+
         try:
             if sys.stdin.isatty():
                 try:
-                    return self._raw_line(prompt_text, view)
+                    return self._raw_line(plain_str, view)
                 except (EOFError, KeyboardInterrupt):
                     return SENTINEL_BACK if view == VIEW_AGENTS else "/exit"
-            return input(prompt_text).strip()
+            return input(plain_str).strip()
         except (EOFError, KeyboardInterrupt):
             return SENTINEL_BACK if view == VIEW_AGENTS else "/exit"
 

@@ -122,9 +122,9 @@ class EditFileTool(Tool):
             with open(p, "w", encoding="utf-8") as f:
                 f.write(new_content)
             
-            # Record change for checkpoint
+            # Record change for checkpoint (store absolute path for reliable undo/redo)
             cp_manager = get_checkpoint_manager()
-            cp_manager.record_file_edit(path, content, new_content)
+            cp_manager.record_file_edit(str(p), content, new_content)
 
             return f"Successfully updated '{path}' (1 replacement applied)."
         except Exception as ex:
@@ -163,12 +163,12 @@ class WriteFileTool(Tool):
             with open(p, "w", encoding="utf-8") as f:
                 f.write(content)
             
-            # Record change for checkpoint
+            # Record change for checkpoint (store absolute path for reliable undo/redo)
             cp_manager = get_checkpoint_manager()
             if old_content is not None:
-                cp_manager.record_file_edit(path, old_content, content)
+                cp_manager.record_file_edit(str(p), old_content, content)
             else:
-                cp_manager.record_file_create(path, content)
+                cp_manager.record_file_create(str(p), content)
 
             return f"Successfully wrote {len(content)} characters to '{path}'."
         except Exception as ex:
@@ -285,9 +285,9 @@ class DeleteFileTool(Tool):
             
             p.unlink()
             
-            # Record change for checkpoint
+            # Record change for checkpoint (store absolute path for reliable undo/redo)
             cp_manager = get_checkpoint_manager()
-            cp_manager.record_file_delete(path, old_content)
+            cp_manager.record_file_delete(str(p), old_content)
 
             return f"Successfully deleted '{path}'."
         except Exception as ex:

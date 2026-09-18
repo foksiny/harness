@@ -5,7 +5,7 @@ subcommands (config, keys, setup, theme), and granular runtime flags.
 """
 import sys
 import argparse
-from typing import Optional
+from typing import Optional, List
 from harness import __version__
 from harness.config import load_config, save_config, mask_key, HarnessConfig
 from harness.core.modes import Mode
@@ -191,7 +191,7 @@ def handle_subcommands(args: list) -> bool:
         return True
 
     elif sub == "update":
-        handle_update_command(renderer)
+        handle_update_command(renderer, args=args[1:] if len(args) > 1 else [])
         return True
 
     elif sub == "discord":
@@ -206,62 +206,50 @@ def handle_subcommands(args: list) -> bool:
     return False
 
 
-def handle_update_command(renderer: TerminalRenderer) -> None:
-    """Handle the 'harness update' command to pull latest changes from upstream."""
-    import subprocess
-    
-    try:
-        # Check if we're in a git repo
-        subprocess.check_output(
-            ["git", "rev-parse", "--git-dir"],
-            stderr=subprocess.DEVNULL,
-            timeout=2,
-        )
-    except subprocess.CalledProcessError:
-        renderer.print_error("Not a git repository. Cannot update.")
-        return
-    except Exception as ex:
-        renderer.print_error(f"Git error: {str(ex)}")
+def handle_update_command(renderer: TerminalRenderer, args: Optional[List[str]] = None) -> None:
+    """Handle the 'harness update' command with changelog preview and dependency sync."""
+    from harness.core.updater import HarnessUpdater
+    args = args or []
+    check_only = "--check" in args
+    force = "--force" in args or "-f" in args
+
+    updater = HarnessUpdater()
+    renderer.print_info("Checking for Harness updates...")
+
+    info = updater.check_for_updates()
+    if info.error:
+        renderer.print_error(f"Update check failed: {info.error}")
         return
 
-    try:
-        # Fetch latest changes
-        renderer.print_info("Fetching latest changes from upstream...")
-        subprocess.check_output(
-            ["git", "fetch"],
-            stderr=subprocess.STDOUT,
-            timeout=30,
+    if not info.is_behind:
+        renderer.print_success(f"Harness is already up to date! (version {info.current_version})")
+        return
+
+    if info.is_git:
+        renderer.print_info(
+            f"Update available: [bold yellow]{info.commits_behind} commit{'s' if info.commits_behind > 1 else ''}[/bold yellow] "
+            f"behind upstream [bold cyan]{info.branch or 'main'}[/bold cyan]."
         )
-        
-        # Check if behind
-        is_behind, commits_behind = check_git_behind()
-        if not is_behind:
-            renderer.print_success("Already up to date!")
-            return
-        
-        renderer.print_info(f"You are {commits_behind} commit{'s' if commits_behind > 1 else ''} behind. Updating...")
-        
-        # Pull changes
-        result = subprocess.run(
-            ["git", "pull"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        
-        if result.returncode == 0:
-            renderer.print_success("Successfully updated to the latest version!")
-            if result.stdout:
-                renderer.print_info(result.stdout.strip())
-        else:
-            renderer.print_error(f"Update failed: {result.stderr.strip()}")
-            
-    except subprocess.TimeoutExpired:
-        renderer.print_error("Git operation timed out.")
-    except subprocess.CalledProcessError as e:
-        renderer.print_error(f"Git error: {e.output.decode('utf-8', errors='ignore') if e.output else str(e)}")
-    except Exception as ex:
-        renderer.print_error(f"Update failed: {str(ex)}")
+        if info.commits:
+            renderer.print_info("[bold magenta]Recent commits:[/bold magenta]")
+            for c in info.commits[:5]:
+                renderer.console.print(f"  [dim]•[/dim] [white]{c}[/white]")
+    else:
+        renderer.print_info(f"New version available: [bold green]{info.latest_version}[/bold green] (current: {info.current_version})")
+
+    if check_only:
+        renderer.print_info("Run [bold cyan]harness update[/bold cyan] to install the latest version.")
+        return
+
+    renderer.print_info("Applying update...")
+    result = updater.apply_update(force=force)
+
+    if result.success:
+        renderer.print_success(f"Successfully updated Harness to latest version!")
+        if result.commits:
+            renderer.print_info(f"Pulled {len(result.commits)} new commits.")
+    else:
+        renderer.print_error(f"Update failed: {result.error or result.message}")
 
 def _maybe_start_server(config: HarnessConfig, agent=None, renderer=None) -> None:
     """Start the HTTP API server if enabled (replaces old mesh peer network).

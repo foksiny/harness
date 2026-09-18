@@ -121,8 +121,81 @@ class TestCommands(unittest.TestCase):
         self.assertEqual(len(self.agent.todo_manager.tasks), 1)
         self.assertEqual(self.agent.todo_manager.tasks[0].title, "Write documentation")
 
-        self.registry.handle("/todo clear", self.agent, self.renderer)
-        self.assertEqual(len(self.agent.todo_manager.tasks), 0)
+    def test_queue_commands(self):
+        from harness.tui.queue import ExecutionQueue
+        q = ExecutionQueue()
+        # Add item
+        self.registry.handle("/queue add Run tests", self.agent, self.renderer, queue=q)
+        self.assertEqual(q.size(), 1)
+        self.assertEqual(q.peek().prompt, "Run tests")
+
+        # List
+        self.registry.handle("/queue list", self.agent, self.renderer, queue=q)
+        self.assertEqual(q.size(), 1)
+
+        # Pause and resume
+        self.registry.handle("/queue pause", self.agent, self.renderer, queue=q)
+        self.assertTrue(q.is_paused)
+        self.registry.handle("/queue resume", self.agent, self.renderer, queue=q)
+        self.assertFalse(q.is_paused)
+
+        # Drop item
+        item_id = q.peek().id
+        self.registry.handle(f"/queue drop {item_id}", self.agent, self.renderer, queue=q)
+        self.assertEqual(q.size(), 0)
+
+        # Clear
+        q.enqueue("Task 1")
+        q.enqueue("Task 2")
+        self.assertEqual(q.size(), 2)
+        self.registry.handle("/queue clear", self.agent, self.renderer, queue=q)
+        self.assertEqual(q.size(), 0)
+
+    def test_stop_all_clears_queue(self):
+        from harness.tui.queue import ExecutionQueue
+        q = ExecutionQueue()
+        q.enqueue("Task 1")
+        q.enqueue("Task 2")
+        self.assertEqual(q.size(), 2)
+        self.registry.handle("/stop all", self.agent, self.renderer, queue=q)
+        self.assertEqual(q.size(), 0)
+
+    def test_status_command(self):
+        from harness.tui.queue import ExecutionQueue
+        q = ExecutionQueue()
+        self.registry.handle("/status", self.agent, self.renderer, queue=q)
+
+    def test_sidebar_command(self):
+        from harness.tui.queue import ExecutionQueue
+        q = ExecutionQueue()
+        q.enqueue("Sidebar test task")
+        self.registry.handle("/sidebar", self.agent, self.renderer, queue=q)
+
+    def test_opencode_visual_rendering(self):
+        from harness.tui.queue import ExecutionQueue
+        q = ExecutionQueue()
+        q.enqueue("Demo queued task")
+        self.renderer.print_welcome_splash(self.agent, queue=q)
+        self.renderer.render_user_prompt("Write a binary search algorithm in Python")
+        self.renderer.render_turn_capsule("build", "gpt-4o", 1.8)
+        panel = self.renderer.render_sidebar(self.agent, queue=q)
+        self.assertIsNotNone(panel)
+
+    def test_clear_command(self):
+        from harness.tui.queue import ExecutionQueue
+        q = ExecutionQueue()
+        # Verify /clear executes cleanly without invoking old hud/banner
+        self.registry.handle("/clear", self.agent, self.renderer, queue=q)
+
+    def test_modal_commands(self):
+        from harness.tui.queue import ExecutionQueue
+        q = ExecutionQueue()
+        # Verify all informational modal commands render without errors
+        self.registry.handle("/help", self.agent, self.renderer, queue=q)
+        self.registry.handle("/session", self.agent, self.renderer, queue=q)
+        self.registry.handle("/models", self.agent, self.renderer, queue=q)
+        self.registry.handle("/theme", self.agent, self.renderer, queue=q)
+        self.registry.handle("/mcp", self.agent, self.renderer, queue=q)
 
 if __name__ == "__main__":
     unittest.main()

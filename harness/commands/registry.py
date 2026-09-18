@@ -2,6 +2,7 @@
 Slash Command Registry and Handlers for Harness.
 Handles /goal, /mode, /perm, /theme, /models, /config, /keys, /setup, /skills, /mcp, /session.
 """
+import sys
 import time
 from typing import Dict, Any, List, Optional, Callable
 from harness.core.modes import Mode
@@ -99,10 +100,11 @@ def _model_belongs_to_provider(model_name: str, provider: str) -> bool:
 
 
 class CommandContext:
-    def __init__(self, agent: Any, renderer: Any, raw_args: str):
+    def __init__(self, agent: Any, renderer: Any, raw_args: str, queue: Any = None):
         self.agent = agent
         self.renderer = renderer
         self.args = raw_args.strip()
+        self.queue = queue
 
 def _publish_state(payload: Dict, ctx: CommandContext) -> None:
     """Broadcast a state change to the Discord side (in-process + cross-process).
@@ -141,7 +143,7 @@ class CommandRegistry:
         self.commands[name.lower()] = handler
         self.descriptions[name.lower()] = description
 
-    def handle(self, input_line: str, agent: Any, renderer: Any) -> bool:
+    def handle(self, input_line: str, agent: Any, renderer: Any, queue: Any = None) -> bool:
         """Check if input_line is a slash command. Returns True if handled."""
         line = input_line.strip()
         if not line.startswith("/"):
@@ -152,7 +154,7 @@ class CommandRegistry:
         args = parts[1] if len(parts) > 1 else ""
 
         if cmd_name in self.commands:
-            ctx = CommandContext(agent, renderer, args)
+            ctx = CommandContext(agent, renderer, args, queue=queue)
             return self.commands[cmd_name](ctx)
         else:
             renderer.print_error(f"Unknown command: '/{cmd_name}'. Type '/help' for available commands.")
@@ -161,7 +163,10 @@ class CommandRegistry:
     def _register_builtins(self):
         self.register("help", self._cmd_help, "Show help directory of all commands and options.")
         self.register("goal", self._cmd_goal, "Initiate Super Mode autonomous loop toward an explicit goal.")
-        self.register("stop", self._cmd_stop, "Interrupt the running agent turn (works mid-stream, from CLI or Discord).")
+        self.register("stop", self._cmd_stop, "Interrupt running agent turn (use '/stop all' to also clear queue).")
+        self.register("queue", self._cmd_queue, "View, drop, pause, resume, or clear prompt execution queue.")
+        self.register("sidebar", self._cmd_sidebar, "Toggle or view workspace, session, model, and context sidebar.")
+        self.register("status", self._cmd_status, "Display full system, agent, budget, and queue status.")
         self.register("mode", self._cmd_mode, "Switch operational mode: plan, build, super.")
         self.register("perm", self._cmd_perm, "Switch permission profile: secure, default, full.")
         self.register("theme", self._cmd_theme, "Theme gallery, preview, and switching (14 themes available).")
@@ -187,16 +192,15 @@ class CommandRegistry:
         self.register("checkpoint", self._cmd_checkpoint, "Manage checkpoints: /checkpoint list, create [label], undo, redo.")
         self.register("tokens", self._cmd_tokens, "Display live token metrics, context window ratio, and RAM.")
         self.register("diff", self._cmd_diff, "Show uncommitted git changes.")
+        self.register("update", self._cmd_update, "Check for and apply latest updates from Git / PyPI.")
+        self.register("discord", self._cmd_discord, "Manage Discord bot daemon and sync connection.")
         self.register("clear", self._cmd_clear, "Clear the terminal screen.")
         self.register("exit", self._cmd_exit, "Exit Harness.")
         self.register("quit", self._cmd_exit, "Exit Harness.")
 
     def _cmd_help(self, ctx: CommandContext):
-        ctx.renderer.print_help(self.descriptions)
-        ctx.renderer.print_info(
-            "Discord bot: set a token with `harness keys set discord <token>`, then run `harness discord`. "
-            "Use `/help discord` inside the bot for the full guide."
-        )
+        # Mirror /models - /sidebar: always the static borderless sidebar-style print.
+        ctx.renderer.print_help_modal(self.descriptions)
 
     def _cmd_goal(self, ctx: CommandContext):
         if not ctx.args:
@@ -206,19 +210,78 @@ class CommandRegistry:
         _publish_state({"mode": "super", "goal": ctx.args}, ctx)
         ctx.renderer.print_super_banner(ctx.args)
         _publish_output(f"🚀 SUPER MODE ACTIVATED — Autonomous Goal: {ctx.args}", ctx)
-        with no_echo_stdin():
-            for ev in ctx.agent.step(f"AUTONOMOUS GOAL: {ctx.args}"):
-                ctx.renderer.render_agent_event(ev)
+        if ctx.queue is not None:
+            ctx.queue.enqueue(f"AUTONOMOUS GOAL: {ctx.args}", mode="super")
+        else:
+            with no_echo_stdin():
+                for ev in ctx.agent.step(f"AUTONOMOUS GOAL: {ctx.args}"):
+                    ctx.renderer.render_agent_event(ev)
 
     def _cmd_stop(self, ctx: CommandContext):
         """Cooperatively interrupt the running turn from the CLI side."""
         was_running = ctx.agent.is_running
         ctx.agent.request_stop()
+        if ctx.args.lower() in ("all", "clear", "queue") and ctx.queue is not None:
+            cleared = ctx.queue.clear()
+            if cleared:
+                ctx.renderer.print_info(f"Purged {cleared} pending task{'s' if cleared != 1 else ''} from queue.")
+
         if was_running:
             ctx.renderer.print_warning("⏹ Stop requested — interrupting current execution…")
         else:
             ctx.renderer.print_info("⏹ Stop flag set.")
             ctx.agent.clear_stop()
+
+    def _cmd_queue(self, ctx: CommandContext):
+        """Manage prompt execution queue."""
+        queue = ctx.queue
+        if queue is None:
+            ctx.renderer.print_info("Execution queue is not active in this mode.")
+            return
+
+        parts = ctx.args.split(" ", 1)
+        sub = parts[0].lower() if parts[0] else "list"
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if sub in ("list", ""):
+            # Mirror /sidebar|/models: always static borderless print, no modal.
+            ctx.renderer.print_queue_modal(queue)
+        elif sub in ("clear", "purge", "flush"):
+            cleared = queue.clear()
+            ctx.renderer.print_success(f"Cleared {cleared} queued task{'s' if cleared != 1 else ''}.")
+        elif sub in ("drop", "rm", "remove", "delete"):
+            if not arg or not arg.isdigit():
+                ctx.renderer.print_warning("Usage: /queue drop <task_id>")
+                return
+            target_id = int(arg)
+            dropped = queue.remove(target_id)
+            if dropped:
+                ctx.renderer.print_success(f"Removed task #{target_id} from queue.")
+            else:
+                ctx.renderer.print_warning(f"No pending task with ID #{target_id} found.")
+        elif sub == "pause":
+            queue.pause()
+            ctx.renderer.print_warning("Queue paused. Running task will finish, but subsequent queued tasks will wait.")
+        elif sub in ("resume", "unpause", "start"):
+            queue.resume()
+            ctx.renderer.print_success("Queue resumed. Next pending task will run automatically.")
+        elif sub == "add":
+            if not arg:
+                ctx.renderer.print_warning("Usage: /queue add <prompt>")
+                return
+            item = queue.enqueue(arg)
+            ctx.renderer.print_queue_event(item, "enqueued")
+        else:
+            ctx.renderer.print_info("Usage: /queue [list] | /queue add <prompt> | /queue drop <id> | /queue clear | /queue pause | /queue resume")
+
+    def _cmd_sidebar(self, ctx: CommandContext):
+        """Display OpenCode-style right-side info panel."""
+        ctx.renderer.print_sidebar(ctx.agent, queue=ctx.queue)
+
+    def _cmd_status(self, ctx: CommandContext):
+        """Display comprehensive system, agent, budget, and queue status card."""
+        # Mirror /sidebar|/models: always static borderless print, no modal.
+        ctx.renderer.print_status_modal(ctx.agent, queue=ctx.queue)
 
     def _cmd_mode(self, ctx: CommandContext):
         if not ctx.args:
@@ -251,7 +314,8 @@ class CommandRegistry:
     def _cmd_theme(self, ctx: CommandContext):
         args = ctx.args.strip()
         if not args:
-            ctx.renderer.print_theme_gallery()
+            # Mirror /sidebar|/models: always static borderless print, no modal.
+            ctx.renderer.print_theme_modal(active_theme=ctx.agent.config.theme)
             return
 
         parts = args.split(" ", 1)
@@ -291,23 +355,27 @@ class CommandRegistry:
                 return univ[base]
             return spec_ctx
 
+        broad_prov = target_prov in ("all", "catalog", "mock", "ollama")
         for rm in cached_prov:
             mid = rm.get("id")
-            if mid and mid not in seen:
-                seen.add(mid)
-                spec = inspect_model(mid, target_prov)
-                ctx_from_cache = rm.get("context_length") or 0
-                cache_thinking = rm.get("supports_thinking")
-                cache_tt = rm.get("thinking_type")
-                models_data.append({
-                    "name": mid,
-                    "context": _resolve_context(mid, ctx_from_cache or spec.context_window),
-                    "output": spec.max_output_tokens,
-                    "thinking": spec.supports_thinking or bool(cache_thinking),
-                    "thinking_type": spec.thinking_type or cache_tt,
-                    "vision": bool(rm.get("supports_vision", spec.supports_vision)),
-                    "reasoning_options": list(rm.get("reasoning_options") or spec.reasoning_options),
-                })
+            if not mid or mid in seen:
+                continue
+            if not broad_prov and not _model_belongs_to_provider(mid.lower(), target_prov):
+                continue
+            seen.add(mid)
+            spec = inspect_model(mid, target_prov)
+            ctx_from_cache = rm.get("context_length") or 0
+            cache_thinking = rm.get("supports_thinking")
+            cache_tt = rm.get("thinking_type")
+            models_data.append({
+                "name": mid,
+                "context": _resolve_context(mid, ctx_from_cache or spec.context_window),
+                "output": spec.max_output_tokens,
+                "thinking": spec.supports_thinking or bool(cache_thinking),
+                "thinking_type": spec.thinking_type or cache_tt,
+                "vision": bool(rm.get("supports_vision", spec.supports_vision)),
+                "reasoning_options": list(rm.get("reasoning_options") or spec.reasoning_options),
+            })
 
         for mname, mdata in KNOWN_MODEL_REGISTRY.items():
             if mname in seen:
@@ -320,7 +388,8 @@ class CommandRegistry:
                 include = True
             elif _model_belongs_to_provider(ml, target_prov):
                 include = True
-            elif not models_data:
+            elif not models_data and target_prov in ("mock", "ollama"):
+                # Generic local providers with no prefix mapping: show registry as fallback
                 include = True
 
             if include:
@@ -335,7 +404,14 @@ class CommandRegistry:
                     "reasoning_options": list(spec.reasoning_options),
                 })
 
-        ctx.renderer.print_models_catalog(target_prov, models_data)
+        active_m = ctx.agent.session.model if ctx.agent.session else ctx.agent.config.model
+        # Mirror /sidebar: always render the static sidebar-style catalog print.
+        # No interactive modal, no overlay, no raw-mode loop. Switch via /model <name>.
+        ctx.renderer.print_models_modal(
+            target_prov,
+            models_data,
+            active_model=active_m,
+        )
 
     def _cmd_config(self, ctx: CommandContext):
         parts = ctx.args.split(" ", 2)
@@ -573,13 +649,8 @@ class CommandRegistry:
 
     def _cmd_mcp(self, ctx: CommandContext):
         servers = ctx.agent.mcp_manager.get_configured_servers()
-        if not servers:
-            ctx.renderer.print_info("No MCP servers configured. (Configure in ~/.harness/mcp.json or ask the model using mcp_integrator skill).")
-            return
-        lines = [f"### Configured MCP Servers ({len(servers)}):"]
-        for name, cfg in servers.items():
-            lines.append(f"- **{name}**: `{cfg.get('command')}` (Args: {cfg.get('args', [])})")
-        ctx.renderer.print_markdown("\n".join(lines))
+        # Mirror /sidebar|/models: always static borderless print, no modal.
+        ctx.renderer.print_mcp_modal(servers)
 
     def _cmd_subagent(self, ctx: CommandContext):
         parts = ctx.args.split(" ", 1)
@@ -653,10 +724,12 @@ class CommandRegistry:
 
         if action in ("", "list"):
             sessions = ctx.agent.session_manager.list_all()
+            active_id = ctx.agent.session.id if ctx.agent.session else None
+            # Mirror /sidebar|/models: always static borderless print, no modal.
+            ctx.renderer.print_sessions_modal(sessions, active_id=active_id)
             lines = ["### Saved Sessions:"]
             for s in sessions[:15]:
                 lines.append(f"- `{s['id']}`: {s['title']} ({s['model']}, {s['turns']} turns)")
-            ctx.renderer.print_markdown("\n".join(lines))
             _publish_output("\n".join(lines), ctx)
         elif action == "create":
             # Explicit session creation — allowed even before a first message.
@@ -670,6 +743,10 @@ class CommandRegistry:
                 title=title,
             )
             ctx.agent.session = new_session
+            try:
+                ctx.agent._bind_checkpoint_session(new_session)
+            except Exception:
+                pass
             _publish_state({"session_id": new_session.id, "session_title": new_session.title, "session_action": "create"}, ctx)
             ctx.renderer.print_success(f"Created new session: `{new_session.id}` ({new_session.title})")
         elif action == "delete":
@@ -703,6 +780,10 @@ class CommandRegistry:
             ctx.agent.session_manager.save(session)
             if ctx.agent.session is not None and session_id == ctx.agent.session.id:
                 ctx.agent.session = session
+                try:
+                    ctx.agent._bind_checkpoint_session(session)
+                except Exception:
+                    pass
             _publish_state({"session_id": session_id, "session_title": new_title, "session_action": "rename"}, ctx)
             ctx.renderer.print_success(f"Renamed session `{session_id}` to: `{new_title}`")
         elif action == "fork":
@@ -712,12 +793,21 @@ class CommandRegistry:
             forked = ctx.agent.session_manager.fork(ctx.agent.session.id, arg or None)
             if forked:
                 ctx.agent.session = forked
+                try:
+                    ctx.agent._bind_checkpoint_session(forked)
+                except Exception:
+                    pass
                 _publish_state({"session_id": forked.id, "session_title": forked.title, "session_action": "fork"}, ctx)
                 ctx.renderer.print_success(f"Forked session to new branch: `{forked.id}` ({forked.title})")
         elif action == "resume" and arg:
             loaded = ctx.agent.session_manager.load(arg)
             if loaded:
                 ctx.agent.session = loaded
+                try:
+                    ctx.agent._bind_checkpoint_session(loaded)
+                    ctx.agent._restore_todos_from_session()
+                except Exception:
+                    pass
                 _publish_state({"session_id": loaded.id, "session_title": loaded.title, "session_action": "resume"}, ctx)
                 ctx.renderer.print_success(f"Resumed session `{loaded.id}`: {loaded.title}")
             else:
@@ -886,12 +976,115 @@ class CommandRegistry:
                 f"{last.get('states', 0)} state change(s), "
                 f"{last.get('files', 0)} file(s)")
 
+    def _cmd_update(self, ctx: CommandContext):
+        """Check and apply updates directly from interactive REPL."""
+        from harness.core.updater import HarnessUpdater
+        updater = HarnessUpdater()
+        ctx.renderer.print_info("Checking for Harness updates...")
+        info = updater.check_for_updates()
+        if info.error:
+            ctx.renderer.print_error(f"Update check failed: {info.error}")
+            return
+        if not info.is_behind:
+            ctx.renderer.print_success(f"Harness is up to date (version {info.current_version})")
+            return
+        if info.is_git:
+            ctx.renderer.print_info(f"Update available: [bold yellow]{info.commits_behind} commits[/bold yellow] behind upstream.")
+            if info.commits:
+                for c in info.commits[:4]:
+                    ctx.renderer.console.print(f"  [dim]•[/dim] [white]{c}[/white]")
+        else:
+            ctx.renderer.print_info(f"New version available: [bold green]{info.latest_version}[/bold green]")
+
+        parts = ctx.args.split()
+        if "--check" in parts:
+            return
+
+        ctx.renderer.print_info("Applying update...")
+        res = updater.apply_update(force="--force" in parts)
+        if res.success:
+            ctx.renderer.print_success("Successfully updated Harness!")
+        else:
+            ctx.renderer.print_error(f"Update failed: {res.error or res.message}")
+
+    def _cmd_discord(self, ctx: CommandContext):
+        """Manage Discord bot and sync."""
+        parts = ctx.args.split(" ", 1)
+        sub = parts[0].lower() if parts and parts[0] else "status"
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        from harness.discord.sync import get_relay
+        relay = get_relay()
+
+        if sub == "status":
+            token = ctx.agent.config.get_discord_token()
+            has_token = bool(token)
+            token_display = f"configured ({token[:4]}...{token[-4:]})" if has_token else "not configured"
+            status = relay.get_status()
+            conn_str = "[green]● Connected[/green]" if status["is_connected"] else "[dim]○ Not connected[/dim]"
+            last_sync = status["last_sync_ts"]
+            last_str = time.strftime("%H:%M:%S", time.localtime(last_sync)) if last_sync else "never"
+            active_ch = status["active_channel"] or "—"
+            q_size = ctx.queue.size() if ctx.queue else 0
+            lines = [
+                "[bold magenta]Discord Bot Status[/bold magenta]",
+                f"  [white]Token:[/white]         [dim]{token_display}[/dim]",
+                f"  [white]Auto-start:[/white]    [cyan]{'Enabled' if ctx.agent.config.discord_auto_start else 'Disabled'}[/cyan]",
+                f"  [white]Permission:[/white]    [green]{ctx.agent.config.discord_permission or 'default'}[/green]",
+                f"  [white]Connection:[/white]    {conn_str}",
+                f"  [white]Active channel:[/white] [dim]{active_ch}[/dim]",
+                f"  [white]Last sync:[/white]     [dim]{last_str}[/dim]",
+                f"  [white]Sync Bus:[/white]      [dim]{relay.bus.path}[/dim]",
+                f"  [white]Queue:[/white]         [dim]{q_size} pending[/dim]",
+                "",
+                "[bold magenta]Sync Usage[/bold magenta]",
+                "  [dim]Start bot:[/dim]       [bold cyan]/discord start [token][/bold cyan]",
+                "  [dim]Stop bot:[/dim]        [bold cyan]/discord stop[/bold cyan]",
+                "  [dim]Force sync:[/dim]      [bold cyan]/discord sync[/bold cyan]",
+                "  [dim]Configure token:[/dim] [bold cyan]/discord token <bot_token>[/bold cyan]",
+            ]
+            ctx.renderer.print_modal_card("Discord Integration", lines, shortcuts="start /discord start  stop /discord stop  esc close")
+        elif sub == "token":
+            if not arg:
+                ctx.renderer.print_warning("Usage: /discord token <your_bot_token>")
+                return
+            ctx.agent.config.set_discord_token(arg)
+            from harness.config import save_config
+            save_config(ctx.agent.config)
+            ctx.renderer.print_success("Saved Discord bot token securely.")
+        elif sub == "start":
+            tok = arg or ctx.agent.config.get_discord_token()
+            if not tok:
+                ctx.renderer.print_error("No Discord token provided. Use: /discord start <token> or /discord token <token>")
+                return
+            from harness.cli import _maybe_start_discord_bot
+            ctx.agent.config.discord_auto_start = True
+            ctx.agent.config.set_discord_token(tok)
+            from harness.config import save_config
+            save_config(ctx.agent.config)
+            _maybe_start_discord_bot(ctx.agent.config)
+            relay.set_connected(True)
+            ctx.renderer.print_success("Started background Discord bot daemon.")
+        elif sub == "stop":
+            ctx.agent.config.discord_auto_start = False
+            from harness.config import save_config
+            save_config(ctx.agent.config)
+            relay.set_connected(False)
+            relay.publish_state({"discord_stop": True}, origin="cli")
+            ctx.renderer.print_success("Discord auto-start disabled. Restart Harness to fully stop background bot (daemon threads exit on process exit).")
+        elif sub == "sync":
+            relay.publish_state({"manual_sync": True, "ts": time.time()}, origin="cli")
+            ctx.renderer.print_success("Broadcasted manual sync pulse to Discord bus.")
+        else:
+            ctx.renderer.print_info("Usage: /discord [status|start [token]|stop|sync|token <val>]")
+
     def _cmd_diff(self, ctx: CommandContext):
         res = ctx.agent.tool_registry.execute("git_diff", {}, ctx.agent.mode)
         ctx.renderer.print_diff(res)
 
     def _cmd_clear(self, ctx: CommandContext):
         ctx.renderer.clear_screen()
+        ctx.renderer.print_welcome_splash(ctx.agent, queue=ctx.queue)
 
     def _cmd_exit(self, ctx: CommandContext):
         ctx.renderer.print_info("Exiting Harness. Goodbye!")

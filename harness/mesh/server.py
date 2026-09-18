@@ -117,7 +117,8 @@ class MeshHandler(BaseHTTPRequestHandler):
 
         # Public endpoints (no auth)
         if path in ("/", "/health"):
-            return self._json({"status": "ok", "version": "1.0.0", "port": server.port}, 200)
+            from harness import __version__ as _ver
+            return self._json({"status": "ok", "version": _ver, "port": server.port}, 200)
 
         if not self._check_auth():
             return self._json({"error": "unauthorized, missing or invalid token"}, 401)

@@ -92,6 +92,30 @@ def chunk_quote(text: str, max_len: int = DISCORD_MAX_MESSAGE_LEN) -> List[str]:
     return chunks
 
 
+TOOL_ICONS = {
+    "bash": "⚡",
+    "run_command": "⚡",
+    "write_to_file": "📝",
+    "replace_file_content": "📝",
+    "edit_file": "📝",
+    "grep_search": "🔍",
+    "find_by_name": "🔍",
+    "view_file": "📖",
+    "read_url_content": "🌐",
+    "search_web": "🌐",
+    "git": "🌿",
+    "subagent": "🤖",
+    "ask_user": "❓",
+}
+
+
+def format_capsule_card(mode: str, model: str, duration: float, tokens: int = 0) -> str:
+    """Render OpenCode turn capsule text for Discord."""
+    dur_str = f"{duration:.1f}s" if duration >= 1.0 else f"{int(duration * 1000)}ms"
+    tok_str = f" · `{tokens:,}t`" if tokens > 0 else ""
+    return f"▣ **{mode.upper()}** · `{model}` · `{dur_str}`{tok_str}"
+
+
 class DiscordRenderState:
     """Accumulates agent events into outgoing Discord messages.
 
@@ -137,7 +161,8 @@ class DiscordRenderState:
             out = self._flush_thinking()
             name = (data or {}).get("name", "tool")
             args = (data or {}).get("arguments", {}) or {}
-            line = f"🔧 Using tool: `{name}`"
+            icon = TOOL_ICONS.get(name.lower(), "🔧")
+            line = f"{icon} Using `{name}`"
             if args:
                 preview = str(args)
                 if len(preview) > 120:

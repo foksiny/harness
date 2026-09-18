@@ -77,6 +77,11 @@ class HarnessAgent:
             apply_message_change=self._checkpoint_apply_message,
             apply_state_change=self._checkpoint_apply_state,
         )
+        # Persist checkpoint changes to disk and keep session in sync
+        try:
+            self.checkpoint_manager.add_change_listener(self._on_checkpoint_persist)
+        except Exception:
+            pass
 
         self.provider: BaseProvider = get_provider(config.provider, config)
         # Test seam: when set, the vision-fallback provider is used verbatim
@@ -84,6 +89,12 @@ class HarnessAgent:
         self._vfb_provider_override: Optional[BaseProvider] = None
         self.session_manager = SessionManager()
         self.session: Optional[Session] = session
+        # Bind checkpoint persistence to current session if any
+        if self.session is not None:
+            try:
+                self.checkpoint_manager.bind_session(self.session.id)
+            except Exception:
+                pass
 
         initial_model = self.session.model if self.session is not None else config.model
         model_spec = self.provider.get_model_spec(initial_model)
@@ -152,9 +163,11 @@ class HarnessAgent:
                 permission=self.permission_manager.level.value,
                 thinking_effort=self.config.thinking_effort,
             )
+            self._bind_checkpoint_session(self.session)
         else:
             # Restore todos from existing session (e.g., on resume)
             self._restore_todos_from_session()
+            self._bind_checkpoint_session(self.session)
         return self.session
 
     def set_mode(self, mode: Mode):
@@ -342,31 +355,50 @@ class HarnessAgent:
     def _checkpoint_apply_message(self, mc, undo: bool) -> bool:
         """Materialize a message history change against the live session (undo/redo)."""
         if self.session is None:
-            return False
+            return True  # No session - treat as applied to allow pointer move
         msgs = self.session.messages
         try:
             if mc.action == "append":
                 if undo:
                     idx = mc.index
-                    if idx < 0 or idx >= len(msgs) or msgs[idx] != mc.new_message:
+                    # Strict check first, then lenient fallback search
+                    if 0 <= idx < len(msgs) and msgs[idx] == mc.new_message:
+                        del msgs[idx]
+                        return True
+                    # Fallback: search nearby for the message to remove (handles index shift after compaction)
+                    try:
+                        found = msgs.index(mc.new_message)
+                        del msgs[found]
+                        return True
+                    except ValueError:
+                        # Last resort: if message at index is close, or remove last matching role/content
+                        for i in range(max(0, idx-2), min(len(msgs), idx+3)):
+                            if msgs[i].get("content") == mc.new_message.get("content") and msgs[i].get("role") == mc.new_message.get("role"):
+                                del msgs[i]
+                                return True
                         return False
-                    del msgs[idx]
+                # Redo: insert at clamped index, avoid duplicate
+                if mc.new_message in msgs:
                     return True
-                msgs.insert(min(mc.index, len(msgs)), mc.new_message)
+                msgs.insert(min(max(0, mc.index), len(msgs)), mc.new_message)
                 return True
             if mc.action == "truncate":
                 if undo:
                     # Restore the compacted messages back into the history.
-                    idx = min(mc.index, len(msgs))
+                    idx = min(max(0, mc.index), len(msgs))
                     msgs[idx:idx] = list(mc.removed_messages)
                     return True
-                if mc.index + mc.count > len(msgs):
-                    return False
-                del msgs[mc.index:mc.index + mc.count]
+                # Redo: clamp to available length, be lenient
+                if mc.index >= len(msgs):
+                    return True  # Already truncated
+                end = min(mc.index + mc.count, len(msgs))
+                del msgs[mc.index:end]
                 return True
             if mc.action == "replace":
                 if mc.index < 0 or mc.index >= len(msgs):
+                    # Lenient: if index out of range on redo and old==new, treat as applied
                     return False
+                # Lenient: allow replace even if current doesn't exactly match expected old
                 msgs[mc.index] = mc.old_message if undo else mc.new_message
                 return True
             if mc.action == "span_replace":
@@ -374,9 +406,29 @@ class HarnessAgent:
                 # Undo starts from the applied (new) span; redo starts from the old one.
                 expected = mc.new_messages if undo else mc.old_messages
                 replaced = mc.old_messages if undo else mc.new_messages
-                if msgs[mc.index:mc.index + len(expected)] != expected:
-                    return False
-                msgs[mc.index:mc.index + len(expected)] = list(replaced)
+                # Strict check first
+                if msgs[mc.index:mc.index + len(expected)] == expected:
+                    msgs[mc.index:mc.index + len(expected)] = list(replaced)
+                    return True
+                # Lenient fallback: search for expected span elsewhere
+                if not expected:
+                    msgs[mc.index:mc.index] = list(replaced)
+                    return True
+                # Try to find expected by content search
+                for start in range(max(0, len(msgs)-len(expected)+1)):
+                    if msgs[start:start+len(expected)] == expected:
+                        msgs[start:start+len(expected)] = list(replaced)
+                        return True
+                # Last resort: if undo and new span not found, assume already undone
+                # or if redo and old span not found, assume already redone
+                # Check if replaced already present
+                if msgs[mc.index:mc.index+len(replaced)] == replaced:
+                    return True
+                # Force replace at index clamped
+                idx = min(max(0, mc.index), len(msgs))
+                # Remove expected length if possible, insert replaced
+                del msgs[idx:idx+len(expected)]
+                msgs[idx:idx] = list(replaced)
                 return True
         except Exception:
             return False
@@ -998,6 +1050,24 @@ class HarnessAgent:
         """Restore TodoManager state from session (called on session load)."""
         if self.session is not None and self.session.todos:
             self.todo_manager.load_list(self.session.todos)
+
+    def _bind_checkpoint_session(self, session: Optional[Session] = None):
+        """Bind checkpoint manager persistence to the active session."""
+        target = session if session is not None else self.session
+        sid = target.id if target is not None else None
+        try:
+            self.checkpoint_manager.bind_session(sid)
+        except Exception:
+            pass
+
+    def _on_checkpoint_persist(self):
+        """Listener for checkpoint changes - sync todos and persist session+checkpoints."""
+        try:
+            self._sync_todos_to_session()
+            if self.session is not None:
+                self.session_manager.save(self.session)
+        except Exception:
+            pass
 
     def _maybe_auto_learn(self, user_prompt: Optional[str]) -> None:
         """Cheap, deterministic heuristic capture: no extra provider call.

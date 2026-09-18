@@ -302,12 +302,29 @@ if HAS_DISCORD:
                 return  # our own publish — applied locally before publishing
             try:
                 if kind == "state":
-                    await self._apply_state(ev.get("payload", {}), source=origin)
+                    payload = ev.get("payload", {})
+                    if payload.get("turn_capsule"):
+                        from harness.discord.renderer import format_capsule_card
+                        mode = str(payload.get("mode", "build"))
+                        model = str(payload.get("model", ""))
+                        dur = float(payload.get("duration", 0))
+                        toks = int(payload.get("tokens", 0) or 0)
+                        capsule = format_capsule_card(mode, model, dur, tokens=toks)
+                        if payload.get("context_pct"):
+                            capsule += f" · `{payload.get('context_pct')}% ctx`"
+                        await self._broadcast_activity(capsule)
+                    else:
+                        await self._apply_state(payload, source=origin)
                 elif kind == "stop":
                     await self._stop_all(reason=f"requested by {origin}")
                 elif kind == "message":
                     # A prompt typed in the TUI was executed there; mirror as activity.
                     await self._broadcast_activity(f"⌨️ CLI: {str(ev.get('text', ''))[:400]}")
+                elif kind == "output":
+                    txt = str(ev.get("text", "")).strip()
+                    if txt:
+                        # Avoid flooding with huge chunks; truncate to Discord limit
+                        await self._broadcast_activity(txt[:1900])
             except Exception:
                 log.debug("Failed handling sync event", exc_info=True)
 
@@ -460,6 +477,11 @@ if HAS_DISCORD:
             async def on_ready() -> None:
                 log.info("Bot connected as %s (ID: %s)", self.bot.user, self.bot.user.id)
                 self._loop = asyncio.get_running_loop()
+                try:
+                    self._relay.set_connected(True)
+                    self._relay.last_sync_ts = __import__("time").time()
+                except Exception:
+                    pass
                 if self._bus_task is None or self._bus_task.done():
                     # Start the cross-process sync poller now that the loop runs.
                     self._bus_task = self._loop.create_task(self._bus_poller())
@@ -702,6 +724,152 @@ if HAS_DISCORD:
                     {"provider": self.config.provider, "model": new_model}, origin="discord"
                 )
                 await interaction.response.send_message(f"✅ Model switched to: **{new_model}**")
+
+            @_cmd(name="models", description="List models available for current or specific provider.")
+            @app_commands.describe(provider="Optional provider name")
+            async def models_cmd(interaction: discord.Interaction, provider: Optional[str] = None):
+                target_prov = (provider or self.config.provider).lower().strip()
+                from harness.providers.discovery import load_cached_models, load_universal_models
+                from harness.providers.detector import inspect_model
+                cache = load_cached_models()
+                univ = load_universal_models()
+                cached_models = cache.get(target_prov, {}).get("models", [])
+                model_lines = []
+                if cached_models:
+                    for m in cached_models[:12]:
+                        mname = m.get("name", "") or m.get("id", "")
+                        ctx_w = m.get("context_window") or m.get("context_length") or 0
+                        if not ctx_w and mname.lower().split("/")[-1].split(":")[0] in univ:
+                            ctx_w = univ[mname.lower().split("/")[-1].split(":")[0]]
+                        ctx_str = f"{ctx_w:,}t" if ctx_w else "—"
+                        badges = []
+                        if m.get("supports_thinking"):
+                            badges.append("🧠 thinking")
+                        if m.get("supports_vision"):
+                            badges.append("👁 vision")
+                        badge_str = f" · {', '.join(badges)}" if badges else ""
+                        model_lines.append(f"• `{mname}` ({ctx_str}){badge_str}")
+                else:
+                    # Fallback: show active model specs
+                    active = self.config.model
+                    spec = inspect_model(active, target_prov)
+                    model_lines.append(f"• `{active}` — Active (ctx {spec.context_window:,}t{' 🧠' if spec.supports_thinking else ''})")
+
+                header = f"**⚡ {target_prov.upper()} Models ({len(cached_models) or 1}):**"
+                active_marker = f"**Active:** `{self.config.model}`"
+                text = header + "\n" + active_marker + "\n\n" + "\n".join(model_lines)
+                # Try embed for richer display
+                try:
+                    embed = discord.Embed(title=f"{target_prov.upper()} Models", description="\n".join(model_lines[:10]), color=0x00BFFF)
+                    embed.set_footer(text=f"Active: {self.config.model} · {len(cached_models)} discovered")
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message(embed=embed)
+                    else:
+                        await interaction.followup.send(embed=embed)
+                    return
+                except Exception:
+                    pass
+                await self._send_chunked(interaction, text)
+
+            @_cmd(name="queue", description="Inspect execution queue.")
+            @app_commands.describe(action="Optional: list, clear, pause, resume")
+            async def queue_cmd(interaction: discord.Interaction, action: Optional[str] = None):
+                act = (action or "list").lower().strip()
+                relay = self._relay
+                if act == "clear":
+                    # Best-effort: publish clear signal; TUI will handle if attached queue exists
+                    relay.publish_state({"queue_action": "clear"}, origin="discord")
+                    await interaction.response.send_message("🧹 Queue clear requested (TUI will flush pending tasks).")
+                    return
+                if act == "pause":
+                    relay.publish_state({"queue_action": "pause"}, origin="discord")
+                    await interaction.response.send_message("⏸ Queue pause requested.")
+                    return
+                if act == "resume":
+                    relay.publish_state({"queue_action": "resume"}, origin="discord")
+                    await interaction.response.send_message("▶ Queue resume requested.")
+                    return
+                # Default: inspect
+                rt = self._get_runtime(interaction.channel_id)
+                agent = rt.ensure_agent()
+                # Try to show pending tasks if any (per-channel agent has no shared queue, so show relay status)
+                history = relay.get_history(limit=5)
+                last_sync = relay.last_sync_ts
+                sync_str = f"<t:{int(last_sync)}:R>" if last_sync else "never"
+                lines = [
+                    "**⚡ Harness Execution Queue**",
+                    f"• Mode: `{self.config.mode.upper()}` · Model: `{self.config.model}`",
+                    f"• Relay bus: `{relay.bus.path}`",
+                    f"• Last sync: {sync_str} · Connected: `{relay.is_connected}`",
+                    f"• Active channel: `{relay.active_channel or '—'}`",
+                    f"• Recent bus events: {len(history)}",
+                ]
+                # Try embed
+                try:
+                    embed = discord.Embed(title="⚡ Execution Queue", color=0xFFAA00)
+                    for ln in lines:
+                        # Strip markdown for embed fields
+                        embed.add_field(name="\u200b", value=ln.replace("**", "").replace("`", ""), inline=False)
+                    embed.set_footer(text="Use /queue clear|pause|resume · Synced with CLI bus")
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message(embed=embed)
+                    else:
+                        await interaction.followup.send(embed=embed)
+                    return
+                except Exception:
+                    pass
+                await self._send_chunked(interaction, "\n".join(lines))
+
+            @_cmd(name="sidebar", description="Inspect workspace context and tasks.")
+            async def sidebar_cmd(interaction: discord.Interaction):
+                rt = self._get_runtime(interaction.channel_id)
+                agent = rt.ensure_agent()
+                cwd = self.workspace
+                branch = ""
+                try:
+                    import subprocess
+                    branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd, stderr=subprocess.DEVNULL, text=True, timeout=2).strip()
+                except Exception:
+                    branch = "detached"
+                # Token usage
+                tokens = 0
+                c_win = 200000
+                pct = 0
+                try:
+                    if agent.session is not None:
+                        from harness.core.compaction import calculate_history_tokens
+                        tokens = calculate_history_tokens(agent.session.messages)
+                    c_win = agent.compactor.context_window
+                    pct = round((tokens / max(1, c_win)) * 100, 1)
+                except Exception:
+                    pass
+                # Todo summary
+                todo_summary = ""
+                try:
+                    todo_summary = agent.todo_manager.summary() or "No active tasks"
+                except Exception:
+                    todo_summary = "—"
+                # MCP count
+                mcp_count = len(getattr(agent, "mcp_manager", {}).clients) if hasattr(agent, "mcp_manager") else 0
+                lines = [
+                    f"**⚡ Harness Workspace — `{cwd}`**",
+                    f"• Branch: `{branch}`  ·  MCP: `{mcp_count}` servers",
+                    f"• Provider: `{self.config.provider}`  ·  Model: `{self.config.model}`",
+                    f"• Mode: `{self.config.mode}`  ·  Permission: `{self.config.discord_permission or 'default'}`",
+                    f"• Context: `{tokens:,}/{c_win:,} ({pct}%)`",
+                    f"• Tasks: {todo_summary}",
+                ]
+                try:
+                    embed = discord.Embed(title="⚡ Workspace Sidebar", description="\n".join(l.replace("**", "") for l in lines), color=0x00FFAA)
+                    embed.set_footer(text=f"Harness {__import__('harness').__version__} · {cwd}")
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message(embed=embed)
+                    else:
+                        await interaction.followup.send(embed=embed)
+                    return
+                except Exception:
+                    pass
+                await self._send_chunked(interaction, "\n".join(lines))
 
             @_cmd(name="session", description="Manage sessions: list, create, resume.")
             @app_commands.describe(action="list, create, or resume", arg="Session ID or title")

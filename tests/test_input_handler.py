@@ -65,6 +65,13 @@ class TestKeybindClassification(unittest.TestCase):
 
     def test_learn_in_slash_commands_completion(self):
         self.assertIn("/learn", SLASH_COMMANDS)
+        self.assertIn("/queue", SLASH_COMMANDS)
+        self.assertIn("/sidebar", SLASH_COMMANDS)
+        self.assertIn("/status", SLASH_COMMANDS)
+        from harness.tui.input_handler import COMMAND_DESCRIPTIONS
+        self.assertIn("/queue", COMMAND_DESCRIPTIONS)
+        self.assertIn("/sidebar", COMMAND_DESCRIPTIONS)
+        self.assertIn("/status", COMMAND_DESCRIPTIONS)
 
 
 class TestCommandVsPathRouting(unittest.TestCase):

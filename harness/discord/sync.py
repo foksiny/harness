@@ -167,6 +167,11 @@ class MessageRelay:
         self._state_listeners: List[Callable[[Dict, str], None]] = []
         self._history: List[dict] = []
         self.bus = SyncBus(bus_path) if bus_path is not None else SyncBus()
+        # Status tracking for plan compliance
+        self.is_connected: bool = False
+        self.active_channel: Optional[int] = None
+        self.last_sync_ts: float = 0.0
+        self._queue_ref = None  # optional ExecutionQueue integration
 
     # ── Callback registration ───────────────────────────────────────────
 
@@ -190,6 +195,7 @@ class MessageRelay:
         """CLI received user input; relay to Discord (callbacks + bus)."""
         with self._lock:
             self._history.append({"source": "cli", "text": text})
+            self.last_sync_ts = time.time()
             cb = self._discord_callback
         self.bus.publish({"kind": MESSAGE, "origin": "cli", "text": text, **(meta or {})})
         if cb:
@@ -202,6 +208,9 @@ class MessageRelay:
         """Discord received user input; relay to CLI (callbacks + bus)."""
         with self._lock:
             self._history.append({"source": "discord", "text": text, "channel_id": channel_id})
+            self.last_sync_ts = time.time()
+            if channel_id is not None:
+                self.active_channel = channel_id
             cb = self._cli_callback
         self.bus.publish({
             "kind": MESSAGE, "origin": "discord", "text": text, "channel_id": channel_id, **(meta or {}),
@@ -214,9 +223,50 @@ class MessageRelay:
 
     def relay_output(self, text: str, origin: str, channel_id: Optional[int] = None) -> None:
         """Agent output text, mirrored to the *other* side for display only."""
+        with self._lock:
+            self.last_sync_ts = time.time()
+            if channel_id is not None:
+                self.active_channel = channel_id
         self.bus.publish({
             "kind": OUTPUT, "origin": origin, "text": text, "channel_id": channel_id,
         })
+
+    def set_connected(self, connected: bool, channel_id: Optional[int] = None) -> None:
+        with self._lock:
+            self.is_connected = connected
+            self.last_sync_ts = time.time()
+            if channel_id is not None:
+                self.active_channel = channel_id
+
+    def attach_queue(self, queue) -> None:
+        """Attach an ExecutionQueue for Discord enqueue helpers."""
+        with self._lock:
+            self._queue_ref = queue
+
+    def enqueue_via_relay(self, text: str, channel_id: Optional[int] = None, mode: Optional[str] = None):
+        """Enqueue a prompt via the attached queue (if available) and broadcast."""
+        with self._lock:
+            q = self._queue_ref
+        if q is not None:
+            try:
+                item = q.enqueue(text, mode=mode, metadata={"origin": "discord", "channel_id": channel_id})
+                self.last_sync_ts = time.time()
+                return item
+            except Exception:
+                pass
+        # Fallback: just publish as MESSAGE
+        self.relay_from_discord(text, channel_id=channel_id)
+        return None
+
+    def get_status(self) -> Dict:
+        with self._lock:
+            return {
+                "is_connected": self.is_connected,
+                "active_channel": self.active_channel,
+                "last_sync_ts": self.last_sync_ts,
+                "bus_path": str(self.bus.path),
+                "history_len": len(self._history),
+            }
 
     # ── State synchronization ──────────────────────────────────────────
 
@@ -224,6 +274,7 @@ class MessageRelay:
         """Broadcast a state change (mode, provider, model, session, …)."""
         with self._lock:
             self._history.append({"source": origin, "kind": "state", "payload": dict(payload)})
+            self.last_sync_ts = time.time()
             listeners = list(self._state_listeners)
         self.bus.publish({"kind": STATE, "origin": origin, "payload": dict(payload)})
         for cb in listeners:
@@ -234,6 +285,8 @@ class MessageRelay:
 
     def publish_stop(self, origin: str, channel_id: Optional[int] = None) -> None:
         """Broadcast an interrupt request for any running agent turn."""
+        with self._lock:
+            self.last_sync_ts = time.time()
         self.bus.publish({"kind": STOP, "origin": origin, "channel_id": channel_id})
 
     def get_history(self, limit: int = 50) -> List[dict]:

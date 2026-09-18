@@ -111,10 +111,11 @@ class StdioMCPClient:
         return None
 
     def _initialize(self) -> bool:
+        from harness import __version__ as _ver
         init_params = {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "Harness", "version": "1.0.0"},
+            "clientInfo": {"name": "Harness", "version": _ver},
         }
         res = self._send_request("initialize", init_params, timeout=5.0)
         if res and "result" in res:
