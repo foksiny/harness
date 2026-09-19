@@ -7,7 +7,7 @@ import time
 from typing import Dict, Any, List, Optional, Callable
 from harness.core.modes import Mode
 from harness.core.permissions import PermissionLevel
-from harness.themes import THEMES, list_themes, render_theme_preview
+from harness.themes import THEMES, BUILTIN_THEME_NAMES, list_themes, render_theme_preview
 from harness.providers import list_providers, PROVIDER_CONFIGS
 from harness.config import save_config, mask_key
 from harness.commands.config_cmd import display_config_table, display_keys_table, run_setup_wizard
@@ -169,7 +169,7 @@ class CommandRegistry:
         self.register("status", self._cmd_status, "Display full system, agent, budget, and queue status.")
         self.register("mode", self._cmd_mode, "Switch operational mode: plan, build, super.")
         self.register("perm", self._cmd_perm, "Switch permission profile: secure, default, full.")
-        self.register("theme", self._cmd_theme, "Theme gallery, preview, and switching (14 themes available).")
+        self.register("theme", self._cmd_theme, "Theme gallery, preview, switching, and custom creation: /theme, /theme list, /theme <name>, /theme preview <name>, /theme create, /theme delete <name>.")
         self.register("models", self._cmd_models, "Browse model catalog for current or specific provider.")
         self.register("config", self._cmd_config, "View, get, or set configuration settings.")
         self.register("keys", self._cmd_keys, "Manage, mask, and test provider API keys.")
@@ -319,15 +319,63 @@ class CommandRegistry:
             return
 
         parts = args.split(" ", 1)
-        if parts[0] == "preview":
-            target = parts[1].lower().strip() if len(parts) > 1 else ctx.renderer.theme.name
+        sub = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if sub == "preview":
+            target = arg.lower() if arg else ctx.renderer.theme.name
             if target in THEMES:
                 card = render_theme_preview(target)
                 ctx.renderer.console.print(card)
             else:
-                ctx.renderer.print_error(f"Unknown theme '{target}'. Use `/theme` to view the 14 available themes.")
+                ctx.renderer.print_error(f"Unknown theme '{target}'. Use `/theme` to view available themes.")
             return
 
+        if sub == "list":
+            # List all themes with indicators for built-in vs custom
+            lines = ["### Available Themes:"]
+            for name, theme in sorted(THEMES.items()):
+                marker = "[dim](built-in)[/dim]" if name in BUILTIN_THEME_NAMES else "[green](custom)[/green]"
+                active = " ▶" if name == ctx.agent.config.theme else ""
+                lines.append(f"- `{name}`: {theme.display_name} {marker}{active}")
+            ctx.renderer.print_markdown("\n".join(lines))
+            return
+
+        if sub == "create":
+            # Interactive theme creation wizard
+            from harness.themes import interactive_create_theme
+            ctx.renderer.print_info("Starting interactive theme creator...")
+            success, message = interactive_create_theme(global_scope=True)
+            if success:
+                ctx.renderer.print_success(message)
+                # Show preview of new theme
+                new_name = message.split("`")[1] if "`" in message else ""
+                if new_name and new_name in THEMES:
+                    card = render_theme_preview(new_name)
+                    ctx.renderer.console.print(card)
+                    ctx.renderer.print_info(f"Switch to it with: /theme {new_name}")
+            else:
+                ctx.renderer.print_error(message)
+            return
+
+        if sub == "delete":
+            if not arg:
+                ctx.renderer.print_warning("Usage: /theme delete <theme_name>")
+                return
+            from harness.themes import delete_custom_theme
+            success, message = delete_custom_theme(arg)
+            if success:
+                ctx.renderer.print_success(message)
+                # If deleted theme was active, revert to default
+                if ctx.agent.config.theme == arg.lower():
+                    ctx.agent.config.theme = "cyberpunk"
+                    ctx.renderer.set_theme("cyberpunk")
+                    save_config(ctx.agent.config)
+            else:
+                ctx.renderer.print_error(message)
+            return
+
+        # Switch theme
         name = args.lower()
         if name in THEMES:
             ctx.renderer.set_theme(name)
@@ -337,7 +385,7 @@ class CommandRegistry:
             card = render_theme_preview(name)
             ctx.renderer.console.print(card)
         else:
-            ctx.renderer.print_error(f"Unknown theme '{name}'. Available: {', '.join(THEMES.keys())}")
+            ctx.renderer.print_error(f"Unknown theme '{name}'. Use `/theme list` to see available themes.")
 
     def _cmd_models(self, ctx: CommandContext):
         target_prov = ctx.args.strip().lower() or ctx.agent.provider.name

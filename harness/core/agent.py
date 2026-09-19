@@ -7,7 +7,7 @@ import json
 import os
 import threading
 import time
-from typing import Dict, Any, List, Optional, Callable, Generator, Tuple
+from typing import Dict, Any, List, Optional, Callable, Generator, Tuple, Iterator
 from harness.core.modes import Mode
 from harness.core.permissions import PermissionManager, PermissionLevel
 from harness.core.prompt import SystemPromptBuilder
@@ -20,7 +20,7 @@ from harness.core.subagents import SubagentOrchestrator
 from harness.core.learning import LearningManager
 from harness.core.attachments import parse_attachments
 from harness.core.mentions import expand_mentions
-from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta, is_fatal_provider_error
+from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta, is_fatal_provider_error, is_empty_stream_error
 from harness.providers import get_provider
 from harness.tools import ToolRegistry
 from harness.skills.loader import SkillsManager
@@ -153,6 +153,126 @@ class HarnessAgent:
     def clear_stop(self) -> None:
         """Clear a pending stop request before starting a new turn."""
         self._stop_requested.clear()
+
+    # ── Exploration watchdog ──────────────────────────────────────────
+    # A model can spiral: dozens of consecutive read-only calls (ls/cat/find)
+    # re-orienting itself, each with huge reasoning, burning the whole turn
+    # without producing anything. When the streak crosses the threshold the
+    # agent injects a system nudge forcing it back to concrete action.
+    _EXPLORATION_TOOLS = frozenset({
+        "view_file", "list_dir", "find_files", "grep_search", "git_status",
+        "git_diff", "web_search", "list_skills", "read_skill", "learn_recall",
+        "mesh_status", "mesh_list_peers", "mesh_read_messages",
+        "swarm_read_messages", "todo_list", "ask_user",
+    })
+    _READ_ONLY_COMMAND_WORDS = frozenset({
+        "ls", "cat", "cd", "pwd", "echo", "find", "grep", "rg", "head",
+        "tail", "wc", "which", "whoami", "stat", "file", "du", "df",
+        "printenv", "type", "less", "more", "uname", "id", "date", "tree",
+    })
+    _READ_ONLY_GIT_SUBCOMMANDS = ("status", "diff", "log", "show", "branch")
+    _COMMAND_MUTATION_MARKERS = (
+        ">", "<<", "&&", ";", "|", "&", "rm ", "mv ", "cp ", "mkdir ",
+        "touch ", "tee ", "chmod ", "chown ", "sed ", "awk ", "python",
+        "node ", "npm ", "npx ", "pip ", "docker ", "kill", "sudo",
+        "apt ", "tar ", "zip ", "make ", "git ",
+    )
+
+    def _is_exploration_call(self, tool_name: str, args: Dict[str, Any]) -> bool:
+        """Heuristic: is this tool call purely read-only exploration?
+
+        Only clearly read-only calls count. Anything ambiguous (pipes, chains,
+        redirections, script runners, git anything-but-read) counts as action
+        and resets the streak — false negatives merely delay the nudge, false
+        positives would interrupt legitimate work.
+        """
+        if tool_name in self._EXPLORATION_TOOLS:
+            return True
+        if tool_name != "run_command":
+            return False
+        cmd = str((args or {}).get("command", "")).strip()
+        if not cmd:
+            return False
+        lowered = cmd.lower()
+        parts = lowered.split()
+        first = parts[0].strip(";()") if parts else ""
+        if first == "git" and len(parts) > 1 and parts[1] in self._READ_ONLY_GIT_SUBCOMMANDS:
+            markers = tuple(m for m in self._COMMAND_MUTATION_MARKERS if m != "git ")
+            return not any(m in lowered for m in markers)
+        if first not in self._READ_ONLY_COMMAND_WORDS:
+            return False
+        return not any(m in lowered for m in self._COMMAND_MUTATION_MARKERS)
+
+    def _stream_interruptible(self, stream_factory: Callable[[], Iterator[LLMChunk]]) -> Iterator[LLMChunk]:
+        """Yield provider chunks while staying responsive to stop requests.
+
+        The provider stream blocks inside network reads that may legally sit
+        silent for the whole SSE read timeout (300s by default, to tolerate
+        long reasoning stalls). Previously the stop flag was only checked
+        *between* chunks — so when a stream stalled with no bytes arriving,
+        /stop and Ctrl-C appeared completely dead until the socket timed out.
+
+        This wrapper pumps the provider generator on a daemon thread and
+        forwards chunks through a queue. The consumer polls the queue with a
+        short timeout and checks the stop flag between polls, so a stop
+        request is honored within ~0.25s even while mid-stream. On stop, the
+        provider's in-flight HTTP stream is hard-aborted (socket teardown),
+        which promptly unblocks and retires the pump thread instead of
+        letting it linger for the read timeout.
+        """
+        import queue as _pyqueue
+
+        q: "_pyqueue.Queue" = _pyqueue.Queue()
+        done_sentinel = object()  # generator finished cleanly
+
+        stop_event = self._stop_requested
+        provider = self.provider
+
+        def _pump() -> None:
+            try:
+                for chunk in stream_factory():
+                    if stop_event.is_set():
+                        break
+                    q.put(chunk)
+            except BaseException as exc:  # forwarded to the consumer thread
+                try:
+                    q.put(exc)
+                except Exception:
+                    pass
+                return
+            try:
+                q.put(done_sentinel)
+            except Exception:
+                pass
+
+        pump = threading.Thread(target=_pump, daemon=True, name="harness-stream-pump")
+        pump.start()
+
+        try:
+            while True:
+                if self._stop_requested.is_set():
+                    return  # finally tears the pump's stream down
+                try:
+                    item = q.get(timeout=0.25)
+                except _pyqueue.Empty:
+                    continue
+                if item is done_sentinel:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            # Any exit (stop, consumer close/GC, exception) must hard-abort
+            # the in-flight HTTP stream so the pump's blocked read raises and
+            # the daemon thread retires NOW instead of lingering for the
+            # read timeout. On normal completion this is a no-op (the
+            # provider already unregistered its streams).
+            abort = getattr(provider, "abort_active_streams", None)
+            if callable(abort):
+                try:
+                    abort()
+                except Exception:
+                    pass
 
     def ensure_session(self) -> Session:
         """Create the active session on the user's first message."""
@@ -777,6 +897,13 @@ class HarnessAgent:
         current_loop = 0
         empty_streak = 0
         MAX_EMPTY_RETRIES = 2
+        # SUPER mode: narration without tool calls must not abandon the goal —
+        # challenge it once; a second consecutive text-only reply ends the turn.
+        super_text_only_streak = 0
+        MAX_SUPER_TEXT_NUDGES = 1
+        # Exploration watchdog: consecutive read-only calls without action.
+        exploration_streak = 0
+        MAX_EXPLORATION_STREAK = 10
 
         # Create checkpoint at start of turn
         self.checkpoint_manager.create_checkpoint(f"Turn {len(self.session.messages) // 2 + 1} start")
@@ -811,14 +938,17 @@ class HarnessAgent:
                 reasoning_accumulator = ""
                 tool_calls_accumulator: Dict[int, Dict[str, Any]] = {}
                 error_accumulator = ""
-                try:
-                    for chunk in self.provider.stream_chat(
+                stream_iter = self._stream_interruptible(
+                    lambda: self.provider.stream_chat(
                         messages=self.session.messages,
                         model=self.session.model,
                         thinking_effort=self.config.thinking_effort,
                         tools=active_tools,
                         system_prompt=sys_prompt,
-                    ):
+                    )
+                )
+                try:
+                    for chunk in stream_iter:
                         if chunk.finish_reason == "error":
                             error_accumulator += chunk.delta_text or ""
                             yield AgentEvent("text_delta", chunk.delta_text or f"\n[Error from {self.provider.display_name}: unknown provider error]\n")
@@ -851,6 +981,15 @@ class HarnessAgent:
                     # Provider raised instead of yielding an error chunk.
                     error_accumulator += f"\n[Unexpected Error from {self.provider.display_name}: {exc}]\n"
                     yield AgentEvent("text_delta", f"\n[Unexpected Error from {self.provider.display_name}: {exc}]\n")
+                finally:
+                    # Promptly retire the pump on ANY exit (stop break, error,
+                    # completion): close() runs the wrapper's finally, which
+                    # aborts any still-open HTTP stream instead of letting the
+                    # daemon thread linger for the read timeout.
+                    try:
+                        stream_iter.close()
+                    except Exception:
+                        pass
 
                 if not error_accumulator or self._stop_requested.is_set():
                     break  # clean stream (or user stop) — proceed with what we have
@@ -859,6 +998,34 @@ class HarnessAgent:
                 err_first_line = (error_accumulator.strip().splitlines() or ["unknown provider error"])[0][:300]
                 if is_fatal_provider_error(error_accumulator) or stream_attempt >= provider_retries:
                     break
+                # An endpoint that answered 200 but streamed zero usable data
+                # ("stream ended without a response") is usually persistent for
+                # this exact payload — NIM does this under load. Cap it at ONE
+                # fast retry instead of the full exponential chain; hammering
+                # it with 5s→10s→20s backoffs just wastes the user's time.
+                if is_empty_stream_error(error_accumulator):
+                    if stream_attempt >= 1:
+                        break
+                    stream_attempt += 1
+                    yield AgentEvent("provider_retry", {
+                        "provider": self.provider.display_name,
+                        "attempt": stream_attempt,
+                        "max_retries": 1,
+                        "delay": 2.0,
+                        "error": err_first_line,
+                    })
+                    yield AgentEvent("text_delta", (
+                        f"\n[Harness] {self.provider.display_name} returned an empty stream — "
+                        f"retrying once in 2s.\n"
+                    ))
+                    deadline = time.time() + 2.0
+                    while time.time() < deadline:
+                        if self._stop_requested.is_set():
+                            break
+                        time.sleep(min(0.25, max(0.0, deadline - time.time())))
+                    if self._stop_requested.is_set():
+                        break
+                    continue
                 stream_attempt += 1
                 delay = provider_base_delay * (2 ** (stream_attempt - 1))
                 yield AgentEvent("provider_retry", {
@@ -953,10 +1120,29 @@ class HarnessAgent:
             self.session.messages.append(assistant_msg)
             self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, assistant_msg)
 
-            # If no tools called, agent has finished speaking for this turn
+            # If no tools called, the agent has finished speaking for this turn —
+            # except in SUPER mode: intermediate narration without tool calls (and
+            # without an explicit `finish`) must not abandon the autonomous goal.
+            # Challenge it once; a second consecutive text-only reply ends the turn.
             if not tool_calls_accumulator:
+                if self.mode == Mode.SUPER and super_text_only_streak < MAX_SUPER_TEXT_NUDGES:
+                    super_text_only_streak += 1
+                    self.session.messages.append({
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM]: SUPER MODE is still active and the goal is NOT confirmed complete. "
+                            "Intermediate narration is not a final answer. Continue the mission now: call the "
+                            "tools needed for the next step. Only stop when the goal is truly accomplished — "
+                            "by calling `finish` with your final summary."
+                        ),
+                    })
+                    yield AgentEvent("step_end", {"step": current_loop, "complete": False})
+                    continue
                 yield AgentEvent("step_end", {"step": current_loop, "complete": True})
                 break
+
+            # Tools were requested this step — real progress. Reset both streaks.
+            super_text_only_streak = 0
 
             # Execute tool calls
             stop_requested = False
@@ -1000,6 +1186,11 @@ class HarnessAgent:
 
                 result = self.tool_registry.execute(tool_name, args, self.mode)
                 tools_executed_this_turn += 1
+                # Exploration watchdog: count consecutive read-only calls.
+                if self._is_exploration_call(tool_name, args):
+                    exploration_streak += 1
+                else:
+                    exploration_streak = 0
 
                 # ── Tool image routing ────────────────────────────────
                 # Tools such as browser_screenshot embed
@@ -1087,6 +1278,24 @@ class HarnessAgent:
                 yield AgentEvent("text_delta", "\n[Harness] Turn interrupted by user.\n")
                 yield AgentEvent("step_end", {"step": current_loop, "complete": True})
                 break
+
+            # Exploration watchdog: a long streak of consecutive read-only calls
+            # means the model is spiraling in re-orientation instead of working.
+            # Force it back to concrete action with a system nudge (fires once
+            # per streak; the streak resets on any real work).
+            if exploration_streak >= MAX_EXPLORATION_STREAK:
+                exploration_streak = 0
+                self.session.messages.append({
+                    "role": "user",
+                    "content": (
+                        f"[SYSTEM]: You have executed {MAX_EXPLORATION_STREAK} consecutive read-only "
+                        "exploration calls in a row without producing any changes. You have enough "
+                        "context — STOP re-exploring and take concrete action toward the goal RIGHT NOW: "
+                        "write the code/files you already planned, run the builds/tests, or — if the "
+                        "goal is truly complete — call `finish` with your final summary."
+                    ),
+                })
+                yield AgentEvent("text_delta", "\n[Harness] Exploration loop detected — nudging the agent back to concrete action.\n")
 
             # Save session state
             self._sync_todos_to_session()

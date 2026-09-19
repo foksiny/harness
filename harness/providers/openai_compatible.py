@@ -12,7 +12,6 @@ from harness.providers.base import (
     ToolCallDelta,
     StreamHTTPError,
     is_transient_transport_error,
-    sse_post_stream,
 )
 from harness.core.attachments import data_url_for_block
 
@@ -265,7 +264,12 @@ class OpenAICompatibleProvider(BaseProvider):
         # Total attempts = 1 initial + max_retries backoff retries + 1 extra for thinking strip if needed
         # We use a manual loop with attempt counter for backoff
         attempt = 0
+        abort_gen = getattr(self, "_abort_gen", 0)
         while True:
+            # Abandoned by a user stop (abort_active_streams bumped the
+            # generation): never open a NEW connection for a zombie pump.
+            if getattr(self, "_abort_gen", 0) != abort_gen:
+                return
             # Reset per attempt: whether any usable SSE content was yielded yet.
             # Referenced by the exception handlers below — a request that dies
             # before the first payload is transient-retryable; mid-stream deaths
@@ -274,8 +278,9 @@ class OpenAICompatibleProvider(BaseProvider):
             try:
                 # httpx streams each SSE line the moment its bytes arrive
                 # (no stdlib buffering delay) with a generous read timeout so
-                # long reasoning stalls don't surface as read timeouts.
-                with sse_post_stream(endpoint, headers, body, self.stream_timeout) as stream:
+                # long reasoning stalls don't surface as read timeouts. The
+                # tracked variant registers the stream for /stop aborts.
+                with self._tracked_sse_stream(endpoint, headers, body) as stream:
                     buffer = ""
                     body_lines = []
                     sse_error_msg: Optional[str] = None

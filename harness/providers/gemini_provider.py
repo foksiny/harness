@@ -11,7 +11,6 @@ from harness.providers.base import (
     ToolCallDelta,
     StreamHTTPError,
     is_transient_transport_error,
-    sse_post_stream,
 )
 from harness.core.attachments import b64_payload_for_block
 
@@ -143,13 +142,18 @@ class GeminiProvider(BaseProvider):
         if tools:
             body["tools"] = [{"functionDeclarations": tools}]
 
+        abort_gen = getattr(self, "_abort_gen", 0)
         for attempt in range(self.max_retries + 1):
+            # Abandoned by a user stop (abort_active_streams bumped the
+            # generation): never open a NEW connection for a zombie pump.
+            if getattr(self, "_abort_gen", 0) != abort_gen:
+                return
             saw_payload = False
             try:
                 # httpx streams each SSE line the moment its bytes arrive
                 # with a generous read timeout so long thinking stalls
                 # don't surface as read timeouts.
-                with sse_post_stream(endpoint, headers, body, self.stream_timeout) as stream:
+                with self._tracked_sse_stream(endpoint, headers, body) as stream:
                     buffer = ""
                     for line in stream:
                         buffer += line + "\n"

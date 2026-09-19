@@ -104,8 +104,9 @@ When a delegation finishes, the report you receive already includes each agent's
   - **Global skill promotion**: When the agent finds a lesson broadly useful across projects (coding patterns, debugging techniques, tool tricks), it promotes it as a **global skill** (`~/.harness/skills/`) so it's available everywhere. Workspace-specific lessons stay scoped to `.harness/skills/`.
 - 🔌 **Model Context Protocol (MCP) Client**:
   - Supports `stdio` and `sse` JSON-RPC 2.0 servers configured in `mcp.json`.
-- 🎨 **14 Handcrafted Visual Themes**:
-  - `cyberpunk` (default neon), `dracula`, `nord`, `monokai`, `catppuccin`, `matrix`, `minimal`, `amber_crt`, `gruvbox`, `one_dark`, `rose_pine`, `solarized_dark`, `synthwave`, `tokyo_night`.
+- 🎨 **14 Handcrafted Visual Themes + Custom Theme Creation**:
+  - Built-ins: `cyberpunk` (default neon), `dracula`, `nord`, `monokai`, `catppuccin`, `matrix`, `minimal`, `amber_crt`, `gruvbox`, `one_dark`, `rose_pine`, `solarized_dark`, `synthwave`, `tokyo_night`.
+  - **Custom themes**: ask the agent to *"create a custom theme"* (it has the `theme_creator` skill), use `/theme create` for the interactive wizard, or write `~/.harness/themes.json` (global) / `.harness/themes.json` (workspace) directly. Each theme defines 10 semantic colors (primary, secondary, accent, success, warning, error, muted, text, border, thinking) plus a Pygments `code_theme`. Built-in names are protected; custom themes persist across sessions and are marked `(custom)` in `/theme list`. Delete with `/theme delete <name>`.
 - 🧠 **Proactive Context-Budget Management**:
   - Beyond reactive compaction, Harness now guards the window **proactively** so it is much harder for the agent to fill its own context log:
     - **Per-tool output caps** clamp runaway results at the source (`view_file` ~8k chars, `run_command` ~16k, `grep_search` ~8k, `execute_python` ~16k, …) with a transparent truncation marker. The agent can still request the full payload by passing an explicit `max_chars`.
@@ -170,7 +171,7 @@ cat logs/error.log | harness "Diagnose this stack trace"
 | `/keys [list\|set\|remove]` | Manage, mask, and test provider API keys |
 | `/setup` | Launch interactive onboarding setup wizard |
 | `/effort <level>` | Set thinking effort (`off`, `low`, `medium`, `high`, or tokens) |
-| `/theme <name>` | Change visual theme (`cyberpunk`, `dracula`, `nord`, etc.) |
+| `/theme` | Theme gallery, preview, switching, and custom creation: `/theme`, `/theme list`, `/theme <name>`, `/theme preview <name>`, `/theme create`, `/theme delete <name>` |
 | `/todo [list\|add\|clear]` | Manage active task items |
 | `/skills [reload]` | List or reload registered skills |
 | `/learn [list\|record\|forget\|promote\|on\|off]` | Manage persistent learned memories; promote proven lessons into skills |
@@ -186,7 +187,7 @@ cat logs/error.log | harness "Diagnose this stack trace"
 
 ---
 
-## 🛠️ Built-in Skills (11 Total)
+## 🛠️ Built-in Skills (13 Total)
 
 1. **`skill_creator`**: Autonomous skill generator — writes and registers new skills on user request.
 2. **`mcp_integrator`**: Autonomous MCP configurator — connects and verifies external MCP servers.
@@ -199,10 +200,12 @@ cat logs/error.log | harness "Diagnose this stack trace"
 9. **`performance_profiler`**: Latency, memory leak diagnosis, and caching strategies.
 10. **`documentation_writer`**: Architecture RFCs, user guides, and API references.
 11. **`motion_graphics`**: Professional motion graphics creation — animation principles, timing/easing, kinetic typography, composition, Remotion/GSAP/Lottie/Manim pipelines, and rigorous anti-slop QA.
+12. **`browser_automation`**: Chrome DevTools Protocol browser control — launching, navigation, clicking, screenshots, and console-driven web testing workflows.
+13. **`theme_creator`**: Custom visual theme creation — guides the agent through defining a 10-color palette + syntax theme, saving it to global/workspace scope, previewing, and switching.
 
 > Note: the catalog also auto-discovers **workspace** (`~/.harness/skills/`, `.harness/skills/`)
-> and **promoted global** skills on top of these 11 built-ins — on this machine it currently
-> resolves to **16 total** skills (see `/skills`).
+> and **promoted global** skills on top of these 13 built-ins — on this machine it currently
+> resolves to **17 total** skills (see `/skills`).
 
 ---
 

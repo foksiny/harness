@@ -6,6 +6,7 @@ and parameter normalization for reasoning/thinking effort.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Iterator
+import threading
 from harness.providers.detector import inspect_model, ModelSpec
 
 @dataclass
@@ -34,11 +35,24 @@ _FATAL_PROVIDER_ERROR_MARKERS = (
     "quota", "billing", "deactivated", "input image", "moderation",
 )
 
+# The endpoint returned HTTP 200 but the SSE stream carried zero usable data.
+# Usually an upstream/LB silently dropping the request. Retrying once is
+# reasonable; hammering it with exponential backoff just burns the user's time.
+_EMPTY_STREAM_ERROR_MARKERS = (
+    "stream ended without a response",
+)
+
 
 def is_fatal_provider_error(error_text: str) -> bool:
     """True when a provider error is permanent — retrying is pointless."""
     low = (error_text or "").lower()
     return any(m in low for m in _FATAL_PROVIDER_ERROR_MARKERS)
+
+
+def is_empty_stream_error(error_text: str) -> bool:
+    """True when the endpoint returned an empty 200 stream (no SSE payload)."""
+    low = (error_text or "").lower()
+    return any(m in low for m in _EMPTY_STREAM_ERROR_MARKERS)
 
 class BaseProvider(ABC):
     """Abstract interface for all LLM providers."""
@@ -56,6 +70,55 @@ class BaseProvider(ABC):
         # receiving any bytes mid-stream. Generous by default so long
         # reasoning stalls don't surface as "read operation timed out".
         self.stream_timeout = resolve_stream_timeout(stream_timeout)
+        # In-flight SSE streams of THIS provider instance, so a stop request
+        # from another thread can hard-abort a stalled HTTP read immediately
+        # instead of waiting out the (potentially 300s) read timeout.
+        self._active_sse_lock = threading.Lock()
+        self._active_sse: list = []
+        # Bumped every time abort_active_streams() runs. Each stream call
+        # captures the value at start; retry loops bail out the moment it
+        # changes, so an abandoned (stopped) stream never opens a NEW
+        # connection in a zombie pump thread.
+        self._abort_gen = 0
+
+    def _tracked_sse_stream(self, endpoint: str, headers: Optional[Dict[str, str]], body: Dict[str, Any]):
+        """Context manager wrapping sse_post_stream with abort registration.
+
+        While the stream is open it is registered with this provider instance;
+        ``abort_active_streams()`` (called by the agent on /stop) can then tear
+        the socket down from another thread and unblock the reader.
+        """
+        return _TrackedSsePostStream(self, endpoint, headers, body, self.stream_timeout)
+
+    def _register_sse(self, sse: "SsePostStream") -> None:
+        with self._active_sse_lock:
+            self._active_sse.append(sse)
+
+    def _unregister_sse(self, sse: "SsePostStream") -> None:
+        with self._active_sse_lock:
+            try:
+                self._active_sse.remove(sse)
+            except ValueError:
+                pass
+
+    def abort_active_streams(self) -> None:
+        """Hard-abort every in-flight SSE stream of this provider (thread-safe).
+
+        Best-effort: used to unblock stalled reads immediately when the user
+        requests a stop. Failures are swallowed — the reader thread's own
+        timeout is the safety net. Also bumps the abort generation so any
+        zombie retry loop from the abandoned call gives up instead of
+        opening a fresh connection.
+        """
+        self._abort_gen += 1
+        with self._active_sse_lock:
+            streams = list(self._active_sse)
+            self._active_sse.clear()
+        for s in streams:
+            try:
+                s.abort()
+            except Exception:
+                pass
 
     def _is_retryable_http_code(self, code: int) -> bool:
         # Retry on rate limit and transient server errors
@@ -275,6 +338,62 @@ class SsePostStream:
         for line in self._resp.iter_lines():
             yield line
 
+    def abort(self) -> None:
+        """Hard-abort the in-flight HTTP stream (thread-safe, best-effort).
+
+        Called from OTHER threads (e.g. the agent loop when the user hits /stop)
+        to unblock a reader stuck in ``iter_lines`` waiting on a stalled socket.
+
+        Plain ``client.close()`` is NOT enough: the connection is checked out
+        to the response, and closing the pool does not interrupt a concurrent
+        blocked read. So this walks the httpx object graph (defensively — these
+        are httpcore internals) for the raw socket and shuts it down, which
+        makes the blocked ``recv()`` raise immediately instead of lingering
+        for the (potentially 300s) read timeout.
+        """
+        resp = self._resp
+        # 1. HARD: find and tear down every raw socket in the response graph.
+        #    Must run BEFORE any graceful close — resp.close() rewrites the
+        #    stream chain and the socket becomes unreachable for the walk.
+        try:
+            import socket as _socket
+            seen = set()
+            def _find_socks(obj, depth):
+                if depth > 8 or id(obj) in seen:
+                    return
+                seen.add(id(obj))
+                d = getattr(obj, "__dict__", None)
+                if not isinstance(d, dict):
+                    return
+                for val in d.values():
+                    if isinstance(val, _socket.socket):
+                        try:
+                            val.shutdown(_socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                        try:
+                            val.close()
+                        except OSError:
+                            pass
+                    elif hasattr(val, "__dict__"):
+                        _find_socks(val, depth + 1)
+            _find_socks(resp, 0)
+        except Exception:
+            pass
+        # 2. Graceful: close the response (releases the connection).
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        # 3. Pool cleanup so the client doesn't linger either.
+        client = self._client
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
     def __exit__(self, exc_type, exc, tb) -> bool:
         try:
             if self._context is not None:
@@ -297,6 +416,31 @@ def sse_post_stream(
 ) -> SsePostStream:
     """Convenience constructor for ``with sse_post_stream(...) as stream:``."""
     return SsePostStream(endpoint, headers, body, stream_timeout)
+
+
+class _TrackedSsePostStream:
+    """``sse_post_stream`` wrapper that registers itself with a provider.
+
+    Enters the inner ``SsePostStream`` and registers it on the provider so
+    ``abort_active_streams()`` can tear the socket down mid-read from another
+    thread (user stop / Ctrl-C). Unregisters on exit so aborted, dead streams
+    don't linger in the registry.
+    """
+
+    def __init__(self, provider: "BaseProvider", endpoint: str,
+                 headers: Optional[Dict[str, str]], body: Dict[str, Any],
+                 stream_timeout: Optional[float]):
+        self._provider = provider
+        self._inner = SsePostStream(endpoint, headers, body, stream_timeout)
+
+    def __enter__(self) -> "SsePostStream":
+        stream = self._inner.__enter__()
+        self._provider._register_sse(self._inner)
+        return stream
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self._provider._unregister_sse(self._inner)
+        return self._inner.__exit__(exc_type, exc, tb)
 
 
 def is_transient_transport_error(ex: Exception) -> bool:

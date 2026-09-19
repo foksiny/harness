@@ -7,11 +7,13 @@ import os
 import json
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.syntax import Syntax
+from rich.console import Console
+from rich.prompt import Prompt, Confirm
 
 @dataclass
 class Theme:
@@ -244,6 +246,10 @@ THEMES: Dict[str, Theme] = {
 
 DEFAULT_THEME = "cyberpunk"
 
+# Snapshot of built-in theme names — captured BEFORE custom themes are loaded,
+# so custom themes can never collide with or shadow a built-in name.
+BUILTIN_THEME_NAMES = frozenset(THEMES.keys())
+
 def load_custom_themes():
     """Load user-defined custom themes from ~/.harness/themes.json or .harness/themes.json."""
     candidates = [
@@ -275,6 +281,212 @@ def load_custom_themes():
                             THEMES[k.lower()] = theme_obj
             except Exception:
                 pass
+
+
+def get_custom_themes_path(global_scope: bool = True) -> Path:
+    """Get the path for custom themes file."""
+    if global_scope:
+        return Path.home() / ".harness" / "themes.json"
+    return Path(".harness") / "themes.json"
+
+
+def normalize_theme_name(name: str) -> str:
+    """Normalize a theme key: lowercase, underscores only, alphanumeric.
+    'Ocean Deep!' -> 'ocean_deep'   """
+    cleaned = (name or "").lower().strip()
+    cleaned = cleaned.replace(" ", "_").replace("-", "_")
+    cleaned = "".join(c for c in cleaned if c.isalnum() or c == "_")
+    return cleaned
+
+
+def validate_theme_dict(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Validate a theme dictionary. Returns (is_valid, list_of_errors)."""
+    required_fields = [
+        "primary", "secondary", "accent", "success", "warning",
+        "error", "muted", "text", "border", "thinking", "code_theme"
+    ]
+    errors = []
+    for field in required_fields:
+        if field not in data:
+            errors.append(f"Missing required field: {field}")
+    # Validate color format (basic check)
+    color_fields = ["primary", "secondary", "accent", "success", "warning",
+                    "error", "muted", "text", "border", "thinking"]
+    for field in color_fields:
+        if field in data:
+            val = data[field]
+            if not isinstance(val, str):
+                errors.append(f"Field '{field}' must be a string")
+            elif not (val.startswith("#") or val in ["bold white", "white", "bright_cyan", "bright_green",
+                                                      "bright_yellow", "bright_red", "dim white", "dim cyan"]):
+                # Allow named colors and hex colors
+                if len(val) not in (4, 7, 9) or not all(c in "0123456789abcdefABCDEF" for c in val[1:]):
+                    pass  # Rich accepts many formats, we'll be permissive
+    return len(errors) == 0, errors
+
+
+def create_custom_theme(
+    name: str,
+    display_name: str,
+    colors: Dict[str, str],
+    code_theme: str = "monokai",
+    global_scope: bool = True
+) -> Tuple[bool, str]:
+    """
+    Create and save a custom theme.
+    Returns (success, message).
+    """
+    # Normalize name
+    clean_name = normalize_theme_name(name)
+    if not clean_name:
+        return False, "Theme name is required (must contain letters or numbers)."
+    
+    # Never allow shadowing a built-in theme
+    if clean_name in BUILTIN_THEME_NAMES:
+        return False, f"Theme name '{clean_name}' conflicts with a built-in theme. Choose a different name."
+    
+    # Build theme data
+    theme_data = {
+        "primary": colors.get("primary", "#00ffff"),
+        "secondary": colors.get("secondary", "#ff007f"),
+        "accent": colors.get("accent", "#ffff00"),
+        "success": colors.get("success", "#00ff66"),
+        "warning": colors.get("warning", "#ffaa00"),
+        "error": colors.get("error", "#ff3366"),
+        "muted": colors.get("muted", "#6c7086"),
+        "text": colors.get("text", "#ffffff"),
+        "border": colors.get("border", "#00ffff"),
+        "thinking": colors.get("thinking", "#bd93f9"),
+        "code_theme": code_theme,
+        "display_name": display_name,
+    }
+    
+    # Validate
+    valid, errors = validate_theme_dict(theme_data)
+    if not valid:
+        return False, "; ".join(errors)
+    
+    # Create Theme object
+    theme_obj = Theme(
+        name=clean_name,
+        display_name=display_name,
+        primary=theme_data["primary"],
+        secondary=theme_data["secondary"],
+        accent=theme_data["accent"],
+        success=theme_data["success"],
+        warning=theme_data["warning"],
+        error=theme_data["error"],
+        muted=theme_data["muted"],
+        text=theme_data["text"],
+        border=theme_data["border"],
+        thinking=theme_data["thinking"],
+        code_theme=theme_data["code_theme"],
+    )
+    
+    # Add to THEMES dictionary
+    THEMES[clean_name] = theme_obj
+    
+    # Save to file
+    themes_path = get_custom_themes_path(global_scope)
+    themes_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Load existing custom themes
+    existing_data = {}
+    if themes_path.exists():
+        try:
+            with open(themes_path, "r", encoding="utf-8") as f:
+                existing_data = json.load(f)
+        except Exception:
+            existing_data = {}
+    
+    # Add new theme
+    existing_data[clean_name] = theme_data
+    
+    # Write back
+    try:
+        with open(themes_path, "w", encoding="utf-8") as f:
+            json.dump(existing_data, f, indent=2)
+    except Exception as e:
+        return False, f"Failed to save theme: {e}"
+    
+    scope_str = "global" if global_scope else "workspace"
+    return True, f"Custom theme '{display_name}' (`{clean_name}`) created and saved to {scope_str} scope."
+
+
+def delete_custom_theme(name: str, global_scope: bool = True) -> Tuple[bool, str]:
+    """Delete a custom theme. Searches both scopes (requested scope first).
+    Only removes the theme from the in-memory registry after the file is updated."""
+    clean_name = normalize_theme_name(name)
+    if not clean_name:
+        return False, "Theme name is required."
+    
+    # Never delete built-in themes
+    if clean_name in BUILTIN_THEME_NAMES:
+        return False, f"Cannot delete built-in theme '{clean_name}'."
+    
+    # Try the requested scope first, then the other
+    candidates = [get_custom_themes_path(global_scope), get_custom_themes_path(not global_scope)]
+    
+    for themes_path in candidates:
+        if not themes_path.exists():
+            continue
+        try:
+            with open(themes_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            return False, f"Failed to delete theme: {e}"
+        if clean_name in data:
+            del data[clean_name]
+            try:
+                with open(themes_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            except Exception as e:
+                return False, f"Failed to delete theme: {e}"
+            # Only remove from the registry after the file is updated
+            THEMES.pop(clean_name, None)
+            return True, f"Custom theme '{clean_name}' deleted."
+    
+    return False, f"Custom theme '{clean_name}' not found in global or workspace themes."
+
+
+def interactive_create_theme(global_scope: bool = True) -> Tuple[bool, str]:
+    """Interactive wizard to create a custom theme."""
+    console = Console()
+    console.print("[bold cyan]🎨 Custom Theme Creator[/bold cyan]")
+    console.print("Create your own color palette for Harness.")
+    console.print()
+    
+    # Get name
+    name = Prompt.ask("[cyan]Theme name[/cyan] (lowercase, underscores)")
+    if not name:
+        return False, "Theme name is required."
+    
+    display_name = Prompt.ask("[cyan]Display name[/cyan]", default=name.title())
+    
+    console.print("\n[dim]Enter colors as hex codes (e.g., #ff007f) or Rich color names (e.g., bright_cyan)[/dim]")
+    console.print("[dim]Press Enter to use defaults[/dim]\n")
+    
+    defaults = {
+        "primary": "#00ffff",
+        "secondary": "#ff007f",
+        "accent": "#ffff00",
+        "success": "#00ff66",
+        "warning": "#ffaa00",
+        "error": "#ff3366",
+        "muted": "#6c7086",
+        "text": "#ffffff",
+        "border": "#00ffff",
+        "thinking": "#bd93f9",
+    }
+    
+    colors = {}
+    for field_name, default in defaults.items():
+        val = Prompt.ask(f"  [cyan]{field_name}[/cyan]", default=default)
+        colors[field_name] = val
+    
+    code_theme = Prompt.ask("[cyan]Code syntax theme[/cyan] (pygments theme)", default="monokai")
+    
+    return create_custom_theme(name, display_name, colors, code_theme, global_scope)
 
 # Load custom themes immediately on module import
 load_custom_themes()
