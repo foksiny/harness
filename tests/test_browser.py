@@ -66,13 +66,16 @@ def _make_mock_controller(png_path=None):
 
 class TestDefaultRegistration(unittest.TestCase):
 
-    def test_default_registry_has_12_browser_tools(self):
+    def test_default_registry_has_15_browser_tools(self):
         r = ToolRegistry()
         browser = sorted(t.name for t in r.list_tools() if t.name.startswith("browser"))
-        self.assertEqual(len(browser), 12)
+        self.assertEqual(len(browser), 15)
         self.assertIn("browser_launch", browser)
         self.assertIn("browser_screenshot", browser)
         self.assertIn("browser_close", browser)
+        self.assertIn("browser_console", browser)
+        self.assertIn("browser_network", browser)
+        self.assertIn("browser_wait", browser)
 
     def test_browser_manager_shared(self):
         r = ToolRegistry()
@@ -87,7 +90,7 @@ class TestDefaultRegistration(unittest.TestCase):
         self.assertIsNone(r.browser_manager)
 
     def test_all_tool_classes_exist(self):
-        self.assertEqual(len(ALL_BROWSER_TOOLS), 12)
+        self.assertEqual(len(ALL_BROWSER_TOOLS), 15)
 
     def test_action_types_and_read_only_declared(self):
         for tool_cls in ALL_BROWSER_TOOLS:
@@ -95,10 +98,12 @@ class TestDefaultRegistration(unittest.TestCase):
             self.assertIn(tool.action_type, ("browser", "browser_read"), tool.name)
         read_only = {t.name for t in ALL_BROWSER_TOOLS
                      if t(controller_factory=lambda **kw: None).is_read_only}
-        self.assertEqual(read_only, {"browser_screenshot", "browser_get_page_info"})
+        self.assertEqual(read_only, {"browser_screenshot", "browser_get_page_info",
+                                     "browser_console", "browser_network", "browser_wait"})
         readers = {t.name for t in ALL_BROWSER_TOOLS
                    if t(controller_factory=lambda **kw: None).action_type == "browser_read"}
-        self.assertEqual(readers, {"browser_screenshot", "browser_get_page_info"})
+        self.assertEqual(readers, {"browser_screenshot", "browser_get_page_info",
+                                   "browser_console", "browser_network", "browser_wait"})
 
 
 class TestBrowserToolsHermetic(unittest.TestCase):

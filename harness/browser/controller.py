@@ -23,6 +23,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional, Any, List, Dict
 from urllib.parse import urlparse
@@ -40,6 +41,12 @@ from harness.browser.overlay import (
 from harness.browser.stealth import STEALTH_JS, STEALTH_LAUNCH_FLAGS
 
 DEFAULT_CDP_PORT = 9222
+
+# Ring-buffer caps for CDP-side event capture (console / network). Bounded so
+# a chatty page can never blow up the agent's context window; tool output is
+# additionally truncated at render time.
+MAX_EVENT_LOG = 300
+MAX_EVENT_TEXT = 2000
 
 CHROME_PATHS = [
     "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
@@ -91,6 +98,15 @@ class BrowserController:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_owner: Optional[int] = None
         self._profile_dir: Optional[str] = None
+        # CDP-side event history: console messages, page exceptions, CDP log
+        # entries and network failures, buffered as they arrive. Survives
+        # navigation/reload (unlike in-page JS listeners), so browser_console
+        # can show errors from the initial page load after the fact.
+        self._event_log: deque = deque(maxlen=MAX_EVENT_LOG)
+        # Late command replies that arrived while no _send was waiting for
+        # them (e.g. after a drain). Keyed by CDP message id; _send checks
+        # here first so a drained reply is never lost.
+        self._stray_responses: Dict[int, dict] = {}
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -180,6 +196,7 @@ class BrowserController:
         self._connected = True
         self._run(self._send("Page.enable", {}))
         self._run(self._send("Runtime.enable", {}))
+        self._enable_event_domains()
         self._apply_stealth()
         self._inject_overlay()
         self._show_overlay("ready")
@@ -250,6 +267,12 @@ class BrowserController:
             raise RuntimeError("Not connected to browser")
         self._cmd_id += 1
         msg_id = self._cmd_id
+        # A previous drain may already have received our reply.
+        if msg_id in self._stray_responses:
+            data = self._stray_responses.pop(msg_id)
+            if "error" in data:
+                raise RuntimeError(f"CDP error: {data['error']}")
+            return data.get("result", {})
         await self._ws.send(json.dumps({"id": msg_id, "method": method, "params": params}))
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -260,13 +283,166 @@ class BrowserController:
                     if "error" in data:
                         raise RuntimeError(f"CDP error: {data['error']}")
                     return data.get("result", {})
-                # Unrelated frames (page events like Page.loadEventFired)
-                # carry no id — skip them and keep waiting for our reply.
+                if isinstance(data.get("id"), int):
+                    # Reply to some other (timed-out or drained) command —
+                    # stash it instead of dropping it.
+                    self._stray_responses[data["id"]] = data
+                    continue
+                # Page events (console, exceptions, network, lifecycle) carry
+                # no id — buffer them for browser_console / browser_network
+                # instead of dropping them on the floor.
+                self._record_event(data)
             except asyncio.TimeoutError:
                 continue
             except websockets.exceptions.ConnectionClosed:
                 raise RuntimeError("Browser disconnected")
         raise TimeoutError(f"CDP command {method} timed out")
+
+    async def _drain_pending(self, max_messages: int = 200) -> int:
+        """Non-blocking drain of queued CDP events into the ring buffer.
+
+        Events that arrive *between* commands (e.g. console errors during
+        page load) sit in the socket buffer until something reads. Called
+        before browser_console / browser_network return so they see the
+        latest page activity. Never raises.
+        """
+        if not self._ws:
+            return 0
+        count = 0
+        while count < max_messages:
+            try:
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=0.15)
+            except asyncio.TimeoutError:
+                break
+            except Exception:
+                break
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(data.get("id"), int):
+                self._stray_responses[data["id"]] = data
+                continue
+            if data.get("method"):
+                self._record_event(data)
+                count += 1
+        return count
+
+    def drain_events(self) -> int:
+        """Drain pending CDP events into the buffer. Returns events captured."""
+        if not self.is_connected():
+            return 0
+        try:
+            return self._run(self._drain_pending())
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _remote_text(obj: Any) -> str:
+        """Best-effort plain text for a CDP RemoteObject (console arg)."""
+        if not isinstance(obj, dict):
+            return str(obj)
+        if "value" in obj and obj["value"] is not None:
+            try:
+                v = obj["value"]
+                return v if isinstance(v, str) else json.dumps(v)[:500]
+            except Exception:
+                return str(obj.get("value", ""))[:500]
+        for key in ("description", "unserializableValue"):
+            if obj.get(key):
+                return str(obj[key])[:500]
+        return obj.get("type", "object")
+
+    @staticmethod
+    def _stamp() -> str:
+        return time.strftime("%H:%M:%S")
+
+    def _record_event(self, data: dict) -> None:
+        """Buffer one CDP event frame for browser_console / browser_network."""
+        try:
+            method = data.get("method", "")
+            params = data.get("params", {}) or {}
+            if method == "Runtime.consoleAPICalled":
+                args = params.get("args", []) or []
+                text = " ".join(self._remote_text(a) for a in args)[:MAX_EVENT_TEXT]
+                entry = {
+                    "kind": "console",
+                    "level": str(params.get("type", "log")),
+                    "text": text,
+                    "url": str((params.get("stackTrace", {}) or {}).get("callFrames", [{}])[0].get("url", "") or ""),
+                    "ts": self._stamp(),
+                }
+            elif method == "Runtime.exceptionThrown":
+                details = params.get("exceptionDetails", {}) or {}
+                exc = details.get("exception", {}) or {}
+                text = str(details.get("text", "") or "")
+                desc = self._remote_text(exc) if exc else ""
+                if desc and desc not in text:
+                    text = f"{text}: {desc}" if text else desc
+                entry = {
+                    "kind": "exception",
+                    "level": "error",
+                    "text": text[:MAX_EVENT_TEXT],
+                    "url": str(details.get("url", "") or ""),
+                    "ts": self._stamp(),
+                }
+            elif method == "Log.entryAdded":
+                e = params.get("entry", {}) or {}
+                entry = {
+                    "kind": "log",
+                    "level": str(e.get("level", "info")),
+                    "text": str(e.get("text", ""))[:MAX_EVENT_TEXT],
+                    "url": str(e.get("url", "") or ""),
+                    "ts": self._stamp(),
+                }
+            elif method == "Network.loadingFailed":
+                entry = {
+                    "kind": "network",
+                    "level": "error",
+                    "text": f"FAILED {params.get('errorText', 'unknown error')}",
+                    "url": "",
+                    "ts": self._stamp(),
+                }
+            elif method == "Network.responseReceived":
+                resp = params.get("response", {}) or {}
+                try:
+                    status = int(resp.get("status", 200))
+                except Exception:
+                    status = 200
+                if status < 400:
+                    return
+                entry = {
+                    "kind": "network",
+                    "level": "error",
+                    "text": f"HTTP {status} {resp.get('statusText', '')}".strip(),
+                    "url": str(resp.get("url", "") or ""),
+                    "ts": self._stamp(),
+                }
+            else:
+                return
+            self._event_log.append(entry)
+        except Exception:
+            pass
+
+    def get_console_entries(self, level: Optional[str] = None, limit: int = 50) -> List[dict]:
+        """Buffered console/exception/log entries, oldest first (up to limit)."""
+        self.drain_events()
+        items = [e for e in self._event_log if e.get("kind") in ("console", "exception", "log")]
+        if level and level != "all":
+            items = [e for e in items if e.get("level") == level]
+        return items[-max(1, limit):]
+
+    def get_network_entries(self, limit: int = 50) -> List[dict]:
+        """Buffered failed requests / bad-status responses, oldest first."""
+        self.drain_events()
+        items = [e for e in self._event_log if e.get("kind") == "network"]
+        return items[-max(1, limit):]
+
+    def clear_event_log(self) -> int:
+        """Drop all buffered events. Returns the number cleared."""
+        n = len(self._event_log)
+        self._event_log.clear()
+        return n
 
     async def _eval(self, expression: str, timeout: float = 10) -> Any:
         result = await self._send("Runtime.evaluate", {
@@ -326,6 +502,22 @@ class BrowserController:
             self._run(self._eval(OVERLAY_JS, timeout=5))
         except Exception:
             pass
+
+    def _enable_event_domains(self) -> None:
+        """Enable the CDP domains that feed the event ring buffer.
+
+        Runtime.consoleAPICalled / exceptionThrown, Log.entryAdded and
+        Network failures are buffered controller-side, so browser_console
+        and browser_network see page activity (including initial-load
+        errors) without any in-page listeners. Best-effort — never raises.
+        """
+        if not self._connected:
+            return
+        for method in ("Log.enable", "Network.enable"):
+            try:
+                self._run(self._send(method, {}, timeout=5))
+            except Exception:
+                pass
 
     def _apply_stealth(self):
         """Register the anti-bot + overlay document scripts for every NEW
@@ -770,6 +962,7 @@ class BrowserController:
                         self._target_id = tab_id
                         self._run(self._send("Page.enable", {}))
                         self._run(self._send("Runtime.enable", {}))
+                        self._enable_event_domains()
                         self._apply_stealth()
                         self._inject_overlay()
                         self._hide_overlay(1500)
@@ -847,6 +1040,24 @@ class BrowserController:
                 }}
             }});
             obs.observe(document.body || document, {{childList: true, subtree: true}});
+            setTimeout(function() {{ obs.disconnect(); resolve(false); }}, {timeout_ms});
+        }})"""
+        return bool(self._run(self._eval(js, timeout=timeout_ms / 1000 + 2)))
+
+    def wait_for_text(self, text: str, timeout_ms: int = 10000) -> bool:
+        """Wait until the page's visible text contains ``text`` (or timeout)."""
+        self._require_connected()
+        js = f"""new Promise(function(resolve) {{
+            var needle = {json.dumps(text)};
+            function check() {{
+                var body = document.body ? document.body.innerText : '';
+                return body.indexOf(needle) !== -1;
+            }}
+            if (check()) {{ resolve(true); return; }}
+            var obs = new MutationObserver(function() {{
+                if (check()) {{ obs.disconnect(); resolve(true); }}
+            }});
+            obs.observe(document.body || document, {{childList: true, subtree: true, characterData: true}});
             setTimeout(function() {{ obs.disconnect(); resolve(false); }}, {timeout_ms});
         }})"""
         return bool(self._run(self._eval(js, timeout=timeout_ms / 1000 + 2)))

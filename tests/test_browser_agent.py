@@ -21,6 +21,13 @@ from harness.providers.anthropic_provider import AnthropicProvider
 from harness.providers.gemini_provider import GeminiProvider
 from harness.providers.openai_compatible import OpenAICompatibleProvider
 from harness.tools.browser import BrowserScreenshotTool
+from harness.tools.browser import (
+    ALL_BROWSER_TOOLS,
+    BrowserConsoleTool,
+    BrowserNetworkTool,
+    BrowserWaitTool,
+)
+from harness.browser.controller import BrowserController
 
 
 TINY_PNG_B64 = (
@@ -294,6 +301,189 @@ class TestMultimodalToolResultPayloads(unittest.TestCase):
             {"role": "tool", "tool_call_id": "1", "name": "t", "content": "plain"},
         ])
         self.assertEqual(contents[-1]["parts"][0]["functionResponse"]["response"]["output"], "plain")
+
+
+class TestCdpEventBuffer(unittest.TestCase):
+    """CDP event recording is pure formatting — no browser needed."""
+
+    def _ctrl(self):
+        return BrowserController(port=19222)
+
+    def test_console_api_called_with_values(self):
+        c = self._ctrl()
+        c._record_event({"method": "Runtime.consoleAPICalled", "params": {
+            "type": "error",
+            "args": [{"type": "string", "value": "boom"},
+                     {"type": "number", "value": 42}],
+        }})
+        entries = c.get_console_entries()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["kind"], "console")
+        self.assertEqual(entries[0]["level"], "error")
+        self.assertIn("boom", entries[0]["text"])
+        self.assertIn("42", entries[0]["text"])
+
+    def test_console_object_arg_uses_description(self):
+        c = self._ctrl()
+        c._record_event({"method": "Runtime.consoleAPICalled", "params": {
+            "type": "log",
+            "args": [{"type": "object", "subtype": "error",
+                      "description": "TypeError: x is not a function"}],
+        }})
+        self.assertIn("TypeError", c.get_console_entries()[0]["text"])
+
+    def test_exception_thrown_recorded_as_error(self):
+        c = self._ctrl()
+        c._record_event({"method": "Runtime.exceptionThrown", "params": {
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "url": "http://localhost:3000/src/main.js",
+                "exception": {"type": "object", "description": "Error: mount failed"},
+            },
+        }})
+        entries = c.get_console_entries()
+        self.assertEqual(entries[0]["kind"], "exception")
+        self.assertEqual(entries[0]["level"], "error")
+        self.assertIn("mount failed", entries[0]["text"])
+
+    def test_log_entry_recorded(self):
+        c = self._ctrl()
+        c._record_event({"method": "Log.entryAdded", "params": {
+            "entry": {"level": "warning", "text": "Slow network", "url": "http://x/"},
+        }})
+        self.assertEqual(c.get_console_entries()[0]["kind"], "log")
+
+    def test_level_filter(self):
+        c = self._ctrl()
+        c._record_event({"method": "Log.entryAdded", "params": {
+            "entry": {"level": "info", "text": "hi"}}})
+        c._record_event({"method": "Log.entryAdded", "params": {
+            "entry": {"level": "error", "text": "bad"}}})
+        self.assertEqual(len(c.get_console_entries(level="error")), 1)
+        self.assertEqual(len(c.get_console_entries()), 2)
+
+    def test_network_failures_and_bad_status(self):
+        c = self._ctrl()
+        c._record_event({"method": "Network.loadingFailed",
+                         "params": {"errorText": "net::ERR_CONNECTION_REFUSED"}})
+        c._record_event({"method": "Network.responseReceived", "params": {
+            "response": {"status": 404, "statusText": "Not Found",
+                         "url": "http://x/missing.js"}}})
+        c._record_event({"method": "Network.responseReceived", "params": {
+            "response": {"status": 200, "url": "http://x/ok.js"}}})
+        nets = c.get_network_entries()
+        self.assertEqual(len(nets), 2)  # the 200 is ignored
+        self.assertIn("ERR_CONNECTION_REFUSED", nets[0]["text"])
+        self.assertIn("404", nets[1]["text"])
+        # Network entries never leak into the console view.
+        self.assertEqual(c.get_console_entries(), [])
+
+    def test_unknown_method_ignored(self):
+        c = self._ctrl()
+        c._record_event({"method": "Page.loadEventFired", "params": {}})
+        self.assertEqual(c.get_console_entries(), [])
+        self.assertEqual(c.get_network_entries(), [])
+
+    def test_ring_buffer_bounded(self):
+        c = self._ctrl()
+        for i in range(320):
+            c._record_event({"method": "Log.entryAdded", "params": {
+                "entry": {"level": "info", "text": f"m{i}"}}})
+        self.assertEqual(len(c._event_log), 300)
+        self.assertEqual(c.clear_event_log(), 300)
+        self.assertEqual(c.get_console_entries(), [])
+
+
+class TestBrowserDebugTools(unittest.TestCase):
+    """browser_console / browser_network / browser_wait via mock controllers."""
+
+    def _entries(self):
+        return [
+            {"kind": "console", "level": "error", "ts": "10:00:01",
+             "text": "TypeError: x is not a function", "url": "http://x/app.js"},
+            {"kind": "exception", "level": "error", "ts": "10:00:02",
+             "text": "Uncaught: mount failed", "url": ""},
+        ]
+
+    def test_console_get_formats_entries(self):
+        ctrl = MagicMock()
+        ctrl.get_console_entries.return_value = self._entries()
+        tool = BrowserConsoleTool(controller_factory=lambda **kw: ctrl)
+        out = tool.execute(action="get")
+        self.assertIn("TypeError", out)
+        self.assertIn("mount failed", out)
+        self.assertIn("10:00:01", out)
+        self.assertIn("http://x/app.js", out)
+
+    def test_console_level_filter_forwarded(self):
+        ctrl = MagicMock()
+        ctrl.get_console_entries.return_value = []
+        tool = BrowserConsoleTool(controller_factory=lambda **kw: ctrl)
+        out = tool.execute(level="error", limit=10)
+        ctrl.get_console_entries.assert_called_once_with(level="error", limit=10)
+        self.assertIn("clean", out)
+
+    def test_console_all_maps_to_no_filter(self):
+        ctrl = MagicMock()
+        ctrl.get_console_entries.return_value = []
+        tool = BrowserConsoleTool(controller_factory=lambda **kw: ctrl)
+        tool.execute(level="all")
+        ctrl.get_console_entries.assert_called_once_with(level=None, limit=50)
+
+    def test_console_clear(self):
+        ctrl = MagicMock()
+        ctrl.clear_event_log.return_value = 7
+        tool = BrowserConsoleTool(controller_factory=lambda **kw: ctrl)
+        out = tool.execute(action="clear")
+        self.assertIn("7", out)
+        ctrl.clear_event_log.assert_called_once_with()
+
+    def test_console_requires_browser(self):
+        tool = BrowserConsoleTool(controller_factory=lambda **kw: None)
+        self.assertIn("browser_launch", tool.execute())
+
+    def test_network_get_and_empty(self):
+        ctrl = MagicMock()
+        ctrl.get_network_entries.return_value = [
+            {"kind": "network", "level": "error", "ts": "10:01:00",
+             "text": "HTTP 404 Not Found", "url": "http://x/missing.js"},
+        ]
+        tool = BrowserNetworkTool(controller_factory=lambda **kw: ctrl)
+        out = tool.execute()
+        self.assertIn("404", out)
+        self.assertIn("missing.js", out)
+
+        ctrl.get_network_entries.return_value = []
+        self.assertIn("No failed requests", tool.execute())
+
+    def test_wait_selector_satisfied_and_timeout(self):
+        ctrl = MagicMock()
+        ctrl.wait_for.return_value = True
+        tool = BrowserWaitTool(controller_factory=lambda **kw: ctrl)
+        self.assertIn("satisfied", tool.execute(selector="#app"))
+        ctrl.wait_for.assert_called_once_with("#app", 10000)
+
+        ctrl.wait_for.return_value = False
+        self.assertIn("Timed out", tool.execute(selector="#app", timeout_ms=1500))
+
+    def test_wait_text_and_missing_condition(self):
+        ctrl = MagicMock()
+        ctrl.wait_for_text.return_value = True
+        tool = BrowserWaitTool(controller_factory=lambda **kw: ctrl)
+        self.assertIn("satisfied", tool.execute(text="Dashboard"))
+        ctrl.wait_for_text.assert_called_once_with("Dashboard", 10000)
+        self.assertIn("Provide", tool.execute())
+
+    def test_debug_tools_registered_and_read_only(self):
+        names = [t.name for t in ALL_BROWSER_TOOLS]
+        for expected in ("browser_console", "browser_network", "browser_wait"):
+            self.assertIn(expected, names)
+        for tool_cls in (BrowserConsoleTool, BrowserNetworkTool, BrowserWaitTool):
+            tool = tool_cls(controller_factory=lambda **kw: MagicMock())
+            self.assertTrue(tool.is_read_only)
+            self.assertEqual(tool.action_type, "browser_read")
+            schema = tool.to_openai_schema()
+            self.assertEqual(schema["function"]["name"], tool.name)
 
 
 if __name__ == "__main__":

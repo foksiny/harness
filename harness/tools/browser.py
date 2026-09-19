@@ -457,6 +457,142 @@ class BrowserCloseTool(_BrowserBase):
             return f"Error closing browser: {e}"
 
 
+class BrowserConsoleTool(_BrowserBase):
+    name = "browser_console"
+    action_type = "browser_read"
+    is_read_only = True
+    description = (
+        "Read the page's console messages and JavaScript errors, captured via "
+        "CDP (console API calls, uncaught exceptions, warnings, CDP log "
+        "entries). The history is buffered browser-side and SURVIVES "
+        "navigation and reload — call this AFTER loading a page to see its "
+        "initial-load errors; no in-page listeners or init scripts needed. "
+        "Use 'get' (default) to read, 'clear' to empty the buffer (e.g. "
+        "before a reload you want a clean capture of)."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["get", "clear"], "default": "get", "description": "Read entries or clear the buffer"},
+            "level": {"type": "string", "enum": ["all", "error", "warning", "log", "info", "debug"], "default": "all", "description": "Only show entries at this console level"},
+            "limit": {"type": "integer", "default": 50, "description": "Max entries to return (oldest first)"},
+        },
+    }
+
+    def execute(self, action="get", level="all", limit=50, **kwargs):
+        ctrl = self._controller()
+        if ctrl is None:
+            return "Error: Browser not launched — call browser_launch first"
+        denied = self._allowed(f"Console {action}")
+        if denied:
+            return denied
+        try:
+            if action == "clear":
+                n = ctrl.clear_event_log()
+                return f"Console buffer cleared ({n} entries dropped)."
+            entries = ctrl.get_console_entries(level=None if level == "all" else level, limit=limit)
+            if not entries:
+                return "Console is clean — no messages, warnings or page errors captured."
+            lines = []
+            for e in entries:
+                line = f"[{e.get('ts', '?')}] [{e.get('level', 'log').upper()}] {e.get('text', '')}"
+                if e.get("url"):
+                    line += f"  ({e['url']})"
+                lines.append(line)
+            return truncate_output("\n".join(lines), 6000)
+        except Exception as e:
+            return f"Error reading console: {e}"
+
+
+class BrowserNetworkTool(_BrowserBase):
+    name = "browser_network"
+    action_type = "browser_read"
+    is_read_only = True
+    description = (
+        "Show failed network requests captured via CDP (connection failures, "
+        "blocked requests, HTTP 4xx/5xx responses). Buffered browser-side and "
+        "survives navigation/reload like browser_console. Use when a page "
+        "loads but the app misbehaves — a failed JS bundle or API call is "
+        "often the cause. 'get' reads (default), 'clear' empties the buffer."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["get", "clear"], "default": "get", "description": "Read entries or clear the buffer"},
+            "limit": {"type": "integer", "default": 50, "description": "Max entries to return (oldest first)"},
+        },
+    }
+
+    def execute(self, action="get", limit=50, **kwargs):
+        ctrl = self._controller()
+        if ctrl is None:
+            return "Error: Browser not launched — call browser_launch first"
+        denied = self._allowed(f"Network {action}")
+        if denied:
+            return denied
+        try:
+            if action == "clear":
+                n = ctrl.clear_event_log()
+                return f"Network buffer cleared ({n} entries dropped)."
+            entries = ctrl.get_network_entries(limit=limit)
+            if not entries:
+                return "No failed requests captured — all network activity succeeded."
+            lines = []
+            for e in entries:
+                line = f"[{e.get('ts', '?')}] {e.get('text', '')}"
+                if e.get("url"):
+                    line += f"  {e['url']}"
+                lines.append(line)
+            return truncate_output("\n".join(lines), 6000)
+        except Exception as e:
+            return f"Error reading network log: {e}"
+
+
+class BrowserWaitTool(_BrowserBase):
+    name = "browser_wait"
+    action_type = "browser_read"
+    is_read_only = True
+    description = (
+        "Wait until a condition is true on the page (or time out): a CSS "
+        "selector matching an element, or visible text appearing. Prefer this "
+        "over fixed sleeps after navigation/clicks on JS-heavy apps — it "
+        "returns the moment the condition holds."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "selector": {"type": "string", "description": "CSS selector to wait for (e.g. '#app .ready')"},
+            "text": {"type": "string", "description": "Visible page text to wait for"},
+            "timeout_ms": {"type": "integer", "default": 10000, "description": "Max time to wait in milliseconds"},
+        },
+    }
+
+    def execute(self, selector=None, text=None, timeout_ms=10000, **kwargs):
+        ctrl = self._controller()
+        if ctrl is None:
+            return "Error: Browser not launched — call browser_launch first"
+        if not selector and not text:
+            return "Error: Provide 'selector' or 'text' to wait for"
+        try:
+            timeout_ms = max(500, min(int(timeout_ms), 120000))
+        except Exception:
+            timeout_ms = 10000
+        cond = f"selector {selector}" if selector else f"text '{text[:80]}'"
+        denied = self._allowed(f"Wait for {cond} (up to {timeout_ms}ms)")
+        if denied:
+            return denied
+        try:
+            if selector:
+                ok = ctrl.wait_for(selector, timeout_ms)
+            else:
+                ok = ctrl.wait_for_text(text, timeout_ms)
+            if ok:
+                return f"Wait satisfied: {cond} appeared."
+            return f"Timed out after {timeout_ms}ms waiting for {cond}."
+        except Exception as e:
+            return f"Error waiting: {e}"
+
+
 ALL_BROWSER_TOOLS = [
     BrowserLaunchTool,
     BrowserNavigateTool,
@@ -470,6 +606,9 @@ ALL_BROWSER_TOOLS = [
     BrowserTabTool,
     BrowserNavigationTool,
     BrowserCloseTool,
+    BrowserConsoleTool,
+    BrowserNetworkTool,
+    BrowserWaitTool,
 ]
 
 
