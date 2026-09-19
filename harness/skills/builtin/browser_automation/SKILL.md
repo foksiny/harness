@@ -31,10 +31,10 @@ browser_close         # Clean up when done
 |------|---------|----------------|
 | `browser_launch` | Start Chrome session | `headless` (bool, default false), `port` (int, default 9222), `browser_path` (optional) |
 | `browser_navigate` | Load a URL | `url` (string) |
-| `browser_click` | Click element | `selector` (CSS) OR `x`+`y` (coordinates) |
+| `browser_click` | Click element | `selector` (CSS), optional `index` (0-based for nth match), OR `x`+`y` (coordinates) |
 | `browser_type` | Type into input | `selector` (CSS), `text` (string) — omit selector for raw keystrokes |
 | `browser_press_key` | Press key | `key` (Enter, Tab, Escape, ArrowUp, etc.) |
-| `browser_scroll` | Scroll page | `direction` (up/down/left/right), `amount` (pixels, default 500) |
+| `browser_scroll` | Scroll page | `direction`+`amount` (pixels or % like "50%"), `to` ("top"/"bottom"/selector), `selector` (scroll into view) |
 | `browser_screenshot` | Capture page | `full_page` (bool), `save_path` (optional) |
 | `browser_evaluate` | Run JS | `expression` (string) |
 | `browser_get_page_info` | Read page | — |
@@ -43,6 +43,46 @@ browser_close         # Clean up when done
 | `browser_close` | End session | — |
 
 ## Best Practices
+
+## Enhanced Click & Scroll
+
+### Smart Click (auto-finds clickable elements)
+`browser_click` now intelligently handles generic selectors like `'a'`, `'button'`, `'.result'`:
+- **Auto-selects first visible, clickable match** — ignores hidden, zero-size, or `pointer-events: none` elements
+- **`index` parameter** — target a specific match (0-based): `{"selector": "a", "index": 2}` clicks the 3rd link
+- **Better errors** — reports match count and why elements aren't clickable
+
+```python
+# Old: failed if first <a> was hidden
+browser_click({"selector": "a"})
+
+# New: auto-finds first clickable link
+browser_click({"selector": "a"})
+
+# Click 3rd search result link
+browser_click({"selector": ".result a", "index": 2})
+```
+
+### Flexible Scroll
+Multiple scrolling modes in one tool:
+```python
+# Scroll by viewport percentage
+browser_scroll({"direction": "down", "amount": "50%"})
+
+# Scroll to page top/bottom
+browser_scroll({"to": "top"})
+browser_scroll({"to": "bottom"})
+
+# Scroll element into view (smooth)
+browser_scroll({"selector": "#comments"})
+# or
+browser_scroll({"to": "#comments"})
+
+# Classic pixel scrolling (still works)
+browser_scroll({"direction": "down", "amount": 500})
+```
+
+---
 
 ### 1. Launch Once, Reuse Session
 ```python
