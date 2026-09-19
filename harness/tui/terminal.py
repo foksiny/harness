@@ -70,6 +70,10 @@ class TerminalRenderer:
         # fast streams stay byte-identical while stalled ones still paint.
         self._md_hold_start: float = 0.0
         self._subagent_open: Optional[str] = None
+        self._active_tool_start: float = 0.0
+        # Tool ids already announced as "generating" — each in-progress tool
+        # call prints its ◌ line exactly once per turn.
+        self._generating_announced: set = set()
 
     def set_theme(self, theme_name: str):
         self.theme = get_theme(theme_name)
@@ -430,6 +434,7 @@ class TerminalRenderer:
         """Render OpenCode completion capsule: ▣ Build · model · 2.4s"""
         self._finish_markdown()
         self._finish_thinking()
+        self._generating_announced.clear()
         dur_str = f"{duration:.1f}s" if duration >= 1.0 else f"{int(duration * 1000)}ms"
         mode_label = mode.capitalize() if mode else "Build"
         self.console.print(
@@ -1593,13 +1598,29 @@ class TerminalRenderer:
             # No Live repaint / cursor repositioning — see _md_flush_with_fallback.
             self._md_flush_with_fallback()
 
+        elif etype == "tool_call_delta":
+            # Live "generating" notice: fired the moment the provider stream
+            # reveals *which* tool is being built, while its arguments are
+            # still streaming in. CLI-only — other surfaces (Discord, mesh)
+            # intentionally ignore this event and wait for tool_call_start.
+            self._finish_markdown()
+            self._finish_thinking()
+            data = data or {}
+            tname = (data.get("name") or "").strip() or "tool"
+            tid = str(data.get("id") or data.get("index", tname))
+            if tid in self._generating_announced:
+                return
+            self._generating_announced.add(tid)
+            icon, category = self._tool_meta(tname)
+            self.console.print(f"\n[{self.theme.accent}]◌ Generating {category}: [bold]{tname}[/bold][/{self.theme.accent}]")
+
         elif etype == "tool_call_start":
             self._finish_markdown()
             self._finish_thinking()
             self._active_tool_start = time.time()
-            tname = data.get("name", "tool")
+            tname = (data or {}).get("name", "tool")
             icon, category = self._tool_meta(tname)
-            args = data.get("arguments", {})
+            args = (data or {}).get("arguments", {})
             self.console.print(f"\n[{self.theme.secondary}]{icon} Invoking {category}: [bold]{tname}[/bold][/{self.theme.secondary}]")
             if args:
                 preview = str(args)
@@ -1672,9 +1693,10 @@ class TerminalRenderer:
                 f"{before:,} -> {after:,} tokens ([bold green]-{saved:,} tokens / {pct}%[/bold green]) · {tactic_str}\n"
             )
 
-        elif etype == "step_end" and data.get("complete"):
+        elif etype == "step_end" and (data or {}).get("complete"):
             self._finish_markdown()
             self._finish_thinking()
+            self._generating_announced.clear()
             self.console.print()
 
         elif etype == "error":

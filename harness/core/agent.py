@@ -937,6 +937,10 @@ class HarnessAgent:
                 text_accumulator = ""
                 reasoning_accumulator = ""
                 tool_calls_accumulator: Dict[int, Dict[str, Any]] = {}
+                # Indices already announced as "generating" for this attempt,
+                # so each in-progress tool call emits exactly one delta event
+                # the moment its name becomes known.
+                announced_generating: Dict[int, str] = {}
                 error_accumulator = ""
                 stream_iter = self._stream_interruptible(
                     lambda: self.provider.stream_chat(
@@ -970,10 +974,26 @@ class HarnessAgent:
                                     "name": tc.name or "",
                                     "arguments": "",
                                 }
+                            if tc.id:
+                                # Prefer a real provider id once it arrives
+                                # (first chunk may carry only the index).
+                                tool_calls_accumulator[idx]["id"] = tc.id
                             if tc.name:
                                 tool_calls_accumulator[idx]["name"] = tc.name
                             if tc.arguments_delta:
                                 tool_calls_accumulator[idx]["arguments"] += tc.arguments_delta
+                            # Live "generating" detection: the moment a tool
+                            # name is known for an index, announce it so CLI
+                            # renderers can show *which* tool is being built
+                            # while its arguments are still streaming in.
+                            current_name = tool_calls_accumulator[idx]["name"]
+                            if current_name and announced_generating.get(idx) != current_name:
+                                announced_generating[idx] = current_name
+                                yield AgentEvent("tool_call_delta", {
+                                    "index": idx,
+                                    "id": tool_calls_accumulator[idx]["id"],
+                                    "name": current_name,
+                                })
 
                         if self._stop_requested.is_set():
                             break
