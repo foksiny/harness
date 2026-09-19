@@ -30,11 +30,15 @@ class BaseProvider(ABC):
     display_name: str
     default_model: str
 
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, max_retries: int = 3, base_delay: float = 5.0):
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, max_retries: int = 3, base_delay: float = 5.0, stream_timeout: Optional[float] = None):
         self.api_key = api_key
         self.base_url = base_url
         self.max_retries = max(0, int(max_retries))
         self.base_delay = max(0.1, float(base_delay))
+        # SSE read timeout (seconds): how long the socket may go without
+        # receiving any bytes mid-stream. Generous by default so long
+        # reasoning stalls don't surface as "read operation timed out".
+        self.stream_timeout = resolve_stream_timeout(stream_timeout)
 
     def _is_retryable_http_code(self, code: int) -> bool:
         # Retry on rate limit and transient server errors
@@ -144,6 +148,162 @@ class BaseProvider(ABC):
             n = int(eff)
             return "low" if n < 4000 else ("medium" if n < 12000 else "high")
         return "medium"
+
+
+# Default streaming timeouts (seconds). Connect stays short so dead endpoints
+# fail fast; read is generous because reasoning models (e.g. DeepSeek on
+# NVIDIA NIM) can stall for minutes between tokens during long thinking.
+# The old urllib single-timeout of 120s fired constantly on those stalls
+# ("The read operation timed out"); httpx lets us split connect vs read the
+# way opencode / pi-agent do.
+DEFAULT_STREAM_CONNECT_TIMEOUT = 15.0
+DEFAULT_STREAM_READ_TIMEOUT = 300.0
+DEFAULT_STREAM_WRITE_TIMEOUT = 30.0
+DEFAULT_STREAM_POOL_TIMEOUT = 15.0
+
+
+def resolve_stream_timeout(config_or_value=None) -> float:
+    """Resolve the SSE read timeout from config, env override, or default."""
+    import os as _os
+    if isinstance(config_or_value, (int, float)):
+        return max(30.0, float(config_or_value))
+    if config_or_value is not None:
+        try:
+            v = float(getattr(config_or_value, "provider_stream_timeout", 0) or 0)
+            if v > 0:
+                return max(30.0, v)
+        except Exception:
+            pass
+    try:
+        env = _os.environ.get("HARNESS_STREAM_TIMEOUT", "").strip()
+        if env:
+            return max(30.0, float(env))
+    except Exception:
+        pass
+    return DEFAULT_STREAM_READ_TIMEOUT
+
+
+class StreamHTTPError(Exception):
+    """Non-2xx response from a streaming POST (carries body + headers)."""
+
+    def __init__(self, status_code: int, body: str, headers=None):
+        super().__init__(f"HTTP {status_code}: {(body or '')[:200]}")
+        self.status_code = status_code
+        self.body = body or ""
+        self.headers = headers
+
+    def retry_after(self) -> Optional[float]:
+        try:
+            raw = None
+            if self.headers is not None:
+                getter = getattr(self.headers, "get", None)
+                raw = getter("retry-after") if getter else None
+            if raw:
+                return max(0.0, float(raw))
+        except Exception:
+            pass
+        return None
+
+
+class SsePostStream:
+    """POST JSON and stream SSE lines as they arrive via httpx.
+
+    Replaces the old ``urllib.request.urlopen`` pattern: httpx decodes and
+    yields each line the moment its bytes arrive (no stdlib buffering
+    delays), splits connect vs read timeouts, and surfaces ``: ping``
+    keep-alives promptly so long reasoning stalls don't kill the socket.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        headers: Optional[Dict[str, str]],
+        body: Dict[str, Any],
+        stream_timeout: Optional[float] = None,
+    ):
+        self.endpoint = endpoint
+        self.headers = headers or {}
+        self.body = body
+        self.stream_timeout = resolve_stream_timeout(stream_timeout)
+        self._client = None
+        self._context = None
+        self._resp = None
+
+    def __enter__(self) -> "SsePostStream":
+        import httpx
+        timeout = httpx.Timeout(
+            connect=DEFAULT_STREAM_CONNECT_TIMEOUT,
+            read=self.stream_timeout,
+            write=DEFAULT_STREAM_WRITE_TIMEOUT,
+            pool=DEFAULT_STREAM_POOL_TIMEOUT,
+        )
+        self._client = httpx.Client(timeout=timeout)
+        self._context = self._client.stream(
+            "POST", self.endpoint, headers=self.headers, json=self.body
+        )
+        self._resp = self._context.__enter__()
+        if self._resp.status_code >= 400:
+            try:
+                raw = self._resp.read()
+                body = raw.decode("utf-8", errors="ignore")
+            except Exception:
+                body = ""
+            headers = self._resp.headers
+            self.__exit__(None, None, None)
+            raise StreamHTTPError(self._resp.status_code, body, headers)
+        return self
+
+    def __iter__(self):
+        # iter_lines() yields each line as soon as its newline arrives.
+        for line in self._resp.iter_lines():
+            yield line
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        try:
+            if self._context is not None:
+                self._context.__exit__(exc_type, exc, tb)
+        except Exception:
+            pass
+        try:
+            if self._client is not None:
+                self._client.close()
+        except Exception:
+            pass
+        return False
+
+
+def sse_post_stream(
+    endpoint: str,
+    headers: Optional[Dict[str, str]],
+    body: Dict[str, Any],
+    stream_timeout: Optional[float] = None,
+) -> SsePostStream:
+    """Convenience constructor for ``with sse_post_stream(...) as stream:``."""
+    return SsePostStream(endpoint, headers, body, stream_timeout)
+
+
+def is_transient_transport_error(ex: Exception) -> bool:
+    """True for connection-level failures a fresh request can fix.
+
+    Covers httpx timeout/transport errors plus stdlib socket timeouts.
+    Auth/validation errors are NOT transient.
+    """
+    try:
+        import httpx as _httpx
+        if isinstance(ex, _httpx.TimeoutException):
+            return True
+        if isinstance(ex, _httpx.TransportError):
+            return True
+    except Exception:
+        pass
+    if isinstance(ex, (TimeoutError, ConnectionError)):
+        return True
+    low = str(ex).lower()
+    return any(t in low for t in (
+        "timed out", "timeout", "connection reset", "connection aborted",
+        "connection refused", "temporarily unavailable", "connection error",
+        "remote protocol error", "incomplete read",
+    ))
 
 
 def probe_effort_options(dialect: Optional[str]) -> List[str]:

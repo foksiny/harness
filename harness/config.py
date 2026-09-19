@@ -81,6 +81,7 @@ class HarnessConfig:
     swarm_enabled: bool = False      # Enable agent swarms (always active in SUPER mode)
     provider_max_retries: int = 3    # Number of retries for provider errors (exponential backoff)
     provider_retry_base_delay: float = 5.0  # Base delay in seconds for first retry (doubles each retry: 5,10,20...)
+    provider_stream_timeout: float = 300.0  # SSE read timeout: max seconds without any bytes mid-stream (reasoning stalls)
     force_media_attach: bool = False # Force-attach images even when the model isn't flagged vision-capable
     vfb_provider: str = "" # Vision fallback provider; when set, degraded media get described via this provider
     vfb_model: str = ""    # Vision fallback model; empty => the provider's default model

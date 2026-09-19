@@ -4,10 +4,15 @@ Supports Gemini 2.5 Pro, 2.5 Flash, 2.0 Flash, thinking budget, and function dec
 """
 import json
 import time
-import urllib.request
-import urllib.error
 from typing import Dict, Any, List, Optional, Iterator
-from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta
+from harness.providers.base import (
+    BaseProvider,
+    LLMChunk,
+    ToolCallDelta,
+    StreamHTTPError,
+    is_transient_transport_error,
+    sse_post_stream,
+)
 from harness.core.attachments import b64_payload_for_block
 
 class GeminiProvider(BaseProvider):
@@ -15,8 +20,8 @@ class GeminiProvider(BaseProvider):
     display_name = "Google Gemini"
     default_model = "gemini-2.5-pro"
 
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, max_retries: int = 3, base_delay: float = 5.0):
-        super().__init__(api_key=api_key, base_url=base_url or "https://generativelanguage.googleapis.com/v1beta", max_retries=max_retries, base_delay=base_delay)
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, max_retries: int = 3, base_delay: float = 5.0, stream_timeout: Optional[float] = None):
+        super().__init__(api_key=api_key, base_url=base_url or "https://generativelanguage.googleapis.com/v1beta", max_retries=max_retries, base_delay=base_delay, stream_timeout=stream_timeout)
 
     def _user_parts(self, content):
         """Convert canonical content (str or block list) to Gemini parts."""
@@ -119,17 +124,16 @@ class GeminiProvider(BaseProvider):
         if tools:
             body["tools"] = [{"functionDeclarations": tools}]
 
-        data_bytes = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(endpoint, data=data_bytes, headers=headers, method="POST")
-
         for attempt in range(self.max_retries + 1):
+            saw_payload = False
             try:
-                with urllib.request.urlopen(req, timeout=120) as resp:
+                # httpx streams each SSE line the moment its bytes arrive
+                # with a generous read timeout so long thinking stalls
+                # don't surface as read timeouts.
+                with sse_post_stream(endpoint, headers, body, self.stream_timeout) as stream:
                     buffer = ""
-                    saw_payload = False
-                    for raw_line in resp:
-                        line = raw_line.decode("utf-8", errors="replace")
-                        buffer += line
+                    for line in stream:
+                        buffer += line + "\n"
 
                         while "\n" in buffer:
                             line_str, buffer = buffer.split("\n", 1)
@@ -176,28 +180,29 @@ class GeminiProvider(BaseProvider):
                                 except Exception:
                                     continue
                     return
-            except urllib.error.HTTPError as he:
-                err_body = he.read().decode("utf-8", errors="ignore") if hasattr(he, "read") else str(he)
-                if not he.code or not self._is_retryable_http_code(he.code) or attempt >= self.max_retries:
-                    yield LLMChunk(delta_text=f"\n[HTTP Error {he.code} from Gemini: {err_body}]\n", finish_reason="error")
+            except StreamHTTPError as he:
+                err_body = he.body
+                if not he.status_code or not self._is_retryable_http_code(he.status_code) or attempt >= self.max_retries:
+                    yield LLMChunk(delta_text=f"\n[HTTP Error {he.status_code} from Gemini: {err_body}]\n", finish_reason="error")
                     return
                 delay = self._retry_delay(attempt)
                 try:
-                    retry_after = he.headers.get("Retry-After") if hasattr(he, "headers") and he.headers else None
+                    retry_after = he.retry_after()
                     if retry_after:
                         delay = max(delay, float(retry_after))
                 except Exception:
                     pass
                 time.sleep(delay)
                 continue
-            except urllib.error.URLError as ue:
-                if attempt >= self.max_retries:
-                    yield LLMChunk(delta_text=f"\n[Connection Error with Gemini: {str(ue)}]\n", finish_reason="error")
-                    return
-                delay = self._retry_delay(attempt)
-                time.sleep(delay)
-                continue
             except Exception as ex:
+                # Transport failure before any payload → retry here with
+                # backoff. Mid-stream deaths are surfaced (not retried) so
+                # the agent-level retry can discard the partial attempt
+                # instead of concatenating a duplicate onto it.
+                if is_transient_transport_error(ex) and not saw_payload and attempt < self.max_retries:
+                    delay = self._retry_delay(attempt)
+                    time.sleep(delay)
+                    continue
                 yield LLMChunk(delta_text=f"\n[Unexpected Error from Gemini: {str(ex)}]\n", finish_reason="error")
                 return
         yield LLMChunk(delta_text=f"\n[Error from Gemini: exhausted {self.max_retries} retries]\n", finish_reason="error")

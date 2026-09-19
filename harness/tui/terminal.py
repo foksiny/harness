@@ -20,6 +20,15 @@ from harness.themes import Theme, get_theme, THEMES, render_theme_preview
 from harness.sysinfo import get_ram_usage_mb
 
 
+# Streaming flush tuning: completed markdown blocks print instantly, but a
+# partial block is never held back longer than _MD_FLUSH_MAX_AGE seconds or
+# past _MD_FLUSH_MAX_SIZE chars — it is printed up to the last safe newline
+# instead. Without this, a long paragraph with no blank line stalls the UI
+# for minutes and then dumps everything at once.
+_MD_FLUSH_MAX_AGE = 2.0
+_MD_FLUSH_MAX_SIZE = 2000
+
+
 class DynamicStdout:
     """Delegates writes to the active sys.stdout, supporting prompt_toolkit.patch_stdout."""
     def write(self, s):
@@ -53,6 +62,10 @@ class TerminalRenderer:
         self._md_buffer: str = ""
         self._md_stream_started: bool = False
         self._md_last_blank: bool = False
+        # When the current unflushed remainder started accumulating (0.0 =
+        # nothing held). The fallback flush measures hold time from here, so
+        # fast streams stay byte-identical while stalled ones still paint.
+        self._md_hold_start: float = 0.0
         self._subagent_open: Optional[str] = None
 
     def set_theme(self, theme_name: str):
@@ -1057,21 +1070,20 @@ class TerminalRenderer:
             self.console.print()
 
     def _thinking_flush_completed(self):
-        """Append-only thinking stream: print every completed block immediately.
+        """Append-only thinking stream: print every completed line immediately.
 
-        Mirrors _md_flush_completed - only prints chunks ending at a markdown
-        block boundary (blank line outside fenced code). This avoids splitting
-        fences/lists mid-block and matches normal response streaming semantics.
+        Thinking is rendered as plain prefixed lines (not markdown), so there
+        is no block structure to preserve — waiting for a blank-line boundary
+        here only delayed visible output by seconds/minutes and then dumped
+        everything at once. The trailing partial line stays buffered;
+        _finish_thinking flushes it at turn end.
         """
-        while True:
-            completed = self._md_completed_end(self._thinking_buffer)
-            if completed <= 0:
-                return
-            chunk, self._thinking_buffer = (
-                self._thinking_buffer[:completed],
-                self._thinking_buffer[completed:],
-            )
-            self._thinking_print_block(chunk)
+        buf = self._thinking_buffer
+        idx = buf.rfind("\n")
+        if idx <= 0:
+            return
+        chunk, self._thinking_buffer = buf[:idx], buf[idx + 1:]
+        self._thinking_print_block(chunk)
 
     def _md_print_block(self, chunk: str):
         """Print one markdown block with whole-document spacing semantics.
@@ -1104,6 +1116,9 @@ class TerminalRenderer:
             self._md_buffer = ""
         self._md_stream_started = False
         self._md_last_blank = False
+        # Reset the hold window so fresh text after a tool call or a new
+        # turn is measured from its own arrival, not the previous segment.
+        self._md_hold_start = 0.0
 
     @staticmethod
     def _md_completed_end(buffer: str) -> int:
@@ -1172,16 +1187,74 @@ class TerminalRenderer:
         no cursor repositioning at all, so it cannot leak frames on any
         terminal.
         """
+        printed = False
         while True:
             completed = self._md_completed_end(self._md_buffer)
             if completed <= 0:
-                return
+                break
             chunk, self._md_buffer = (
                 self._md_buffer[:completed],
                 self._md_buffer[completed:],
             )
             self._md_print_block(chunk)
             self._md_stream_started = True
+            printed = True
+        if printed:
+            # Remainder (if any) starts a fresh hold window from this paint.
+            self._md_hold_start = time.time() if self._md_buffer else 0.0
+
+    @staticmethod
+    def _md_line_cut(buffer: str) -> int:
+        """Return the length of the longest prefix ending at a newline outside
+        any fenced code block (0 when there is no safe cut point)."""
+        in_fence = False
+        fence_marker = ""
+        cut = 0
+        pos = 0
+        for line in buffer.splitlines(keepends=True):
+            stripped = line.strip()
+            if not in_fence and (stripped.startswith("```") or stripped.startswith("~~~")):
+                in_fence = True
+                fence_marker = stripped[:3]
+            elif in_fence and stripped.startswith(fence_marker):
+                in_fence = False
+            pos += len(line)
+            if not in_fence and line.endswith("\n"):
+                cut = pos
+        return cut
+
+    def _md_flush_with_fallback(self):
+        """Flush completed blocks instantly; never hold partial text too long.
+
+        Fast path is the blank-line block boundary (byte-identical spacing).
+        Fallback: when the remainder has been held longer than
+        _MD_FLUSH_MAX_AGE or grown past _MD_FLUSH_MAX_SIZE, print it up to
+        the last newline outside a fence so tokens stay visible instead of
+        stalling for minutes and dumping at once.
+        """
+        self._md_flush_completed()
+        if not self._md_buffer:
+            self._md_hold_start = 0.0
+            return
+        now = time.time()
+        if self._md_hold_start == 0.0:
+            # First sight of this remainder — stamp it and give the block
+            # fast path a chance on the next chunk before falling back.
+            self._md_hold_start = now
+            return
+        if "\n" not in self._md_buffer:
+            return
+        held = now - self._md_hold_start
+        if held < _MD_FLUSH_MAX_AGE and len(self._md_buffer) < _MD_FLUSH_MAX_SIZE:
+            return
+        cut = self._md_line_cut(self._md_buffer)
+        if cut <= 0:
+            return
+        chunk, self._md_buffer = self._md_buffer[:cut], self._md_buffer[cut:]
+        self._md_print_block(chunk)
+        self._md_stream_started = True
+        # Remainder (if any) starts a fresh hold window from this paint.
+        self._md_hold_start = now if self._md_buffer else 0.0
 
     def _sub_id(self, agent_id: str) -> str:
         return f"[bold {self.theme.secondary}]{agent_id}[/bold {self.theme.secondary}]"
@@ -1363,9 +1436,10 @@ class TerminalRenderer:
         elif etype == "text_delta":
             self._finish_thinking()
             self._md_buffer += str(data)
-            # Append-only streaming: print each completed markdown block once.
-            # No Live repaint / cursor repositioning — see _md_flush_completed.
-            self._md_flush_completed()
+            # Append-only streaming: print each completed markdown block once,
+            # with a time/size fallback so partial blocks never stall the UI.
+            # No Live repaint / cursor repositioning — see _md_flush_with_fallback.
+            self._md_flush_with_fallback()
 
         elif etype == "tool_call_start":
             self._finish_markdown()

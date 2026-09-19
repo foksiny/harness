@@ -5,13 +5,35 @@ Mistral, xAI, Ollama, Together, Fireworks, and Perplexity.
 """
 import json
 import time
-import urllib.request
-import urllib.error
 from typing import Dict, Any, List, Optional, Iterator
-from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta
+from harness.providers.base import (
+    BaseProvider,
+    LLMChunk,
+    ToolCallDelta,
+    StreamHTTPError,
+    is_transient_transport_error,
+    sse_post_stream,
+)
 from harness.core.attachments import data_url_for_block
 
 DEFAULT_USER_AGENT = "Harness/1.0"
+
+
+def _is_connection_error(ex: Exception) -> bool:
+    """True for socket/transport-level failures (vs unexpected app errors)."""
+    try:
+        import httpx as _httpx
+        if isinstance(ex, _httpx.TransportError):
+            return True
+    except Exception:
+        pass
+    return isinstance(ex, (TimeoutError, ConnectionError))
+
+
+def _is_transient_exception(ex: Exception) -> bool:
+    """True for connection-level failures that a fresh request can fix
+    (socket read timeouts, resets, aborts). Auth/validation errors are not."""
+    return is_transient_transport_error(ex)
 
 def _openai_content_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Map canonical attachment blocks to OpenAI-style multimodal content."""
@@ -114,8 +136,9 @@ class OpenAICompatibleProvider(BaseProvider):
         user_agent: str = DEFAULT_USER_AGENT,
         max_retries: int = 3,
         base_delay: float = 5.0,
+        stream_timeout: Optional[float] = None,
     ):
-        super().__init__(api_key=api_key, base_url=base_url, max_retries=max_retries, base_delay=base_delay)
+        super().__init__(api_key=api_key, base_url=base_url, max_retries=max_retries, base_delay=base_delay, stream_timeout=stream_timeout)
         self.name = name
         self.display_name = display_name
         self.default_model = default_model
@@ -132,9 +155,21 @@ class OpenAICompatibleProvider(BaseProvider):
             content = msg.get("content")
             item: Dict[str, Any] = {"role": role}
             if isinstance(content, list):
-                item["content"] = _openai_content_blocks(content)
+                if role == "tool":
+                    # Tool messages must carry a string for the OpenAI API: keep
+                    # the text inline and ship any attached media as a synthetic
+                    # follow-up user message with the same image blocks.
+                    texts = [b.get("text", "") for b in content
+                             if isinstance(b, dict) and b.get("type") == "text"]
+                    media = [b for b in content
+                             if isinstance(b, dict) and b.get("type") in ("image", "video")]
+                    item["content"] = "\n".join(t for t in texts if t) or ""
+                else:
+                    item["content"] = _openai_content_blocks(content)
+                    media = []
             else:
                 item["content"] = content or ""
+                media = []
             if "tool_calls" in msg and msg["tool_calls"]:
                 item["tool_calls"] = msg["tool_calls"]
             if "tool_call_id" in msg and msg["tool_call_id"]:
@@ -215,9 +250,6 @@ class OpenAICompatibleProvider(BaseProvider):
         if tools and model_spec.supports_tools:
             body["tools"] = tools
 
-        data_bytes = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(endpoint, data=data_bytes, headers=headers, method="POST")
-
         # ── Retry handling: unsupported param (immediate) + exponential backoff for transient errors ──
         # Configurable retries: default 3 => waits 5s, 10s, 20s (base * 2^attempt)
         max_retries = getattr(self, "max_retries", 3)
@@ -228,17 +260,23 @@ class OpenAICompatibleProvider(BaseProvider):
         # We use a manual loop with attempt counter for backoff
         attempt = 0
         while True:
+            # Reset per attempt: whether any usable SSE content was yielded yet.
+            # Referenced by the exception handlers below — a request that dies
+            # before the first payload is transient-retryable; mid-stream deaths
+            # are surfaced to the agent, which retries the whole call.
+            saw_payload = False
             try:
-                with urllib.request.urlopen(req, timeout=120) as resp:
+                # httpx streams each SSE line the moment its bytes arrive
+                # (no stdlib buffering delay) with a generous read timeout so
+                # long reasoning stalls don't surface as read timeouts.
+                with sse_post_stream(endpoint, headers, body, self.stream_timeout) as stream:
                     buffer = ""
-                    saw_payload = False
                     body_lines = []
                     sse_error_msg: Optional[str] = None
                     sse_retryable = False
-                    for raw_line in resp:
-                        line = raw_line.decode("utf-8", errors="replace")
-                        body_lines.append(line)
-                        buffer += line
+                    for line in stream:
+                        body_lines.append(line + "\n")
+                        buffer += line + "\n"
 
                         while "\n" in buffer:
                             line_str, buffer = buffer.split("\n", 1)
@@ -333,11 +371,10 @@ class OpenAICompatibleProvider(BaseProvider):
                     if sse_error_msg is not None:
                         if not sse_retryable:
                             # Unsupported param → strip and retry immediately
+                            # (body dict is passed fresh to the next attempt)
                             self._strip_thinking_params(body)
                             thinking_params = {}
                             thinking_stripped = True
-                            data_bytes = json.dumps(body).encode("utf-8")
-                            req = urllib.request.Request(endpoint, data=data_bytes, headers=headers, method="POST")
                             # Do not increment backoff attempt for this, retry immediately
                             continue
                         else:
@@ -378,8 +415,6 @@ class OpenAICompatibleProvider(BaseProvider):
                                 self._strip_thinking_params(body)
                                 thinking_params = {}
                                 thinking_stripped = True
-                                data_bytes = json.dumps(body).encode("utf-8")
-                                req = urllib.request.Request(endpoint, data=data_bytes, headers=headers, method="POST")
                                 continue
                             if self._is_retryable_error_message(err_msg, err_code) and attempt < max_retries:
                                 delay = self._retry_delay(attempt)
@@ -391,22 +426,20 @@ class OpenAICompatibleProvider(BaseProvider):
                             yield LLMChunk(delta_text=f"\n[Error from {self.display_name}: stream ended without a response]\n", finish_reason="error")
                     return
 
-            except urllib.error.HTTPError as he:
-                err_body = he.read().decode("utf-8", errors="ignore") if hasattr(he, "read") else str(he)
+            except StreamHTTPError as he:
+                err_body = he.body
                 # Unsupported param → immediate retry (no backoff, doesn't count towards max_retries)
                 if not thinking_stripped and thinking_params and self._is_unsupported_param_error(err_body):
                     self._strip_thinking_params(body)
                     thinking_params = {}
                     thinking_stripped = True
-                    data_bytes = json.dumps(body).encode("utf-8")
-                    req = urllib.request.Request(endpoint, data=data_bytes, headers=headers, method="POST")
                     continue
                 # Retryable HTTP codes → exponential backoff
-                if self._is_retryable_http_code(he.code) and attempt < max_retries:
+                if self._is_retryable_http_code(he.status_code) and attempt < max_retries:
                     # Respect Retry-After header if present
                     delay = self._retry_delay(attempt)
                     try:
-                        retry_after = he.headers.get("Retry-After") if hasattr(he, "headers") and he.headers else None
+                        retry_after = he.retry_after()
                         if retry_after:
                             delay = max(delay, float(retry_after))
                     except Exception:
@@ -414,17 +447,21 @@ class OpenAICompatibleProvider(BaseProvider):
                     time.sleep(delay)
                     attempt += 1
                     continue
-                yield LLMChunk(delta_text=f"\n[HTTP Error {he.code} from {self.display_name}: {err_body}]\n", finish_reason="error")
+                yield LLMChunk(delta_text=f"\n[HTTP Error {he.status_code} from {self.display_name}: {err_body}]\n", finish_reason="error")
                 return
-            except urllib.error.URLError as ue:
-                if attempt < max_retries:
+            except Exception as ex:
+                # Transient connection failure (read timeout, reset, abort)
+                # BEFORE any payload was yielded → retry with backoff here.
+                # Mid-stream deaths are NOT retried here (deltas were already
+                # yielded; the agent-level retry handles those safely by
+                # discarding the partial attempt).
+                if not saw_payload and _is_transient_exception(ex) and attempt < max_retries:
                     delay = self._retry_delay(attempt)
                     time.sleep(delay)
                     attempt += 1
                     continue
-                yield LLMChunk(delta_text=f"\n[Connection Error with {self.display_name}: {str(ue)}]\n", finish_reason="error")
-                return
-            except Exception as ex:
-                # Don't retry on non-retryable unexpected errors
-                yield LLMChunk(delta_text=f"\n[Unexpected Error from {self.display_name}: {str(ex)}]\n", finish_reason="error")
+                if _is_connection_error(ex):
+                    yield LLMChunk(delta_text=f"\n[Connection Error with {self.display_name}: {str(ex)}]\n", finish_reason="error")
+                else:
+                    yield LLMChunk(delta_text=f"\n[Unexpected Error from {self.display_name}: {str(ex)}]\n", finish_reason="error")
                 return

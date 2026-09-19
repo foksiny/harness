@@ -122,6 +122,9 @@ def get_provider(provider_name: str, config: Optional[HarnessConfig] = None) -> 
     # Retry config (default 3 retries, 5s base -> 5,10,20)
     max_retries = getattr(config, "provider_max_retries", 3) if config else 3
     base_delay = getattr(config, "provider_retry_base_delay", 5.0) if config else 5.0
+    # SSE stream read timeout (default 300s so long reasoning stalls survive)
+    from harness.providers.base import resolve_stream_timeout
+    stream_timeout = resolve_stream_timeout(config)
     # Env overrides (useful for VPS)
     import os as _os
     if _os.environ.get("HARNESS_PROVIDER_RETRIES"):
@@ -134,10 +137,15 @@ def get_provider(provider_name: str, config: Optional[HarnessConfig] = None) -> 
             base_delay = float(_os.environ["HARNESS_PROVIDER_RETRY_DELAY"])
         except Exception:
             pass
+    if _os.environ.get("HARNESS_STREAM_TIMEOUT"):
+        try:
+            stream_timeout = max(30.0, float(_os.environ["HARNESS_STREAM_TIMEOUT"]))
+        except Exception:
+            pass
 
     cls = cfg_entry["class"]
     if cls is AnthropicProvider or cls is GeminiProvider:
-        return cls(api_key=api_key, base_url=base_url, max_retries=max_retries, base_delay=base_delay)
+        return cls(api_key=api_key, base_url=base_url, max_retries=max_retries, base_delay=base_delay, stream_timeout=stream_timeout)
     elif cls is MockProvider:
         return MockProvider()
     else:
@@ -156,6 +164,7 @@ def get_provider(provider_name: str, config: Optional[HarnessConfig] = None) -> 
             extra_headers=extra_headers,
             max_retries=max_retries,
             base_delay=base_delay,
+            stream_timeout=stream_timeout,
         )
 
 def list_providers() -> Dict[str, str]:
