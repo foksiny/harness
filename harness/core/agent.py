@@ -20,7 +20,7 @@ from harness.core.subagents import SubagentOrchestrator
 from harness.core.learning import LearningManager
 from harness.core.attachments import parse_attachments
 from harness.core.mentions import expand_mentions
-from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta
+from harness.providers.base import BaseProvider, LLMChunk, ToolCallDelta, is_fatal_provider_error
 from harness.providers import get_provider
 from harness.tools import ToolRegistry
 from harness.skills.loader import SkillsManager
@@ -60,6 +60,7 @@ class HarnessAgent:
             ask_user_handler=ask_user_handler,
             learning_manager=self.learning_manager,
             learning_enabled=config.learning_enabled,
+            browser_enabled=getattr(config, "browser_enabled", True),
         )
         # Debounce heuristic auto-learning so at most one learned lesson is
         # captured per session.
@@ -573,6 +574,28 @@ class HarnessAgent:
         })
         return (description, "")
 
+    def _describe_tool_images(
+        self, media_blocks: List[Dict[str, Any]], question: Optional[str] = None
+    ) -> Tuple[list, Optional[str], str]:
+        """Run the vision fallback over images produced by a tool result.
+
+        Returns (events, description, error): the UX events to replay into the
+        turn, plus exactly one of description/error set on completion.
+        """
+        events: list = []
+        description, err = None, ""
+        gen = self._run_vision_fallback(media_blocks, user_prompt=question)
+        try:
+            while True:
+                try:
+                    events.append(next(gen))
+                except StopIteration as stop:
+                    description, err = stop.value or (None, "")
+                    break
+        except Exception:
+            err = "vision fallback crashed unexpectedly"
+        return events, description, err
+
     def step(self, user_prompt: Optional[str] = None) -> Generator[AgentEvent, None, None]:
         """Execute a single or multi-step agent turn, yielding live events."""
         self.is_running = True
@@ -766,11 +789,6 @@ class HarnessAgent:
             current_loop += 1
             active_tools = self.tool_registry.get_openai_schemas(self.mode)
 
-            text_accumulator = ""
-            reasoning_accumulator = ""
-            tool_calls_accumulator: Dict[int, Dict[str, Any]] = {}
-            error_accumulator = ""
-
             yield AgentEvent("step_start", {"step": current_loop, "mode": self.mode.value})
 
             # Proactive budget: compact BEFORE sending so the model never sees a
@@ -779,39 +797,87 @@ class HarnessAgent:
             for ev in self._proactive_budget_check(sys_prompt):
                 yield ev
 
-            for chunk in self.provider.stream_chat(
-                messages=self.session.messages,
-                model=self.session.model,
-                thinking_effort=self.config.thinking_effort,
-                tools=active_tools,
-                system_prompt=sys_prompt,
-            ):
-                if chunk.finish_reason == "error":
-                    error_accumulator += chunk.delta_text or ""
-                    yield AgentEvent("text_delta", chunk.delta_text or f"\n[Error from {self.provider.display_name}: unknown provider error]\n")
-                    continue
+            # ── Provider stream with agent-level retry ───────────────────
+            # Providers retry transient errors *before the first byte*, but a
+            # stream that dies MID-WAY (e.g. a read timeout after long thinking)
+            # cannot be resumed there. Nothing from a failed attempt is
+            # committed to the session yet, so the whole model call is retried
+            # here with a fresh request and the partial accumulators discarded.
+            provider_retries = max(0, int(getattr(self.config, "provider_max_retries", 3)))
+            provider_base_delay = max(0.1, float(getattr(self.config, "provider_retry_base_delay", 5.0)))
+            stream_attempt = 0
+            while True:
+                text_accumulator = ""
+                reasoning_accumulator = ""
+                tool_calls_accumulator: Dict[int, Dict[str, Any]] = {}
+                error_accumulator = ""
+                try:
+                    for chunk in self.provider.stream_chat(
+                        messages=self.session.messages,
+                        model=self.session.model,
+                        thinking_effort=self.config.thinking_effort,
+                        tools=active_tools,
+                        system_prompt=sys_prompt,
+                    ):
+                        if chunk.finish_reason == "error":
+                            error_accumulator += chunk.delta_text or ""
+                            yield AgentEvent("text_delta", chunk.delta_text or f"\n[Error from {self.provider.display_name}: unknown provider error]\n")
+                            continue
 
-                if chunk.delta_reasoning:
-                    reasoning_accumulator += chunk.delta_reasoning
-                    yield AgentEvent("reasoning_delta", chunk.delta_reasoning)
+                        if chunk.delta_reasoning:
+                            reasoning_accumulator += chunk.delta_reasoning
+                            yield AgentEvent("reasoning_delta", chunk.delta_reasoning)
 
-                if chunk.delta_text:
-                    text_accumulator += chunk.delta_text
-                    yield AgentEvent("text_delta", chunk.delta_text)
+                        if chunk.delta_text:
+                            text_accumulator += chunk.delta_text
+                            yield AgentEvent("text_delta", chunk.delta_text)
 
-                for tc in chunk.tool_calls:
-                    idx = tc.index
-                    if idx not in tool_calls_accumulator:
-                        tool_calls_accumulator[idx] = {
-                            "id": tc.id or f"tc_{idx}_{time.time()}",
-                            "name": tc.name or "",
-                            "arguments": "",
-                        }
-                    if tc.name:
-                        tool_calls_accumulator[idx]["name"] = tc.name
-                    if tc.arguments_delta:
-                        tool_calls_accumulator[idx]["arguments"] += tc.arguments_delta
+                        for tc in chunk.tool_calls:
+                            idx = tc.index
+                            if idx not in tool_calls_accumulator:
+                                tool_calls_accumulator[idx] = {
+                                    "id": tc.id or f"tc_{idx}_{time.time()}",
+                                    "name": tc.name or "",
+                                    "arguments": "",
+                                }
+                            if tc.name:
+                                tool_calls_accumulator[idx]["name"] = tc.name
+                            if tc.arguments_delta:
+                                tool_calls_accumulator[idx]["arguments"] += tc.arguments_delta
 
+                        if self._stop_requested.is_set():
+                            break
+                except Exception as exc:
+                    # Provider raised instead of yielding an error chunk.
+                    error_accumulator += f"\n[Unexpected Error from {self.provider.display_name}: {exc}]\n"
+                    yield AgentEvent("text_delta", f"\n[Unexpected Error from {self.provider.display_name}: {exc}]\n")
+
+                if not error_accumulator or self._stop_requested.is_set():
+                    break  # clean stream (or user stop) — proceed with what we have
+
+                # Transient stream failure → retry the whole model call.
+                err_first_line = (error_accumulator.strip().splitlines() or ["unknown provider error"])[0][:300]
+                if is_fatal_provider_error(error_accumulator) or stream_attempt >= provider_retries:
+                    break
+                stream_attempt += 1
+                delay = provider_base_delay * (2 ** (stream_attempt - 1))
+                yield AgentEvent("provider_retry", {
+                    "provider": self.provider.display_name,
+                    "attempt": stream_attempt,
+                    "max_retries": provider_retries,
+                    "delay": round(delay, 1),
+                    "error": err_first_line,
+                })
+                yield AgentEvent("text_delta", (
+                    f"\n[Harness] {self.provider.display_name} stream failed — retrying in "
+                    f"{delay:g}s (attempt {stream_attempt}/{provider_retries}); partial output above was discarded.\n"
+                ))
+                # Interruptible backoff: a user Ctrl-C cancels the retry wait.
+                deadline = time.time() + delay
+                while time.time() < deadline:
+                    if self._stop_requested.is_set():
+                        break
+                    time.sleep(min(0.5, max(0.0, deadline - time.time())))
                 if self._stop_requested.is_set():
                     break
 
@@ -935,6 +1001,16 @@ class HarnessAgent:
                 result = self.tool_registry.execute(tool_name, args, self.mode)
                 tools_executed_this_turn += 1
 
+                # ── Tool image routing ────────────────────────────────
+                # Tools such as browser_screenshot embed
+                # [harness:image:/abs/path.png] markers in their text result.
+                # Strip them before anything else sees the text, then route the
+                # files: real image blocks for vision models, a vision-fallback
+                # (VFB) text description for non-vision models when one is
+                # configured, else a plain path reference.
+                from harness.core.attachments import split_tool_images
+                result, tool_image_paths = split_tool_images(result)
+
                 # Replay any subagent/swarm activity that occurred during this tool
                 # call from the main thread so the renderer stays single-threaded.
                 for etype, edata in self.subagent_orchestrator.drain_events():
@@ -947,11 +1023,43 @@ class HarnessAgent:
                 result = sanitize_tool_output(result)
 
                 # Append tool result to history
+                tool_content: Any = result
+                if tool_image_paths:
+                    image_blocks = [{"type": "image", "path": p} for p in tool_image_paths]
+                    try:
+                        turn_spec = self.provider.get_model_spec(self.session.model)
+                        can_see = bool(getattr(turn_spec, "supports_vision", False))
+                    except Exception:
+                        can_see = False
+                    if can_see or self.config.force_media_attach:
+                        tool_content = [{"type": "text", "text": result}, *image_blocks]
+                        yield AgentEvent("attachment", {
+                            "files": [{"type": "image", "path": p} for p in tool_image_paths],
+                            "tool": tool_name,
+                        })
+                    elif self.config.vfb_provider.strip():
+                        vfb_events, vfb_description, vfb_err = self._describe_tool_images(
+                            image_blocks, question=user_prompt
+                        )
+                        for vfb_ev in vfb_events:
+                            yield vfb_ev
+                        if vfb_description:
+                            tool_content = (
+                                result
+                                + "\n\n[Vision fallback description of the screenshot(s):\n"
+                                + vfb_description + "\n]"
+                            )
+                        else:
+                            tool_content = (
+                                result
+                                + f"\n[Note: the screenshot could not be described ({vfb_err}); "
+                                + "the file path above can be opened manually.]"
+                            )
                 tool_result_msg = {
                     "role": "tool",
                     "tool_call_id": v["id"],
                     "name": tool_name,
-                    "content": result,
+                    "content": tool_content,
                 }
                 self.session.messages.append(tool_result_msg)
                 self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, tool_result_msg)

@@ -74,14 +74,44 @@ class AnthropicProvider(BaseProvider):
                         })
                 anthropic_msgs.append({"role": "assistant", "content": blocks or ""})
             elif role == "tool":
-                anthropic_msgs.append({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": msg.get("tool_call_id", ""),
-                        "content": content or "",
-                    }]
-                })
+                content = msg.get("content")
+                if isinstance(content, list):
+                    # Multimodal tool result (e.g. browser_screenshot): text and
+                    # image blocks are legal inside an Anthropic tool_result.
+                    tr_blocks = []
+                    for b in content:
+                        if not isinstance(b, dict):
+                            tr_blocks.append({"type": "text", "text": str(b)})
+                            continue
+                        t = b.get("type")
+                        if t == "text":
+                            tr_blocks.append({"type": "text", "text": b.get("text", "")})
+                            continue
+                        mime, b64 = b64_payload_for_block(b)
+                        if t == "image" and mime and b64:
+                            tr_blocks.append({
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": mime, "data": b64},
+                            })
+                        else:
+                            tr_blocks.append({"type": "text", "text": f"[{t} file unavailable: {b.get('path', '')}]"})
+                    anthropic_msgs.append({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": msg.get("tool_call_id", ""),
+                            "content": tr_blocks or "",
+                        }]
+                    })
+                else:
+                    anthropic_msgs.append({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": msg.get("tool_call_id", ""),
+                            "content": content or "",
+                        }]
+                    })
         return anthropic_msgs
 
     def stream_chat(

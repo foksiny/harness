@@ -31,6 +31,17 @@ PLAN_MODE_BLOCKED_TOOLS: Set[str] = {
     "edit_file",
     "replace_file_content",
     "execute_python",   # Unless explicitly marked read-only
+    # Browser mutations: PLAN may observe the web (navigate/read/screenshot)
+    # but not interact with it.
+    "browser_launch",
+    "browser_click",
+    "browser_type",
+    "browser_press_key",
+    "browser_scroll",
+    "browser_evaluate",
+    "browser_tab",
+    "browser_navigation",
+    "browser_close",
 }
 
 # Dangerous shell command prefixes blocked in PLAN mode

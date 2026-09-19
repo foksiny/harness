@@ -23,6 +23,23 @@ class LLMChunk:
     finish_reason: Optional[str] = None
     usage: Optional[Dict[str, int]] = None
 
+
+# Errors that retrying cannot fix (auth, bad request, missing model, context
+# overflow). The agent consults this before spending a retry on a dead request.
+_FATAL_PROVIDER_ERROR_MARKERS = (
+    "no api key", "api key", "authentication", "unauthorized", "forbidden",
+    "permission denied", "invalid api key", "invalid request",
+    "unsupported parameter", "unsupported", "not found", "does not exist",
+    "invalid model", "model_not_found", "context length", "too long",
+    "quota", "billing", "deactivated", "input image", "moderation",
+)
+
+
+def is_fatal_provider_error(error_text: str) -> bool:
+    """True when a provider error is permanent — retrying is pointless."""
+    low = (error_text or "").lower()
+    return any(m in low for m in _FATAL_PROVIDER_ERROR_MARKERS)
+
 class BaseProvider(ABC):
     """Abstract interface for all LLM providers."""
 

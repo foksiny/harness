@@ -36,6 +36,7 @@ class ToolRegistry:
         ask_user_handler: Optional[Any] = None,
         learning_manager: Optional[LearningManager] = None,
         learning_enabled: bool = True,
+        browser_enabled: bool = True,
     ):
         self.permission_manager = permission_manager or PermissionManager()
         self.todo_manager = todo_manager or TodoManager()
@@ -43,7 +44,9 @@ class ToolRegistry:
         self.skills_manager = skills_manager or SkillsManager()
         self.learning_manager = learning_manager or LearningManager()
         self.learning_enabled = learning_enabled
+        self.browser_enabled = browser_enabled
         self.tools: Dict[str, Tool] = {}
+        self.browser_manager = None
         self._register_default_tools(ask_user_handler)
 
     def _register_default_tools(self, ask_user_handler: Optional[Any] = None):
@@ -105,6 +108,21 @@ class ToolRegistry:
             self.register(MeshReadMessagesTool())
         except Exception:
             pass
+
+        # Web control (Chrome via CDP). All browser_* tools share one
+        # BrowserManager so the launched session persists across tool calls.
+        if self.browser_enabled:
+            try:
+                from harness.browser.manager import BrowserManager
+                from harness.tools.browser import register_browser_tools
+                self.browser_manager = BrowserManager()
+                register_browser_tools(
+                    self,
+                    controller_factory=self.browser_manager.controller_factory,
+                    permission_manager=self.permission_manager,
+                )
+            except Exception:
+                self.browser_manager = None
 
     def register(self, tool: Tool) -> None:
         self.tools[tool.name] = tool

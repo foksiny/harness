@@ -85,6 +85,7 @@ class HarnessConfig:
     force_media_attach: bool = False # Force-attach images even when the model isn't flagged vision-capable
     vfb_provider: str = "" # Vision fallback provider; when set, degraded media get described via this provider
     vfb_model: str = ""    # Vision fallback model; empty => the provider's default model
+    browser_enabled: bool = True   # Register the browser_* web-control tools (Chrome via CDP)
     # API server — disabled by default for `harness`, requires explicit args to activate
     server_enabled: bool = False     # Enable HTTP API server (requires --server / serve / --host/--port)
     server_host: str = "127.0.0.1"    # Bind host: 127.0.0.1 (local) or 0.0.0.0 (VPS)

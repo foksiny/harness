@@ -308,12 +308,119 @@ class TerminalRenderer:
         )
         self.console.print(p)
 
+    def _highlight_prompt(self, text: str) -> Text:
+        """Highlight file paths and commands in user prompt text."""
+        # Common shell commands to highlight
+        commands = {
+            "ls", "cat", "grep", "find", "cd", "mkdir", "rm", "cp", "mv",
+            "git", "python", "python3", "node", "npm", "npx", "yarn", "pnpm",
+            "cargo", "go", "rustc", "javac", "java", "dotnet", "php", "ruby",
+            "perl", "lua", "bash", "sh", "zsh", "fish", "ps", "kill", "top",
+            "htop", "df", "du", "free", "uname", "whoami", "pwd", "echo",
+            "printf", "sed", "awk", "cut", "sort", "uniq", "wc", "head",
+            "tail", "less", "more", "vim", "vi", "nano", "emacs", "code",
+            "curl", "wget", "ssh", "scp", "rsync", "tar", "gzip", "gunzip",
+            "zip", "unzip", "make", "cmake", "ninja", "docker", "kubectl",
+            "terraform", "ansible", "vagrant", "pytest", "jest", "mocha",
+            "cargo test", "go test", "npm test", "mvn test", "gradle test",
+        }
+        
+        # Regex patterns for file paths
+        # Matches: absolute paths, relative paths, tilde paths, filenames with extensions
+        file_path_pattern = re.compile(
+            r'(?:'
+            r'(?:^|[\s\({\[\'"`])'  # Start of string or delimiter
+            r'(?:'
+            r'(?:~?/|\.\.?/)'  # ~/ or ./ or ../
+            r'(?:[\w\-]+/)*'  # directory components
+            r'[\w\-.]+\.[\w\-]+'  # filename with extension
+            r'|'
+            r'(?:~?/|\.\.?/)'  # ~/ or ./ or ../
+            r'(?:[\w\-]+/)*'  # directory components
+            r'[\w\-]+'  # directory or file without extension
+            r'|'
+            r'(?:[\w\-]+/)+[\w\-.]+\.[\w\-]+'  # relative path with dirs: src/utils/helper.js
+            r'|'
+            r'[\w\-]+\.[\w\-]+'  # simple filename with extension
+            r')'
+            r')'
+        )
+        
+        # Command pattern - matches known commands at start of line or after separators
+        cmd_pattern = re.compile(
+            r'(?:^|[;&|`$\s({[])'
+            r'(' + '|'.join(re.escape(c) for c in sorted(commands, key=len, reverse=True)) + r')'
+            r'(?=\s|$)'
+        )
+        
+        result = Text()
+        last_end = 0
+        
+        # First pass: find all file paths
+        file_matches = list(file_path_pattern.finditer(text))
+        
+        # Second pass: find all commands
+        cmd_matches = list(cmd_pattern.finditer(text))
+        
+        # Combine and sort all matches
+        all_matches = []
+        for m in file_matches:
+            # Only highlight the path part, not the delimiter
+            start = m.start()
+            if text[start] in ' ([{\'"`':
+                start += 1
+            all_matches.append((start, m.end(), 'file', text[start:m.end()]))
+        for m in cmd_matches:
+            start = m.start()
+            if text[start] in ';&|`$ ([{\\[':
+                start += 1
+            all_matches.append((start, m.start(1), 'cmd_delim', text[m.start():start]))
+            all_matches.append((m.start(1), m.end(1), 'command', m.group(1)))
+        
+        # Sort by position and remove overlaps (prefer file paths over commands)
+        all_matches.sort(key=lambda x: (x[0], 0 if x[2] == 'file' else 1))
+        
+        filtered_matches = []
+        for match in all_matches:
+            start, end, mtype, content = match
+            # Check for overlap with existing matches
+            overlap = False
+            for existing in filtered_matches:
+                if not (end <= existing[0] or start >= existing[1]):
+                    overlap = True
+                    break
+            if not overlap:
+                filtered_matches.append(match)
+        
+        filtered_matches.sort(key=lambda x: x[0])
+        
+        # Build the highlighted text
+        for start, end, mtype, content in filtered_matches:
+            if start > last_end:
+                result.append(text[last_end:start])
+            if mtype == 'file':
+                # Highlight file paths with background - use theme text on accent for visibility
+                result.append(content, style=f"bold {self.theme.text} on {self.theme.accent}")
+            elif mtype == 'command':
+                # Highlight commands with background - use theme text on success for visibility
+                result.append(content, style=f"bold {self.theme.text} on {self.theme.success}")
+            elif mtype == 'cmd_delim':
+                result.append(content)
+            last_end = end
+        
+        if last_end < len(text):
+            result.append(text[last_end:])
+        
+        return result
+
     def render_user_prompt(self, text: str):
-        """Render user input with OpenCode vertical cyan bar style."""
+        """Render user input with OpenCode vertical cyan bar style and highlighted files/commands."""
         lines = text.strip().split("\n")
         self.console.print()
         for line in lines:
-            self.console.print(f"  [bold cyan]│[/bold cyan] [bold white]{line}[/bold white]")
+            highlighted = self._highlight_prompt(line)
+            self.console.print(f"  [bold cyan]│[/bold cyan] ", end="")
+            self.console.print(highlighted)
         self.console.print()
 
     def render_turn_capsule(self, mode: str, model: str, duration: float):
@@ -404,7 +511,7 @@ class TerminalRenderer:
             items.append(ModalItem(
                 id=sid,
                 title=stitle,
-                subtitle=f"{sid[:8]} · {model_tag} ({turns} turns)",
+                subtitle=f"{sid} · {model_tag} ({turns} turns)",
                 category="Recent Sessions",
                 is_active=is_active,
                 payload=sid,
@@ -510,9 +617,11 @@ class TerminalRenderer:
         self.console.print()
 
     def print_sessions_modal(self, sessions: list, active_id: Optional[str] = None):
-        """Render session picker modal matching OpenCode's Sessions dialog."""
-        card_w = min(max(60, 76), max(50, (self.console.width or 80) - 4))
-        inner_w = card_w - 6
+        """Render session list (sidebar style). Full session ids are shown —
+        users copy them straight into /session resume|delete|rename; only the
+        title ever shrinks, and only when the line would wrap."""
+        term_w = self.console.width or 80
+        budget = max(40, term_w - 2)  # lines are printed with a 2-space indent
 
         lines = [
             "[dim]Search[/dim]",
@@ -528,16 +637,17 @@ class TerminalRenderer:
                 model_tag = s.get("model", "")
                 is_active = (active_id and sid == active_id) or False
                 if is_active:
-                    label = f"  ▶ {stitle} ({sid[:8]}) · {model_tag}"
-                    if len(label) > inner_w:
-                        label = label[:inner_w - 1] + "…"
-                    pad = max(0, inner_w - len(label))
+                    fixed = len(sid) + len(model_tag) + 11
+                    max_title = max(10, budget - fixed)
+                    t = stitle if len(stitle) <= max_title else stitle[:max_title - 1] + "…"
+                    label = f"  ▶ {t} ({sid}) · {model_tag}"
+                    pad = max(0, budget - len(label))
                     lines.append(f"[black on #f5a623]{label}{' ' * pad}[/black on #f5a623]")
                 else:
-                    label = f"  {stitle} ({sid[:8]} · {model_tag})"
-                    if len(label) > inner_w:
-                        stitle = stitle[:max(10, inner_w - 24)] + "…"
-                    lines.append(f"  [white]{stitle}[/white] [dim]({sid[:8]} · {model_tag})[/dim]")
+                    fixed = len(sid) + len(model_tag) + 8
+                    max_title = max(10, budget - fixed)
+                    t = stitle if len(stitle) <= max_title else stitle[:max_title - 1] + "…"
+                    lines.append(f"  [white]{t}[/white] [dim]({sid} · {model_tag})[/dim]")
 
         # Same /models|/sidebar style: borderless sidebar-style lines, no card,
         # no panel, no interactive modal. Drops the leading "Search" + card blank.
@@ -941,9 +1051,8 @@ class TerminalRenderer:
 
     def _build_sidebar_lines(self, agent, queue=None) -> list[str]:
         lines = []
+        # Full session id — users copy it for /session resume|delete|rename.
         sid = agent.session.id if (agent and agent.session) else "New session"
-        if len(sid) > 16:
-            sid = sid[:16]
         now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ")
         lines.append(f"[bold white]{sid}[/bold white] [dim]- {now_str}[/dim]")
         lines.append("")
@@ -1529,6 +1638,18 @@ class TerminalRenderer:
             self._finish_markdown()
             self._finish_thinking()
             self.console.print(f"\n[{self.theme.error}]❌ {data.get('message', 'Unknown error')}[/{self.theme.error}]\n")
+
+        elif etype == "provider_retry":
+            self._finish_markdown()
+            self._finish_thinking()
+            self.console.print(
+                f"\n[{self.theme.warning}]🔁 {data.get('provider', 'Provider')} stream failed — "
+                f"retrying in {data.get('delay', 0)}s "
+                f"(attempt {data.get('attempt', 1)}/{data.get('max_retries', 1)})[/{self.theme.warning}]"
+            )
+            err = str(data.get("error", "")).strip()
+            if err:
+                self.console.print(f"  [{self.theme.muted}]{err}[/{self.theme.muted}]")
 
         elif etype == "security_warning":
             self.console.print(f"\n[{self.theme.warning}]🛡️ {data.get('message', '')}[/{self.theme.warning}]")

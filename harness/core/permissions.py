@@ -102,13 +102,20 @@ class PermissionManager:
 
         if self.level == PermissionLevel.SECURE:
             # In Secure mode, read tools are auto-approved; writes/execs always require prompt
-            if action_type in ("read_file", "list_dir", "search", "web_search", "todo", "ask_user"):
+            if action_type in ("read_file", "list_dir", "search", "web_search", "todo", "ask_user", "browser_read"):
                 return True
             prompt_msg = f"Secure Mode requires approval for [{action_type}]: {details.get('summary', str(details))}"
             return self._request_user_approval(prompt_msg, details)
 
         # DEFAULT mode: Balanced
-        if action_type in ("read_file", "list_dir", "search", "web_search", "todo", "ask_user"):
+        if action_type in ("read_file", "list_dir", "search", "web_search", "todo", "ask_user", "browser_read"):
+            return True
+
+        if action_type == "browser":
+            # Controlling the harness-owned ephemeral Chrome instance (fresh
+            # throwaway profile, no user data/extensions). Reads and in-page
+            # interaction are low-stakes here, so DEFAULT approves without
+            # prompting; SECURE above still prompts.
             return True
 
         if action_type in ("write_file", "edit_file"):

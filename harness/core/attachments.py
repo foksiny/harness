@@ -57,6 +57,36 @@ _MIME_TABLE = {
 
 _DATA_URI_RE = re.compile(r"^data:([a-z0-9.+-]+/[a-z0-9.+-]+);base64,")
 
+# Marker a tool embeds in its *text* result to hand an image file to the
+# model, e.g. ``[harness:image:/home/u/.harness/screenshots/shot.png]``.
+# The agent strips these markers before the result reaches the transcript and
+# routes the files either as real image content blocks (vision models) or
+# through the vision-fallback describer (non-vision models + VFB configured).
+TOOL_IMAGE_MARKER_RE = re.compile(r"^\[harness:image:(?P<path>[^\]\r\n]+)\]\s*$", re.MULTILINE)
+
+
+def split_tool_images(text: str) -> Tuple[str, List[str]]:
+    """Split ``[harness:image:path]`` markers out of a tool result.
+
+    Returns ``(clean_text, [paths])`` — the text with marker lines removed
+    (blank-line collapsed) and the referenced image paths in order. Only
+    paths that point at an existing file are returned; stale markers are
+    dropped silently.
+    """
+    if not text or "[harness:image:" not in text:
+        return text, []
+    paths: List[str] = []
+
+    def _collect(m: "re.Match") -> str:
+        p = (m.group("path") or "").strip()
+        if p and os.path.isfile(p):
+            paths.append(p)
+        return ""
+
+    clean = TOOL_IMAGE_MARKER_RE.sub(_collect, text)
+    clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+    return clean, paths
+
 
 def media_kind_for_path(path: str) -> Optional[str]:
     """Return ``image`` / ``video`` for a recognized media extension, else None."""

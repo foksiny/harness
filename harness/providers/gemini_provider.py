@@ -71,13 +71,32 @@ class GeminiProvider(BaseProvider):
                         })
                 contents.append({"role": "model", "parts": parts})
             elif role == "tool":
-                parts.append({
-                    "functionResponse": {
-                        "name": msg.get("name", "tool"),
-                        "response": {"output": content},
-                    }
-                })
-                contents.append({"role": "user", "parts": parts})
+                if isinstance(content, list):
+                    # functionResponse carries text; attached media rides along
+                    # as a synthetic follow-up user content with inline_data.
+                    texts = [b.get("text", "") for b in content
+                             if isinstance(b, dict) and b.get("type") == "text"]
+                    media = [b for b in content
+                             if isinstance(b, dict) and b.get("type") in ("image", "video")]
+                    parts.append({
+                        "functionResponse": {
+                            "name": msg.get("name", "tool"),
+                            "response": {"output": "\n".join(t for t in texts if t) or ""},
+                        }
+                    })
+                    contents.append({"role": "user", "parts": parts})
+                    if media:
+                        caption = f"[Image(s) attached by tool '{msg.get('name', 'tool')}' — see below.]"
+                        contents.append({"role": "user", "parts": self._user_parts(
+                            [{"type": "text", "text": caption}, *media])})
+                else:
+                    parts.append({
+                        "functionResponse": {
+                            "name": msg.get("name", "tool"),
+                            "response": {"output": content},
+                        }
+                    })
+                    contents.append({"role": "user", "parts": parts})
         return contents
 
     def stream_chat(

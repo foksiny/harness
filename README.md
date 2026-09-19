@@ -45,12 +45,15 @@
    - Falls back to `~/.harness/api_keys.json` with `0600` permissions (owner read/write only) when OS keychain is unavailable.
    - Automatic one-time migration from legacy plaintext `config.json`.
    - Environment variables remain the first-priority source (ideal for CI/CD).
-- 🌐 **Browser Automation (CDP)**:
-  - Full browser control via Chrome DevTools Protocol — works with any Chromium-based browser (Chrome, Edge, Brave, Zen, Opera, Vivaldi) and Firefox.
+- 🌐 **Web Control (Chrome via CDP)**:
+  - Full browser control via Chrome DevTools Protocol — Chrome/Chromium only, zero heavy dependencies (raw websockets, no Playwright/Selenium).
   - Visual overlay banner injected into every page shows the user exactly what the agent is doing (navigating, clicking, typing, etc.) with icons and color-coded status.
-  - 11 tools: `browser_launch`, `browser_navigate`, `browser_click`, `browser_type`, `browser_press_key`, `browser_scroll`, `browser_screenshot`, `browser_evaluate`, `browser_get_page_info`, `browser_tab`, `browser_navigation`.
-  - Auto-detects installed browser, supports headless mode, tab management, full-page screenshots, and JavaScript evaluation.
-  - PLAN mode blocks all browser mutations; `browser_screenshot` and `browser_get_page_info` remain read-only and allowed everywhere.
+  - 12 tools: `browser_launch`, `browser_navigate`, `browser_click`, `browser_type`, `browser_press_key`, `browser_scroll`, `browser_screenshot`, `browser_evaluate`, `browser_get_page_info`, `browser_tab`, `browser_navigation`, `browser_close`.
+  - Anti-bot hardening: `--disable-blink-features=AutomationControlled` at launch plus `navigator.webdriver`/`window.chrome`/plugins shims injected into every new document, so sites like Google News don't flag the agent as automation (no login/CAPTCHA bypassing — just no self-identifying).
+  - Agent mouse indicator: a glowing cyan ring glides to whatever the model is clicking/typing/hovering with a click ripple and element flash, so a human can follow along in the live window (hidden from screenshots; the status overlay banner is hidden there too).
+  - Auto-detects Chrome, opens a real visible window by default (pass `headless: true` to run in the background; automatic Xvfb on headless servers when available), tab management, full-page screenshots, and JavaScript evaluation.
+  - Screenshots are saved to disk and shown to the model directly: vision models receive the image, non-vision models get a written description from the vision-fallback (`vfb_provider`/`vfb_model`) when one is configured.
+  - PLAN mode blocks all browser mutations; `browser_navigate`, `browser_screenshot` and `browser_get_page_info` remain allowed everywhere.
 - 🎯 **Three Operational Modes**:
   - `Plan`: Purely investigatory & architectural mode. Prevents filesystem mutations and destructive commands.
   - `Build`: Full developer mode. Atomic code edits, file creation, command execution, and test runs.

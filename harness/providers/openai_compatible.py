@@ -177,6 +177,12 @@ class OpenAICompatibleProvider(BaseProvider):
             if "name" in msg and msg["name"]:
                 item["name"] = msg["name"]
             payload.append(item)
+            if media:
+                caption = f"[Image(s) attached by tool '{msg.get('name', 'tool')}' — see below.]"
+                payload.append({
+                    "role": "user",
+                    "content": _openai_content_blocks([{"type": "text", "text": caption}, *media]),
+                })
         return payload
 
     @staticmethod
@@ -196,7 +202,7 @@ class OpenAICompatibleProvider(BaseProvider):
     def _is_retryable_error_message(self, msg: str, code: Any = None) -> bool:
         low = (msg or "").lower()
         # Check explicit retryable phrases
-        if any(x in low for x in ("rate limit", "too many requests", "overloaded", "try again", "timeout", "temporarily unavailable", "service unavailable", "bad gateway", "gateway timeout", "internal server error")):
+        if any(x in low for x in ("rate limit", "too many requests", "overloaded", "try again", "timeout", "timed out", "connection reset", "connection aborted", "connection refused", "temporarily unavailable", "service unavailable", "bad gateway", "gateway timeout", "internal server error")):
             return True
         # Check code
         try:
