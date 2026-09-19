@@ -59,6 +59,9 @@ class TerminalRenderer:
         self._is_thinking_visible = False
         self._thinking_start_time: float = 0.0
         self._thinking_line_chars: int = 0
+        # Hold window for a newline-less thinking line (mirrors
+        # _md_hold_start): 0.0 = nothing held.
+        self._thinking_hold_start: float = 0.0
         self._md_buffer: str = ""
         self._md_stream_started: bool = False
         self._md_last_blank: bool = False
@@ -1152,6 +1155,7 @@ class TerminalRenderer:
         self._is_thinking_visible = False
         self._current_thinking = ""
         self._thinking_buffer = ""
+        self._thinking_hold_start = 0.0
 
     def _thinking_print_block(self, chunk: str):
         """Print one thinking block with prefix - mirrors _md_print_block structure.
@@ -1193,6 +1197,44 @@ class TerminalRenderer:
             return
         chunk, self._thinking_buffer = buf[:idx], buf[idx + 1:]
         self._thinking_print_block(chunk)
+        if self._thinking_buffer:
+            # Remainder starts a fresh hold window from this paint.
+            self._thinking_hold_start = time.time()
+        else:
+            self._thinking_hold_start = 0.0
+
+    def _thinking_flush_with_fallback(self):
+        """Flush completed thinking lines instantly; never hold partial text.
+
+        Fast path is the per-line flush above. Fallback: when a single line
+        runs longer than _MD_FLUSH_MAX_AGE or _MD_FLUSH_MAX_SIZE without a
+        newline — a minutes-long stall that then dumps one huge chunk — print
+        it up to the last word boundary so tokens stay visible. The
+        continuation paints on the next prefixed line; _finish_thinking
+        flushes the tail. Still append-only: no cursor repositioning.
+        """
+        self._thinking_flush_completed()
+        if not self._thinking_buffer:
+            self._thinking_hold_start = 0.0
+            return
+        now = time.time()
+        if self._thinking_hold_start == 0.0:
+            # First sight of this line — stamp it and give the line fast
+            # path a chance on the next delta before falling back.
+            self._thinking_hold_start = now
+            return
+        if now - self._thinking_hold_start < _MD_FLUSH_MAX_AGE and len(self._thinking_buffer) < _MD_FLUSH_MAX_SIZE:
+            return
+        buf = self._thinking_buffer
+        cut = buf.rfind(" ")
+        if cut <= 0:
+            cut = len(buf)  # single huge word: hard-cut rather than stall
+        else:
+            cut += 1  # keep the trailing space so the next line starts clean
+        chunk, self._thinking_buffer = buf[:cut], buf[cut:]
+        self._thinking_print_block(chunk)
+        # Remainder (if any) starts a fresh hold window from this paint.
+        self._thinking_hold_start = now if self._thinking_buffer else 0.0
 
     def _md_print_block(self, chunk: str):
         """Print one markdown block with whole-document spacing semantics.
@@ -1538,9 +1580,10 @@ class TerminalRenderer:
                     "\n  [bold yellow]Thought[/bold yellow] [dim]· streaming...[/dim]"
                 )
                 self._is_thinking_visible = True
-            # Append-only streaming: print each completed block once (like text_delta).
-            # No per-char repaints / cursor repositioning - see _thinking_flush_completed.
-            self._thinking_flush_completed()
+            # Append-only streaming: print each completed line at once, with a
+            # time/size fallback so a newline-less line never stalls the UI.
+            # No per-char repaints / cursor repositioning - see _thinking_flush_with_fallback.
+            self._thinking_flush_with_fallback()
 
         elif etype == "text_delta":
             self._finish_thinking()

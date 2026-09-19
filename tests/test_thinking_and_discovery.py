@@ -175,6 +175,65 @@ class TestThinkingAndDiscovery(unittest.TestCase):
         self.assertFalse(renderer._is_thinking_visible)
         self.assertEqual(renderer._current_thinking, '')
 
+    def test_thinking_newlineless_stream_paints_via_fallback(self):
+        """A newline-less thinking line must still paint mid-stream.
+
+        Regression test: previously a thinking line with no ``\\n`` was held
+        back for minutes and dumped as one huge chunk. The fallback prints
+        up to the last word boundary once the hold exceeds the age limit.
+        The age gate is forced to zero here for a deterministic (sleepless)
+        test; production uses _MD_FLUSH_MAX_AGE seconds.
+        """
+        import io
+        from rich.console import Console
+        import harness.tui.terminal as term_mod
+        old_age = term_mod._MD_FLUSH_MAX_AGE
+        term_mod._MD_FLUSH_MAX_AGE = 0.0
+        try:
+            renderer = TerminalRenderer('cyberpunk')
+            renderer.console = Console(file=io.StringIO(), force_terminal=True, width=80)
+            renderer.render_agent_event(AgentEvent('reasoning_delta', 'alpha beta '))
+            out1 = renderer.console.file.getvalue()
+            # First sight only stamps the hold window — header shows, text held.
+            self.assertIn('Thought', out1)
+            self.assertNotIn('alpha', out1)
+            self.assertEqual(renderer._thinking_buffer, 'alpha beta ')
+
+            renderer.render_agent_event(AgentEvent('reasoning_delta', 'gamma delta'))
+            out2 = renderer.console.file.getvalue()
+            # Fallback cut at the last word boundary: 'delta' stays buffered.
+            self.assertIn('alpha beta gamma', out2)
+            self.assertNotIn('delta', out2.split('alpha beta gamma')[-1])
+            self.assertEqual(renderer._thinking_buffer, 'delta')
+
+            # Back to the real age gate: a fresh remainder waits again.
+            term_mod._MD_FLUSH_MAX_AGE = old_age
+            renderer.render_agent_event(AgentEvent('reasoning_delta', ' epsilon\ntail'))
+            out3 = renderer.console.file.getvalue()
+            # Newline flushes the completed line; 'tail' stays buffered.
+            self.assertIn('delta epsilon', out3)
+            self.assertEqual(renderer._thinking_buffer, 'tail')
+        finally:
+            term_mod._MD_FLUSH_MAX_AGE = old_age
+
+    def test_thinking_single_huge_word_hard_cuts(self):
+        """A spaceless thinking blob must paint rather than stall forever."""
+        import io
+        from rich.console import Console
+        import harness.tui.terminal as term_mod
+        old_age = term_mod._MD_FLUSH_MAX_AGE
+        term_mod._MD_FLUSH_MAX_AGE = 0.0
+        try:
+            renderer = TerminalRenderer('cyberpunk')
+            renderer.console = Console(file=io.StringIO(), force_terminal=True, width=80)
+            renderer.render_agent_event(AgentEvent('reasoning_delta', 'supercali'))
+            renderer.render_agent_event(AgentEvent('reasoning_delta', 'fragilistic'))
+            out = renderer.console.file.getvalue()
+            self.assertIn('supercalifragilistic', out)
+            self.assertEqual(renderer._thinking_buffer, '')
+        finally:
+            term_mod._MD_FLUSH_MAX_AGE = old_age
+
     def test_markdown_stream_flushes_each_segment_once(self):
         renderer = TerminalRenderer('cyberpunk')
         chunks = [
