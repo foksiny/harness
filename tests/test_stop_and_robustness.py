@@ -181,11 +181,12 @@ class TestSuperModeContinuation(AgentStepTestCase):
                          "streak must reset on tool work so later narration is challenged again")
 
 
-class TestEmptyStreamRetryCap(AgentStepTestCase):
+class TestEmptyStreamRetryBudget(AgentStepTestCase):
 
-    def test_empty_stream_error_gets_exactly_one_fast_retry(self):
-        """NIM 'stream ended without a response': one 2s retry, then give up —
-        never the full 5s→10s→20s exponential chain."""
+    def test_empty_stream_errors_get_full_retry_budget(self):
+        """NIM 'stream ended without a response': retried up to
+        provider_max_retries (3) with a short fixed 2s delay — not capped at
+        a single retry, and never the 5s→10s→20s exponential chain."""
         error_script = [LLMChunk(
             delta_text="\n[Error from NIM: stream ended without a response]\n",
             finish_reason="error",
@@ -193,17 +194,49 @@ class TestEmptyStreamRetryCap(AgentStepTestCase):
         cfg = HarnessConfig()
         cfg.provider = "mock"
         cfg.provider_max_retries = 3
+        cfg.provider_retry_base_delay = 1.0  # irrelevant here: empty-stream uses 2s fixed
         agent = HarnessAgent(cfg)
-        agent.provider = ScriptedProvider([error_script, error_script, error_script])
+        agent.provider = ScriptedProvider([error_script] * 4)
         agent.is_running = True
 
         events = list(agent.step("hello"))
-        self.assertEqual(len(agent.provider.call_history), 2,
-                         "empty-stream errors must retry exactly once (got "
+        self.assertEqual(len(agent.provider.call_history), 4,
+                         "1 initial call + 3 retries for empty-stream errors (got "
                          f"{len(agent.provider.call_history)} calls)")
+        retries = [e for e in events if e.type == "provider_retry"]
+        self.assertEqual(len(retries), 3)
+        self.assertEqual([r.data["attempt"] for r in retries], [1, 2, 3])
+        self.assertTrue(all(r.data["max_retries"] == 3 for r in retries),
+                         "empty-stream retries must honor provider_max_retries")
+        self.assertTrue(all(r.data["delay"] == 2.0 for r in retries),
+                         "empty-stream retries use a short fixed 2s delay")
         deltas = "".join(e.data for e in events if e.type == "text_delta")
         self.assertIn("returned an error; ending this turn", deltas)
-        self.assertIn("retrying once in 2s", deltas)
+        self.assertIn("(attempt 1/3)", deltas)
+
+    def test_empty_stream_recovers_on_a_later_retry(self):
+        """Two consecutive empty streams then a healthy response: the turn
+        completes rather than dying after the first failure."""
+        err = [LLMChunk(
+            delta_text="\n[Error from NIM: stream ended without a response]\n",
+            finish_reason="error",
+        )]
+        ok = [LLMChunk(delta_text="recovered"), LLMChunk(finish_reason="stop")]
+        cfg = HarnessConfig()
+        cfg.provider = "mock"
+        cfg.provider_max_retries = 3
+        agent = HarnessAgent(cfg)
+        agent.provider = ScriptedProvider([err, err, ok])
+        agent.is_running = True
+
+        events = list(agent.step("hello"))
+        self.assertEqual(len(agent.provider.call_history), 3)
+        self.assertTrue(any(e.type == "turn_complete" for e in events))
+        self.assertFalse(any("returned an error" in str(getattr(e, "data", ""))
+                             for e in events if e.type == "text_delta"))
+        finals = [m for m in agent.session.messages
+                  if m.get("role") == "assistant" and m.get("content")]
+        self.assertEqual(finals[-1]["content"], "recovered")
 
 
 class TestExplorationWatchdog(AgentStepTestCase):

@@ -13,6 +13,35 @@ from typing import Optional, List, Dict, Any, Tuple
 from harness.core.modes import Mode
 from harness.core.permissions import PermissionLevel
 
+# Marker used by the /ultra-goal command. When a user prompt starts with this
+# prefix, the model is put into full ULTRA-GOAL mode for that turn.
+ULTRA_GOAL_MARKER = "ULTRA-GOAL:"
+
+ULTRA_GOAL_PROTOCOL = """## 🏆 ULTRA-GOAL PROTOCOL (FULL PRODUCT / APP / GAME ENGINEERING):
+You are executing an ULTRA-GOAL: deliver a REAL, RUNNABLE application or game. Operate at maximum engineering capability. The user already answered the requirements interview — honor it exactly and fill only genuine gaps.
+
+### Operating stance
+- The deliverable is a real, working artifact. NO stubs, placeholder returns, or "TODO: implement" unless truly unavoidable — and every TODO you leave must be implemented before you finish.
+- Announce completion ONLY when the artifact builds, runs, and its key paths are verified.
+
+### Mandatory phase machine (work the phases in order; on any verification failure, iterate the loop)
+0. **DISCOVER**: Skills-first (`list_skills` / `read_skill`). Inspect the workspace and any existing code, check git state, and detect available runtimes with `run_command`. Recall prior lessons via `learn_recall`.
+1. **PLAN & DESIGN**: Define architecture, the full module/file map (each file: responsibility, dependencies, interfaces), data model, and UX/UI structure (games: engine, scene/entity layout, game loop; apps: framework, routes, state, persistence). Create `todo_create` milestones per phase and file group. `checkpoint create`.
+2. **INTERVIEW (mandatory — YOU are the one who asks, not the harness)**: Before writing ANY files, ask the user what they want via `ask_user`, one question at a time, adapting to their answers. Cover at minimum: what kind of thing (app vs game vs tool), tech/language stack, target platform, must-have features, how much scope/polish, and where the project should live. Only ask what is NOT already clear from their request — don't re-interrogate decisions they already made. Accept a numbered option, a custom write-in, or Enter for their recommended default. This conversation is what lets you build EXACTLY what they want, so do not skip or shortcut it; if the user aborts the questions, proceed with sensible defaults, state that in your plan, and move on. Feed what you learn into your todo plan.
+3. **GENERATE VIA SWARMS** (mandatory for multi-file builds): decompose the work into independent modules/files and dispatch `spawn_swarm` with multiple `coder` agents in PARALLEL (add `researcher`/`tester`/`reviewer` when useful). Every agent task must be self-contained: goal, the EXACT file paths it owns (never shared with another agent — no races), the interfaces/contracts other agents can rely on, acceptance criteria, and expected output format. Use `background=false` per wave to wait for reports; read the mailbox with `swarm_read_messages` and fold results in.
+4. **INTEGRATE YOURSELF**: wire everything together — entrypoint, composition root, imports, config, routes, scene wiring, assets — so the subsystems actually connect. Never trust the swarm for integration.
+5. **VERIFY LIKE A CI SYSTEM**: create and run tests (yourself or a `tester` subagent), build, then LAUNCH the artifact (`run_command` / `execute_python`; a headless smoke test is fine for GUI/games). Fix every failure iteratively: reproduce → diagnose → patch → re-run. Include a smoke/launch check as part of the deliverable.
+6. **REVIEW & POLISH**: `reviewer` subagent (or `git_diff`) for security, edge cases, and performance; write a README with run instructions and entrypoints; record reusable lessons via `learn_record`.
+
+### Use everything, with everything
+- Pair tools deliberately: filesystem + `run_command` for verification; wave 1 researchers/planners + wave 2 coders + wave 3 tester/reviewers; `git_status`/`git_diff` to track progress; checkpoints before risky refactors; browser tools only when live web verification genuinely helps.
+- Prefer parallel `coder` swarms building distinct files over sequential single-file edits — that is how full apps and games get generated fast and correctly. Do the glue and the hardest 20% yourself.
+- Never spawn agents that write to the same file concurrently; give each agent its own files or sequence them.
+
+### Finish contract
+When verified, call `finish` with: (1) what was built and where (file tree), (2) how to run it, (3) test/build/launch verification evidence, (4) what you would do next. Your final answer must include run instructions.
+
+"""
 SYSTEM_PROMPT_BASE = """You are Harness, the world's most capable, disciplined, and reliable Agentic AI Coding Assistant and Engineering Harness.
 Your mission is to solve complex engineering, architecture, and programming tasks with exceptional precision, speed, and safety.
 
@@ -132,6 +161,7 @@ class SystemPromptBuilder:
         learned_lessons: str = "",
         degrade_verbose: bool = False,
         mesh_info: str = "",
+        ultra_goal: bool = False,
     ) -> str:
         """Assemble the system prompt.
 
@@ -174,6 +204,10 @@ class SystemPromptBuilder:
         # 2. Swarm protocol (active via config flag or SUPER mode)
         if swarm_enabled:
             sections.append(SWARM_PROTOCOL)
+
+        # 2b. Ultra-Goal protocol (full app/game engineering mission)
+        if ultra_goal:
+            sections.append(ULTRA_GOAL_PROTOCOL)
 
         # 2. Permission Guidance
         sections.append("\n## PERMISSION PROFILE:")

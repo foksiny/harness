@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from typing import List, Optional, Iterator
 
 SLASH_COMMANDS = [
-    "/help", "/goal", "/stop", "/queue", "/sidebar", "/status", "/mode", "/perm", "/theme",
+    "/help", "/goal", "/ultra-goal", "/ultragoal", "/stop", "/queue", "/sidebar", "/status", "/mode", "/perm", "/theme",
     "/provider", "/model", "/models", "/config", "/keys", "/setup",
     "/effort", "/todo", "/skills", "/reload", "/mcp", "/update", "/discord",
     "/subagent", "/agents", "/agent", "/back",
@@ -22,6 +22,8 @@ SLASH_COMMANDS = [
 COMMAND_DESCRIPTIONS = {
     "/help": "Show commands, hotkeys & usage reference",
     "/goal": "Launch autonomous goal loop in Super Mode",
+    "/ultra-goal": "Full app/game build: interview + swarm file generation + verified delivery",
+    "/ultragoal": "Alias of /ultra-goal",
     "/stop": "Interrupt running task (or '/stop all' to clear queue)",
     "/queue": "View, drop, pause, resume or clear prompt queue",
     "/sidebar": "Toggle or view workspace, session & model sidebar",

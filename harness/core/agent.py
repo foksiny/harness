@@ -10,7 +10,7 @@ import time
 from typing import Dict, Any, List, Optional, Callable, Generator, Tuple, Iterator
 from harness.core.modes import Mode
 from harness.core.permissions import PermissionManager, PermissionLevel
-from harness.core.prompt import SystemPromptBuilder
+from harness.core.prompt import SystemPromptBuilder, ULTRA_GOAL_MARKER
 from harness.core.compaction import Compactor, TokenStats
 from harness.core.context_budget import ContextBudget, PRESSURE_WARNING, PRESSURE_CRITICAL
 from harness.core.todo import TodoManager, TaskItem
@@ -1014,40 +1014,17 @@ class HarnessAgent:
                 if not error_accumulator or self._stop_requested.is_set():
                     break  # clean stream (or user stop) — proceed with what we have
 
-                # Transient stream failure → retry the whole model call.
+                # Transient stream failure → retry the whole model call. Both
+                # ordinary mid-stream deaths and "empty 200 stream" responses
+                # share the same retry budget (provider_max_retries, default 3);
+                # the empty-stream variant just uses a short fixed delay
+                # instead of the full exponential chain.
                 err_first_line = (error_accumulator.strip().splitlines() or ["unknown provider error"])[0][:300]
                 if is_fatal_provider_error(error_accumulator) or stream_attempt >= provider_retries:
                     break
-                # An endpoint that answered 200 but streamed zero usable data
-                # ("stream ended without a response") is usually persistent for
-                # this exact payload — NIM does this under load. Cap it at ONE
-                # fast retry instead of the full exponential chain; hammering
-                # it with 5s→10s→20s backoffs just wastes the user's time.
-                if is_empty_stream_error(error_accumulator):
-                    if stream_attempt >= 1:
-                        break
-                    stream_attempt += 1
-                    yield AgentEvent("provider_retry", {
-                        "provider": self.provider.display_name,
-                        "attempt": stream_attempt,
-                        "max_retries": 1,
-                        "delay": 2.0,
-                        "error": err_first_line,
-                    })
-                    yield AgentEvent("text_delta", (
-                        f"\n[Harness] {self.provider.display_name} returned an empty stream — "
-                        f"retrying once in 2s.\n"
-                    ))
-                    deadline = time.time() + 2.0
-                    while time.time() < deadline:
-                        if self._stop_requested.is_set():
-                            break
-                        time.sleep(min(0.25, max(0.0, deadline - time.time())))
-                    if self._stop_requested.is_set():
-                        break
-                    continue
+                empty_stream = is_empty_stream_error(error_accumulator)
                 stream_attempt += 1
-                delay = provider_base_delay * (2 ** (stream_attempt - 1))
+                delay = 2.0 if empty_stream else provider_base_delay * (2 ** (stream_attempt - 1))
                 yield AgentEvent("provider_retry", {
                     "provider": self.provider.display_name,
                     "attempt": stream_attempt,
@@ -1055,10 +1032,16 @@ class HarnessAgent:
                     "delay": round(delay, 1),
                     "error": err_first_line,
                 })
-                yield AgentEvent("text_delta", (
-                    f"\n[Harness] {self.provider.display_name} stream failed — retrying in "
-                    f"{delay:g}s (attempt {stream_attempt}/{provider_retries}); partial output above was discarded.\n"
-                ))
+                if empty_stream:
+                    yield AgentEvent("text_delta", (
+                        f"\n[Harness] {self.provider.display_name} returned an empty stream — "
+                        f"retrying in {delay:g}s (attempt {stream_attempt}/{provider_retries}).\n"
+                    ))
+                else:
+                    yield AgentEvent("text_delta", (
+                        f"\n[Harness] {self.provider.display_name} stream failed — retrying in "
+                        f"{delay:g}s (attempt {stream_attempt}/{provider_retries}); partial output above was discarded.\n"
+                    ))
                 # Interruptible backoff: a user Ctrl-C cancels the retry wait.
                 deadline = time.time() + delay
                 while time.time() < deadline:
@@ -1519,6 +1502,7 @@ class HarnessAgent:
             learned_lessons=learned_lessons,
             degrade_verbose=degrade_verbose,
             mesh_info=mesh_info,
+            ultra_goal=str(current_query or "").startswith(ULTRA_GOAL_MARKER),
         )
 
     def _summarize_block(self, messages: List[Dict[str, Any]]) -> Optional[str]:

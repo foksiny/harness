@@ -67,6 +67,7 @@ class HarnessConfig:
     mode: str = "build"              # plan, build, super
     permission: str = "default"      # secure, default, full
     thinking_effort: str = "high"    # off, low, medium, high, or token count
+    terminal_show_thinking: bool = False  # Stream raw reasoning text in the terminal; when off, show a compact Thinking indicator + token count instead
     theme: str = "cyberpunk"
     auto_compact: bool = True
     compact_threshold: float = 0.75  # Arm compaction at 75% of context window

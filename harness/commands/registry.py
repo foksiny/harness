@@ -163,6 +163,8 @@ class CommandRegistry:
     def _register_builtins(self):
         self.register("help", self._cmd_help, "Show help directory of all commands and options.")
         self.register("goal", self._cmd_goal, "Initiate Super Mode autonomous loop toward an explicit goal.")
+        self.register("ultra-goal", self._cmd_ultra_goal, "Full app/game build: agent interviews you first, then max-capability Super Mode mission with parallel subagent/squad generation and enforced verification.")
+        self.register("ultragoal", self._cmd_ultra_goal, "Alias of /ultra-goal: full app/game build mission.")
         self.register("stop", self._cmd_stop, "Interrupt running agent turn (use '/stop all' to also clear queue).")
         self.register("queue", self._cmd_queue, "View, drop, pause, resume, or clear prompt execution queue.")
         self.register("sidebar", self._cmd_sidebar, "Toggle or view workspace, session, model, and context sidebar.")
@@ -215,6 +217,44 @@ class CommandRegistry:
         else:
             with no_echo_stdin():
                 for ev in ctx.agent.step(f"AUTONOMOUS GOAL: {ctx.args}"):
+                    ctx.renderer.render_agent_event(ev)
+
+    def _cmd_ultra_goal(self, ctx: CommandContext):
+        """/ultra-goal: maximum-capability full app/game build.
+
+        Upside of /goal with a dedicated ULTRA-GOAL system prompt. The AGENT
+        interviews the user via ask_user before writing any files, then runs
+        mandatory parallel swarm file generation and enforced verification
+        (deps + tests + launch) before finishing.
+        """
+        if not ctx.args:
+            ctx.renderer.print_warning(
+                "Usage: /ultra-goal <high-level objective to build as a full app/game>"
+            )
+            return
+
+        from harness.commands.ultra_goal import (
+            build_ultra_goal_brief,
+            print_ultra_goal_banner,
+        )
+
+        # Launch the ULTRA-GOAL mission in Super Mode; the agent interviews
+        # the user itself (ask_user) so it knows exactly what is wanted.
+        ctx.agent.set_mode(Mode.SUPER)
+        brief = build_ultra_goal_brief(ctx.args)
+        print_ultra_goal_banner(ctx.renderer, ctx.args)
+        _publish_state({
+            "mode": "super",
+            "goal": ctx.args,
+            "ultra_goal": True,
+        }, ctx)
+        _publish_output(f"🎯 ULTRA-GOAL ACTIVATED — Full Build: {ctx.args}", ctx)
+
+        if ctx.queue is not None:
+            ctx.queue.enqueue(brief, mode="super")
+        else:
+            with no_echo_stdin():
+                for ev in ctx.agent.step(brief):
                     ctx.renderer.render_agent_event(ev)
 
     def _cmd_stop(self, ctx: CommandContext):

@@ -394,7 +394,7 @@ def _resolve_ask_response(raw: str, req: dict, renderer: TerminalRenderer) -> st
 
 def run_interactive(agent: HarnessAgent):
     """Run interactive terminal session with concurrent prompt & queue support."""
-    renderer = TerminalRenderer(agent.config.theme)
+    renderer = TerminalRenderer(agent.config.theme, show_thinking=agent.config.terminal_show_thinking)
     commands = CommandRegistry()
     input_handler = InputHandler()
     queue = ExecutionQueue()

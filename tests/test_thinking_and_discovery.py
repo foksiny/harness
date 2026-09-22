@@ -190,7 +190,7 @@ class TestThinkingAndDiscovery(unittest.TestCase):
         old_age = term_mod._MD_FLUSH_MAX_AGE
         term_mod._MD_FLUSH_MAX_AGE = 0.0
         try:
-            renderer = TerminalRenderer('cyberpunk')
+            renderer = TerminalRenderer('cyberpunk', show_thinking=True)
             renderer.console = Console(file=io.StringIO(), force_terminal=True, width=80)
             renderer.render_agent_event(AgentEvent('reasoning_delta', 'alpha beta '))
             out1 = renderer.console.file.getvalue()
@@ -224,7 +224,7 @@ class TestThinkingAndDiscovery(unittest.TestCase):
         old_age = term_mod._MD_FLUSH_MAX_AGE
         term_mod._MD_FLUSH_MAX_AGE = 0.0
         try:
-            renderer = TerminalRenderer('cyberpunk')
+            renderer = TerminalRenderer('cyberpunk', show_thinking=True)
             renderer.console = Console(file=io.StringIO(), force_terminal=True, width=80)
             renderer.render_agent_event(AgentEvent('reasoning_delta', 'supercali'))
             renderer.render_agent_event(AgentEvent('reasoning_delta', 'fragilistic'))
@@ -233,6 +233,40 @@ class TestThinkingAndDiscovery(unittest.TestCase):
             self.assertEqual(renderer._thinking_buffer, '')
         finally:
             term_mod._MD_FLUSH_MAX_AGE = old_age
+
+    def test_thinking_hidden_mode_shows_indicator_not_content(self):
+        """Default (show_thinking=False) prints a compact indicator and the
+        final token count, never the raw reasoning text."""
+        import io
+        from rich.console import Console
+
+        renderer = TerminalRenderer('cyberpunk', show_thinking=False)
+        renderer.console = Console(file=io.StringIO(), force_terminal=True, width=80)
+
+        renderer.render_agent_event(AgentEvent('reasoning_delta', 'secret reasoning alpha '))
+        renderer.render_agent_event(AgentEvent('reasoning_delta', 'gamma\n'))
+        out1 = renderer.console.file.getvalue()
+        self.assertIn('Thinking', out1)
+        self.assertNotIn('alpha', out1)
+        self.assertNotIn('gamma', out1)
+        # Reasoning text is still tallied for the final token count.
+        self.assertEqual(renderer._current_thinking, 'secret reasoning alpha gamma\n')
+        self.assertEqual(renderer._thinking_buffer, '')
+
+        renderer.render_agent_event(AgentEvent('text_delta', 'Final answer.'))
+        renderer.finish_markdown()
+        out2 = renderer.console.file.getvalue()
+        self.assertIn('Final answer.', out2)
+        self.assertNotIn('alpha', out2)
+        self.assertNotIn('gamma', out2)
+        # Closing stats report the thinking duration and token count.
+        self.assertIn('Thought', out2)
+        self.assertIn('tokens', out2)
+
+    def test_thinking_hidden_mode_is_default(self):
+        """TerminalRenderer() matches the product default: reasoning is hidden."""
+        renderer = TerminalRenderer('cyberpunk')
+        self.assertFalse(renderer._show_thinking)
 
     def test_markdown_stream_flushes_each_segment_once(self):
         renderer = TerminalRenderer('cyberpunk')

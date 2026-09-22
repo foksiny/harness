@@ -51,9 +51,12 @@ class DynamicStdout:
 class TerminalRenderer:
     """Renders rich UI elements with custom themes."""
 
-    def __init__(self, theme_name: str = "cyberpunk"):
+    def __init__(self, theme_name: str = "cyberpunk", show_thinking: Optional[bool] = None):
         self.console = Console(file=DynamicStdout())
         self.theme: Theme = get_theme(theme_name)
+        # When False (default) only a compact "Thinking…" indicator and the
+        # final token count are shown; the raw reasoning text is never printed.
+        self._show_thinking = False if show_thinking is None else show_thinking
         self._current_thinking: str = ""
         self._thinking_buffer: str = ""
         self._is_thinking_visible = False
@@ -1578,16 +1581,25 @@ class TerminalRenderer:
             self._finish_markdown()
             text = str(data)
             self._current_thinking += text
-            self._thinking_buffer += text
             if not self._is_thinking_visible:
                 self._thinking_start_time = time.time()
-                self.console.print(
-                    "\n  [bold yellow]Thought[/bold yellow] [dim]· streaming...[/dim]"
-                )
+                if self._show_thinking:
+                    self.console.print(
+                        "\n  [bold yellow]Thought[/bold yellow] [dim]· streaming...[/dim]"
+                    )
+                else:
+                    # Compact indicator only: never print the raw reasoning
+                    # text, just note that the model is thinking. The final
+                    # token count is reported by _finish_thinking.
+                    c = self.theme.thinking
+                    self.console.print(f"\n  [bold {c}]◆ Thinking…[/bold {c}]")
                 self._is_thinking_visible = True
+            if not self._show_thinking:
+                return
             # Append-only streaming: print each completed line at once, with a
             # time/size fallback so a newline-less line never stalls the UI.
             # No per-char repaints / cursor repositioning - see _thinking_flush_with_fallback.
+            self._thinking_buffer += text
             self._thinking_flush_with_fallback()
 
         elif etype == "text_delta":

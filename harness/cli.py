@@ -116,7 +116,7 @@ def handle_subcommands(args: list) -> bool:
 
     sub = args[0].lower()
     config = load_config()
-    renderer = TerminalRenderer(config.theme)
+    renderer = TerminalRenderer(config.theme, show_thinking=config.terminal_show_thinking)
 
     if sub == "setup":
         run_setup_wizard(config, renderer)
@@ -424,7 +424,7 @@ def main():
     # Check if user is behind upstream commits and warn them
     is_behind, commits_behind = check_git_behind()
     if is_behind:
-        renderer = TerminalRenderer(config.theme)
+        renderer = TerminalRenderer(config.theme, show_thinking=config.terminal_show_thinking)
         renderer.print_warning(
             f"You are {commits_behind} commit{'s' if commits_behind > 1 else ''} behind the upstream branch.\n"
             f"  Tip: Run '{get_git_update_command()}' to update to the latest version."
@@ -501,11 +501,11 @@ def main():
     )
 
     # Start API server (best-effort, no peer mesh)
-    _maybe_start_server(config, agent=agent, renderer=TerminalRenderer(config.theme) if not full_prompt else None)
+    _maybe_start_server(config, agent=agent, renderer=TerminalRenderer(config.theme, show_thinking=config.terminal_show_thinking) if not full_prompt else None)
 
     if full_prompt:
         # Non-interactive / Headless single-shot execution
-        renderer = TerminalRenderer(config.theme)
+        renderer = TerminalRenderer(config.theme, show_thinking=config.terminal_show_thinking)
         if agent.mode == Mode.SUPER:
             renderer.print_super_banner(full_prompt)
 
