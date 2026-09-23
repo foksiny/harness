@@ -10,6 +10,7 @@ from harness.core.modes import Mode
 from harness.config import HarnessConfig
 from harness.core.agent import HarnessAgent
 from harness.providers.base import LLMChunk
+from harness.providers.mock_provider import MockProvider
 
 class TestSkills(unittest.TestCase):
 
@@ -120,19 +121,43 @@ class TestSkills(unittest.TestCase):
         seeded = [m for m in agent.session.messages if m.get("role") == "tool" and m.get("name") == "list_skills"]
         self.assertEqual(len(seeded), 1)
 
-    def test_empty_response_retries_then_gives_up(self):
+    def test_empty_response_never_ends_turn_until_model_answers(self):
         cfg = HarnessConfig()
         cfg.provider = "mock"
         cfg.thinking_effort = "off"
         cfg.learning_enabled = False
-        from harness.providers.mock_provider import MockProvider
-        mock = MockProvider(responses=[LLMChunk()])
+
+        class EmptyThenTextProvider(MockProvider):
+            def __init__(self, empties_first):
+                super().__init__(responses=[])
+                self._empties_left = empties_first
+
+            def stream_chat(self, messages, model=None, thinking_effort="high", tools=None, system_prompt=None, **kwargs):
+                self.call_history.append({
+                    "messages": list(messages),
+                    "model": model,
+                    "tools": tools,
+                    "system_prompt": system_prompt,
+                })
+                if self._empties_left:
+                    self._empties_left -= 1
+                    yield LLMChunk()
+                else:
+                    yield LLMChunk(delta_text="Here is my final answer.", finish_reason="stop")
+
+        mock = EmptyThenTextProvider(empties_first=3)
         agent = HarnessAgent(cfg)
         agent.provider = mock
         events = list(agent.step("respond to me"))
+
+        # An empty reply must not auto-stop the turn: all 4 provider calls ran
+        # (3 empty + 1 answering) and the turn only ended once text arrived.
+        self.assertEqual(len(mock.call_history), 4)
         nudges = [m for m in agent.session.messages if str(m.get("content", "")).startswith("[SYSTEM]: Your previous response was empty")]
-        self.assertEqual(len(nudges), 2)
-        self.assertTrue(any(ev.type == "text_delta" and "empty response" in str(ev.data) for ev in events))
+        self.assertEqual(len(nudges), 3)
+        self.assertTrue(any(ev.type == "text_delta" and "Here is my final answer." in str(ev.data) for ev in events))
+        self.assertTrue(any(ev.type == "turn_complete" for ev in events))
+        self.assertTrue(any(ev.type == "step_end" and ev.data.get("complete") for ev in events))
 
     def test_provider_receives_list_skills_result(self):
         from harness.providers.mock_provider import MockProvider

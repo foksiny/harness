@@ -28,6 +28,12 @@ from harness.sysinfo import get_ram_usage_mb
 _MD_FLUSH_MAX_AGE = 2.0
 _MD_FLUSH_MAX_SIZE = 2000
 
+# Live thinking indicator: the running token estimate is rewritten IN PLACE on
+# its own line (carriage return, never cursor-up), throttled to these limits so
+# a fast reasoning stream repaints at most a few times a second.
+_THINKING_INDICATOR_MIN_INTERVAL = 0.75
+_THINKING_INDICATOR_TOKEN_STEP = 128
+
 
 class DynamicStdout:
     """Delegates writes to the active sys.stdout, supporting prompt_toolkit.patch_stdout."""
@@ -65,6 +71,12 @@ class TerminalRenderer:
         # Hold window for a newline-less thinking line (mirrors
         # _md_hold_start): 0.0 = nothing held.
         self._thinking_hold_start: float = 0.0
+        # Live indicator state: True while the streaming count line is still the
+        # last printed line (safe to rewrite in place), plus throttling bookkeeping
+        # for the real-time token counter.
+        self._thinking_header_open: bool = False
+        self._thinking_indicator_last_refresh: float = 0.0
+        self._thinking_indicator_last_tokens: int = 0
         self._md_buffer: str = ""
         self._md_stream_started: bool = False
         self._md_last_blank: bool = False
@@ -518,11 +530,15 @@ class TerminalRenderer:
             stitle = s.get("title") or "New session"
             model_tag = s.get("model", "")
             turns = s.get("turns", 0)
+            ws_name = os.path.basename((s.get("workspace") or "").rstrip("/\\")) or ""
+            tags = f"{sid} · {model_tag} ({turns} turns)"
+            if ws_name:
+                tags += f" · {ws_name}"
             is_active = (active_id and sid == active_id) or False
             items.append(ModalItem(
                 id=sid,
                 title=stitle,
-                subtitle=f"{sid} · {model_tag} ({turns} turns)",
+                subtitle=tags,
                 category="Recent Sessions",
                 is_active=is_active,
                 payload=sid,
@@ -646,19 +662,22 @@ class TerminalRenderer:
                 sid = s.get("id", "")
                 stitle = s.get("title") or "New session"
                 model_tag = s.get("model", "")
+                # Workspace folder the session belongs to (basename only).
+                ws_name = os.path.basename((s.get("workspace") or "").rstrip("/\\"))
+                meta = f"{sid} · {model_tag}" + (f" · {ws_name}" if ws_name else "")
                 is_active = (active_id and sid == active_id) or False
                 if is_active:
-                    fixed = len(sid) + len(model_tag) + 11
+                    fixed = len(meta) + 8
                     max_title = max(10, budget - fixed)
                     t = stitle if len(stitle) <= max_title else stitle[:max_title - 1] + "…"
-                    label = f"  ▶ {t} ({sid}) · {model_tag}"
+                    label = f"  ▶ {t} ({meta})"
                     pad = max(0, budget - len(label))
                     lines.append(f"[black on #f5a623]{label}{' ' * pad}[/black on #f5a623]")
                 else:
-                    fixed = len(sid) + len(model_tag) + 8
+                    fixed = len(meta) + 8
                     max_title = max(10, budget - fixed)
                     t = stitle if len(stitle) <= max_title else stitle[:max_title - 1] + "…"
-                    lines.append(f"  [white]{t}[/white] [dim]({sid} · {model_tag})[/dim]")
+                    lines.append(f"  [white]{t}[/white] [dim]({meta})[/dim]")
 
         # Same /models|/sidebar style: borderless sidebar-style lines, no card,
         # no panel, no interactive modal. Drops the leading "Search" + card blank.
@@ -1141,10 +1160,59 @@ class TerminalRenderer:
         """Flush the trailing partial markdown block on turn end or interrupt."""
         self._finish_markdown()
 
+    def _thinking_token_estimate(self) -> int:
+        # Cheap deterministic ~4 chars/token estimate; shared by the live counter
+        # and the closing stats line so the two never disagree.
+        return max(1, len(self._current_thinking) // 4)
+
+    def _thinking_print_header(self) -> None:
+        """(Re)draw the thinking header line with the running token estimate.
+
+        The header line is rewritten IN PLACE (leading carriage return, no newline)
+        so the count updates in real time without ever touching the lines below it.
+        Callers must ensure nothing has been printed since the last header draw.
+        """
+        tokens = self._thinking_token_estimate()
+        if self._show_thinking:
+            self.console.print(
+                f"\r  [bold yellow]Thought[/bold yellow] [dim]· streaming… (~{tokens:,} tokens)[/dim]",
+                end="",
+                highlight=False,
+            )
+        else:
+            c = self.theme.thinking
+            self.console.print(
+                f"\r  [bold {c}]◆ Thinking…[/bold {c}] [dim](~{tokens:,} tokens)[/dim]",
+                end="",
+                highlight=False,
+            )
+        self._thinking_header_open = True
+        self._thinking_indicator_last_tokens = tokens
+        self._thinking_indicator_last_refresh = time.time()
+
+    def _thinking_refresh_header(self, force: bool = False) -> None:
+        """Throttled in-place token-count refresh on the live thinking header."""
+        if not self._is_thinking_visible or not self._thinking_header_open:
+            return
+        now = time.time()
+        tokens = self._thinking_token_estimate()
+        if not force and (
+            now - self._thinking_indicator_last_refresh < _THINKING_INDICATOR_MIN_INTERVAL
+            and tokens - self._thinking_indicator_last_tokens < _THINKING_INDICATOR_TOKEN_STEP
+        ):
+            return
+        self._thinking_print_header()
+
     def _finish_thinking(self):
         """Close out the thinking display panel and show timing stats."""
         if not self._is_thinking_visible:
             return
+        # Close the live header line: refresh one last time, then move to the
+        # next line so buffered blocks / stats never overwrite the counter.
+        if self._thinking_header_open:
+            self._thinking_refresh_header(force=True)
+            self.console.print()
+            self._thinking_header_open = False
         # Flush any buffered thinking blocks (append-only, like markdown).
         if self._thinking_buffer:
             self._thinking_print_block(self._thinking_buffer)
@@ -1154,7 +1222,7 @@ class TerminalRenderer:
             el_str = f"{int(elapsed * 1000)}ms"
         else:
             el_str = f"{elapsed:.1f}s"
-        t_tokens = max(1, len(self._current_thinking) // 4)
+        t_tokens = self._thinking_token_estimate()
         self.console.print()  # newline after streamed thinking text
         self.console.print(
             f"  [bold yellow]Thought[/bold yellow] [dim]· {el_str} (~{t_tokens:,} tokens)[/dim]"
@@ -1164,6 +1232,9 @@ class TerminalRenderer:
         self._current_thinking = ""
         self._thinking_buffer = ""
         self._thinking_hold_start = 0.0
+        self._thinking_header_open = False
+        self._thinking_indicator_last_refresh = 0.0
+        self._thinking_indicator_last_tokens = 0
 
     def _thinking_print_block(self, chunk: str):
         """Print one thinking block with prefix - mirrors _md_print_block structure.
@@ -1174,6 +1245,11 @@ class TerminalRenderer:
         """
         if not chunk:
             return
+        # Close the live "streaming…" header before printing real reasoning text
+        # so the in-place token counter never clobbers the content below it.
+        if self._thinking_header_open:
+            self.console.print()
+            self._thinking_header_open = False
         # Strip only trailing blank handling handled by caller; print each line
         # with the thinking sidebar prefix. Preserve empty lines.
         lines = chunk.splitlines()
@@ -1583,17 +1659,14 @@ class TerminalRenderer:
             self._current_thinking += text
             if not self._is_thinking_visible:
                 self._thinking_start_time = time.time()
-                if self._show_thinking:
-                    self.console.print(
-                        "\n  [bold yellow]Thought[/bold yellow] [dim]· streaming...[/dim]"
-                    )
-                else:
-                    # Compact indicator only: never print the raw reasoning
-                    # text, just note that the model is thinking. The final
-                    # token count is reported by _finish_thinking.
-                    c = self.theme.thinking
-                    self.console.print(f"\n  [bold {c}]◆ Thinking…[/bold {c}]")
+                self._thinking_hold_start = 0.0
+                self._thinking_header_open = False
+                # Draw the live header now — it carries the running token
+                # estimate that refreshes in place with each delta.
+                self._thinking_print_header()
                 self._is_thinking_visible = True
+            else:
+                self._thinking_refresh_header()
             if not self._show_thinking:
                 return
             # Append-only streaming: print each completed line at once, with a

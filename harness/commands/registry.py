@@ -2,6 +2,7 @@
 Slash Command Registry and Handlers for Harness.
 Handles /goal, /mode, /perm, /theme, /models, /config, /keys, /setup, /skills, /mcp, /session.
 """
+import os
 import sys
 import time
 from typing import Dict, Any, List, Optional, Callable
@@ -189,7 +190,7 @@ class CommandRegistry:
         self.register("agent", self._cmd_agent, "Inspect a subagent: /agent <id>.")
         self.register("back", self._cmd_back, "Return to the parent agent view (ESC).")
         self.register("compact", self._cmd_compact, "Trigger manual conversation context compaction.")
-        self.register("session", self._cmd_session, "Manage sessions: /session list, create [title], delete <id>, rename <id> <title>, fork [title], resume <id>.")
+        self.register("session", self._cmd_session, "Manage sessions: /session list [all], create [title], delete <id>, rename <id> <title>, fork [title], resume <id>. Sessions are workspace-associated (list shows this folder's; 'all' shows every workspace).")
         self.register("mesh", self._cmd_mesh, "Mesh network: /mesh status, /mesh peers, /mesh send <port> <msg>, /mesh broadcast <msg>.")
         self.register("checkpoint", self._cmd_checkpoint, "Manage checkpoints: /checkpoint list, create [label], undo, redo.")
         self.register("tokens", self._cmd_tokens, "Display live token metrics, context window ratio, and RAM.")
@@ -811,13 +812,19 @@ class CommandRegistry:
         arg = parts[1] if len(parts) > 1 else ""
 
         if action in ("", "list"):
-            sessions = ctx.agent.session_manager.list_all()
+            # Sessions are global but associated to a workspace: list this
+            # workspace's sessions by default; `/session list all` shows every
+            # workspace's history.
+            arg_l = arg.strip().lower()
+            ws = None if arg_l in ("all", "--all", "*") else ctx.agent.session_manager.workspace
+            sessions = ctx.agent.session_manager.list_all(workspace=ws)
             active_id = ctx.agent.session.id if ctx.agent.session else None
             # Mirror /sidebar|/models: always static borderless print, no modal.
             ctx.renderer.print_sessions_modal(sessions, active_id=active_id)
             lines = ["### Saved Sessions:"]
             for s in sessions[:15]:
-                lines.append(f"- `{s['id']}`: {s['title']} ({s['model']}, {s['turns']} turns)")
+                ws_tag = f", {os.path.basename(s['workspace'].rstrip('/\\'))}" if s.get("workspace") else ""
+                lines.append(f"- `{s['id']}`: {s['title']} ({s['model']}, {s['turns']} turns{ws_tag})")
             _publish_output("\n".join(lines), ctx)
         elif action == "create":
             # Explicit session creation — allowed even before a first message.
@@ -901,7 +908,7 @@ class CommandRegistry:
             else:
                 ctx.renderer.print_error(f"Session '{arg}' not found.")
         else:
-            ctx.renderer.print_info("Usage: /session [list|create [title]|delete <id>|rename <id> <title>|fork [title]|resume <id>]")
+            ctx.renderer.print_info("Usage: /session [list [all]|create [title]|delete <id>|rename <id> <title>|fork [title]|resume <id>]")
 
     def _cmd_tokens(self, ctx: CommandContext):
         from harness.sysinfo import get_ram_usage_mb

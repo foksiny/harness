@@ -131,7 +131,9 @@ class MeshHandler(BaseHTTPRequestHandler):
                 agent = server._get_agent()
                 if agent is None:
                     return self._json({"sessions": []}, 200)
-                sessions = agent.session_manager.list_all()
+                # Sessions are global but associated to a workspace — scope the
+                # listing to this server's workspace.
+                sessions = agent.session_manager.list_all(workspace=server.workspace)
                 return self._json({"sessions": sessions[:20]}, 200)
             except Exception as ex:
                 return self._json({"error": str(ex)}, 500)

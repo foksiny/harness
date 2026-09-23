@@ -98,7 +98,7 @@ the bot is launched from, using your configured provider/model.
 - **`/perm <secure|default|full>`** — switch permission profile (synced with the CLI).
 - **`/provider [name]`** — show or switch the active LLM provider (synced).
 - **`/model [name]`** — show or change the current model (synced).
-- **`/session <list|create [title]|resume <id>|fork [title]|delete <id>|rename <id> <title>`** — manage conversation sessions (synced).
+- **`/session <list|all|create [title]|resume <id>|fork [title]|delete <id>|rename <id> <title>>`** — manage conversation sessions (synced; each session is associated to the workspace folder it was created in).
 - **`/todo <list|add|clear>`** — manage the task list.
 - **`/skills [list|reload]`** — view or reload available skills.
 - **`/reload`** — reload config, skills, and permissions from disk.

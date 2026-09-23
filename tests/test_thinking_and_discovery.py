@@ -268,6 +268,30 @@ class TestThinkingAndDiscovery(unittest.TestCase):
         renderer = TerminalRenderer('cyberpunk')
         self.assertFalse(renderer._show_thinking)
 
+    def test_thinking_indicator_updates_token_count_in_real_time(self):
+        """The Thinking indicator rewrites its token estimate as reasonings streams."""
+        import io
+        from rich.console import Console
+
+        renderer = TerminalRenderer('cyberpunk', show_thinking=False)
+        renderer.console = Console(file=io.StringIO(), force_terminal=True, width=120)
+
+        # Each 520-char chunk is ~130 estimated tokens; the in-place refresh
+        # fires on the token-step threshold (no sleeps needed) so the count
+        # visibly climbs: 130 -> 260 -> 390.
+        renderer.render_agent_event(AgentEvent('reasoning_delta', 'y' * 520))
+        out1 = renderer.console.file.getvalue()
+        self.assertIn('◆ Thinking…', out1)
+        self.assertIn('~130 tokens', out1)
+
+        renderer.render_agent_event(AgentEvent('reasoning_delta', 'y' * 520))
+        renderer.render_agent_event(AgentEvent('reasoning_delta', 'y' * 520))
+        out3 = renderer.console.file.getvalue()
+        self.assertIn('~260 tokens', out3)
+        self.assertIn('~390 tokens', out3)
+        # Hidden mode still never leaks the raw reasoning text.
+        self.assertNotIn('y' * 40, out3)
+
     def test_markdown_stream_flushes_each_segment_once(self):
         renderer = TerminalRenderer('cyberpunk')
         chunks = [

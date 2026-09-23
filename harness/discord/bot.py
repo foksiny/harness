@@ -204,8 +204,10 @@ if HAS_DISCORD:
         the same channel from corrupting agent state.
         """
 
-        def __init__(self, config: HarnessConfig):
+        def __init__(self, config: HarnessConfig, workspace: Optional[str] = None):
             self.config = config
+            # Workspace folder this channel's sessions are associated with.
+            self.workspace = workspace or config.discord_workspace or os.getcwd()
             self.agent: Optional[HarnessAgent] = None
             self.lock = threading.Lock()
             # Channels (discord channel IDs) currently running an agent turn.
@@ -219,6 +221,8 @@ if HAS_DISCORD:
                 self.agent = HarnessAgent(
                     config=discord_cfg,
                 )
+                # Sessions stay global but are tagged with the bot's workspace.
+                self.agent.session_manager.workspace = str(Path(self.workspace).resolve())
             return self.agent
 
     # ── Bot class ────────────────────────────────────────────────────────
@@ -881,7 +885,9 @@ if HAS_DISCORD:
                 agent = rt.ensure_agent()
                 action = action.lower().strip()
                 if action == "list":
-                    sessions = agent.session_manager.list_all()
+                    # Sessions are global but associated to a workspace — the bot
+                    # lists its own workspace's sessions (plus untracked ones).
+                    sessions = agent.session_manager.list_all(workspace=self.workspace)
                     if not sessions:
                         await interaction.response.send_message("ℹ️ No saved sessions.")
                         return
@@ -1839,7 +1845,7 @@ if HAS_DISCORD:
         def _get_runtime(self, channel_id: int) -> _ChannelRuntime:
             rt = self._runtimes.get(channel_id)
             if rt is None:
-                rt = _ChannelRuntime(self.config)
+                rt = _ChannelRuntime(self.config, workspace=self.workspace)
                 self._runtimes[channel_id] = rt
             return rt
 

@@ -892,8 +892,8 @@ class HarnessAgent:
                 yield AgentEvent("compaction", stats)
 
         # Loop for tool executions. There is no hard step budget — iteration
-        # stops when the model delivers a text-only answer, calls the `finish`
-        # tool, or the empty-response guard determines the turn is done.
+        # stops when the model delivers a text-only answer or calls the `finish`
+        # tool. Empty responses only get re-prompted, never end the turn.
         current_loop = 0
         empty_streak = 0
         MAX_EMPTY_RETRIES = 2
@@ -1051,56 +1051,46 @@ class HarnessAgent:
                 if self._stop_requested.is_set():
                     break
 
-            # Guard against a model/provider returning a dead-end response (no text, no tool
-            # calls) — common with local reasoning endpoints. Nudge before giving up. If the
-            # provider itself surfaced an error, show it and finish the turn instead.
+            # Guard against a model/provider returning a dead-end response (no text, no
+            # tool calls) — common with local reasoning endpoints. An empty reply NEVER ends
+            # the turn on its own: the model must call the `finish` tool (or deliver a final
+            # text answer) to stop, or the user must interrupt. Keep re-prompting so a silent
+            # endpoint cannot quietly abort a task mid-goal. If the provider itself surfaced
+            # an error, show it and finish the turn instead.
             if not text_accumulator and not tool_calls_accumulator:
-                guard_start = len(self.session.messages)
                 if error_accumulator:
                     yield AgentEvent("text_delta", f"\n[Harness] {self.provider.display_name} returned an error; ending this turn.\n")
                     yield AgentEvent("step_end", {"step": current_loop, "complete": True})
                     break
                 empty_streak += 1
-                # A model that already executed tool work gets at most ONE targeted
-                # nudge before the turn is concluded cleanly — it proved it can
-                # operate, so lingering on a silent endpoint wastes calls.
-                max_retries = 1 if tools_executed_this_turn else MAX_EMPTY_RETRIES
-                if empty_streak <= max_retries:
-                    if tools_executed_this_turn:
-                        nudge = (
-                            "[SYSTEM]: Your previous response was empty. The tool results above were "
-                            "delivered. If your task is complete, immediately write your FINAL ANSWER "
-                            "summary text now; otherwise continue with the next tool call. Do not go silent."
-                        )
-                    else:
-                        nudge = (
-                            "[SYSTEM]: Your previous response was empty. Either continue with concrete "
-                            "work by calling a tool, or — if the task is complete — immediately produce "
-                            "your FINAL ANSWER text now (or call `finish` with your final summary). Do not "
-                            "go silent."
-                        )
-                    self.session.messages.append({
-                        "role": "user",
-                        "content": nudge,
-                    })
-                    yield AgentEvent("step_end", {"step": current_loop, "complete": False})
-                    continue
-                # Second (first post-work) consecutive dead-end: conclude the turn.
                 if tools_executed_this_turn:
-                    yield AgentEvent("text_delta", (
-                        f"\n[Harness] The model completed {tools_executed_this_turn} tool call"
-                        f"{'s' if tools_executed_this_turn != 1 else ''} but did not return a final "
-                        "message. Turn complete.\n"
-                    ))
+                    base_nudge = (
+                        "[SYSTEM]: Your previous response was empty. The tool results above were "
+                        "delivered. If your task is complete, immediately write your FINAL ANSWER "
+                        "summary text now; otherwise continue with the next tool call. Do not go silent."
+                    )
                 else:
-                    last_text = self._last_assistant_text(guard_start)
-                    if last_text:
-                        yield AgentEvent("text_delta", "\n[Harness] The model went quiet — here is its final message:\n")
-                        yield AgentEvent("text_delta", last_text)
-                    else:
-                        yield AgentEvent("text_delta", "[Harness] The model returned an empty response after retries. Please rephrase your request or try again.")
-                yield AgentEvent("step_end", {"step": current_loop, "complete": True})
-                break
+                    base_nudge = (
+                        "[SYSTEM]: Your previous response was empty. Either continue with concrete "
+                        "work by calling a tool, or — if the task is complete — immediately produce "
+                        "your FINAL ANSWER text now (or call `finish` with your final summary). Do not "
+                        "go silent."
+                    )
+                if empty_streak > MAX_EMPTY_RETRIES:
+                    nudge = (
+                        "[SYSTEM]: Your previous response was empty again. This turn cannot end on an "
+                        "empty reply — only you can stop it: call `finish` with your final summary when "
+                        "the task is complete, otherwise keep working with concrete tool calls, or write "
+                        "your FINAL ANSWER text. Do not go silent."
+                    )
+                else:
+                    nudge = base_nudge
+                self.session.messages.append({
+                    "role": "user",
+                    "content": nudge,
+                })
+                yield AgentEvent("step_end", {"step": current_loop, "complete": False})
+                continue
 
             empty_streak = 0
             assistant_msg: Dict[str, Any] = {

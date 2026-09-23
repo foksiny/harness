@@ -87,7 +87,7 @@ class TestFinishTool(unittest.TestCase):
         self.assertEqual(len(finish_results), 1)
         self.assertEqual(finish_results[0]["content"], "All done. Tests passed.")
 
-    def test_empty_after_work_recovers_final_text_gracefully(self):
+    def test_empty_after_work_keeps_nudging_and_ends_on_final_text(self):
         cfg = HarnessConfig()
         cfg.provider = "mock"
         cfg.learning_enabled = False
@@ -111,18 +111,19 @@ class TestFinishTool(unittest.TestCase):
 
         events = list(agent.step("do the work"))
 
-        # The model already executed tool work, so it gets ONE targeted nudge
-        # before the turn is concluded cleanly — never a misleading "went quiet"
-        # message pointing at its pre-tool preamble.
+        # Empty replies never auto-stop the turn: the model is re-prompted on
+        # EVERY silent response and the turn concludes only once it produces
+        # a final answer (or calls `finish`).
         nudges = [m for m in agent.session.messages if str(m.get("content", "")).startswith("[SYSTEM]: Your previous response was empty")]
-        self.assertEqual(len(nudges), 1)
+        self.assertEqual(len(nudges), 3)
         self.assertIn("tool results above were delivered", nudges[0]["content"])
-        self.assertTrue(any(
-            ev.type == "text_delta" and "completed 1 tool call" in str(ev.data) and "did not return a final message" in str(ev.data)
+        # No "gave up"/"went quiet" recovery framing when tool work happened.
+        self.assertFalse(any(ev.type == "text_delta" and "went quiet" in str(ev.data) for ev in events))
+        self.assertFalse(any(
+            ev.type == "text_delta" and "did not return a final message" in str(ev.data)
             for ev in events
         ))
-        # No "went quiet" recovery framing is used when tool work happened.
-        self.assertFalse(any(ev.type == "text_delta" and "went quiet" in str(ev.data) for ev in events))
+        self.assertTrue(any(ev.type == "text_delta" and "done." in str(ev.data) for ev in events))
         self.assertTrue(any(ev.type == "step_end" and ev.data.get("complete") for ev in events))
 
 
