@@ -823,7 +823,8 @@ class CommandRegistry:
             ctx.renderer.print_sessions_modal(sessions, active_id=active_id)
             lines = ["### Saved Sessions:"]
             for s in sessions[:15]:
-                ws_tag = f", {os.path.basename(s['workspace'].rstrip('/\\'))}" if s.get("workspace") else ""
+                ws_base = os.path.basename(str(s.get("workspace") or "").rstrip("/\\"))
+                ws_tag = f", {ws_base}" if ws_base else ""
                 lines.append(f"- `{s['id']}`: {s['title']} ({s['model']}, {s['turns']} turns{ws_tag})")
             _publish_output("\n".join(lines), ctx)
         elif action == "create":
