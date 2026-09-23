@@ -292,6 +292,35 @@ class TestThinkingAndDiscovery(unittest.TestCase):
         # Hidden mode still never leaks the raw reasoning text.
         self.assertNotIn('y' * 40, out3)
 
+    def test_interactive_prompt_mode_never_glues_header_to_input_line(self):
+        """Under the interactive prompt_toolkit frame, the thinking header must
+        NOT write a raw in-place line to the console — that would collide with
+        the input row (the '◆ Thinking… (~92 tokens)│ Ask anything..' artifact).
+        The live count is instead tracked on _live_thinking_tokens for the
+        prompt's bottom toolbar to repaint atomically."""
+        import io
+        from rich.console import Console
+
+        renderer = TerminalRenderer('cyberpunk', show_thinking=False)
+        renderer.interactive_prompt = True
+        renderer.console = Console(file=io.StringIO(), force_terminal=True, width=120)
+
+        renderer.render_agent_event(AgentEvent('reasoning_delta', 'y' * 520))
+        renderer.render_agent_event(AgentEvent('reasoning_delta', 'y' * 520))
+        out = renderer.console.file.getvalue()
+        # No raw carriage-return header may reach the screen while the prompt
+        # frame is active...
+        self.assertNotIn('◆ Thinking…', out)
+        self.assertNotIn('\r', out)
+        # ...but the live counter is still tracked for the toolbar.
+        self.assertTrue(renderer._live_thinking_active)
+        self.assertEqual(renderer._live_thinking_tokens, 260)
+
+        renderer._finish_thinking()
+        # Closing stays clean: no stray header residue left mid-line.
+        self.assertFalse(renderer._live_thinking_active)
+        self.assertEqual(renderer._live_thinking_tokens, 0)
+
     def test_markdown_stream_flushes_each_segment_once(self):
         renderer = TerminalRenderer('cyberpunk')
         chunks = [

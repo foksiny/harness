@@ -645,6 +645,10 @@ def run_interactive(agent: HarnessAgent):
         sync_cursor = None
 
     # ── Main Foreground Prompt Loop ──────────────────────────────────
+    # While this prompt owns the screen, the renderer must not write raw
+    # in-place lines (they collide with the input row) — the live thinking
+    # counter is then surfaced through the bottom toolbar instead.
+    renderer.interactive_prompt = True
     while True:
         _drain_discord_activity(agent, renderer, activity_queue)
         if sync_cursor is not None:
@@ -704,6 +708,12 @@ def run_interactive(agent: HarnessAgent):
                 line1 = '<ansiyellow><b>│ [INPUT REQUIRED]</b></ansiyellow> <style color="#cccccc">Type answer or approval choice</style>'
             else:
                 line1 = f'<ansicyan><b>│</b></ansicyan> <ansicyan><b>{mode_str}</b></ansicyan> <style color="#666666">·</style> <style color="#cccccc">{model_str}</style> <style color="#666666">·</style> <ansiyellow><b>{effort_str}</b></ansiyellow>'
+            # Live thinking counter: the renderer suppresses its raw in-place line
+            # while the prompt frame owns the screen (it would collide with the
+            # input row), and repaints the count atomically through this toolbar.
+            if agent.is_running and getattr(renderer, "_live_thinking_active", False):
+                live_tok = getattr(renderer, "_live_thinking_tokens", 0)
+                line1 += f' <style color="#888888">·</style> <style color="#e8b64c">◆ Thinking… (~{live_tok:,} tok)</style>'
 
             if agent.is_running:
                 status_tag = '<ansigreen><b>[▶ RUNNING]</b></ansigreen> '

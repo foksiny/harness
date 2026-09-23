@@ -24,8 +24,10 @@ from harness.sysinfo import get_ram_usage_mb
 # partial block is never held back longer than _MD_FLUSH_MAX_AGE seconds or
 # past _MD_FLUSH_MAX_SIZE chars — it is printed up to the last safe newline
 # instead. Without this, a long paragraph with no blank line stalls the UI
-# for minutes and then dumps everything at once.
-_MD_FLUSH_MAX_AGE = 2.0
+# and then dumps everything at once. Kept at half a second so prose/code
+# remain visibly real-time even when a model streams a block without blank
+# line separators.
+_MD_FLUSH_MAX_AGE = 0.5
 _MD_FLUSH_MAX_SIZE = 2000
 
 # Live thinking indicator: the running token estimate is rewritten IN PLACE on
@@ -77,6 +79,13 @@ class TerminalRenderer:
         self._thinking_header_open: bool = False
         self._thinking_indicator_last_refresh: float = 0.0
         self._thinking_indicator_last_tokens: int = 0
+        # When the interactive prompt_toolkit frame owns the bottom screen rows,
+        # raw in-place header writes would collide with the input line. In that
+        # mode the live counter is surfaced through the prompt toolbar instead
+        # (see _live_thinking_tokens / _live_thinking_active).
+        self.interactive_prompt: bool = False
+        self._live_thinking_tokens: int = 0
+        self._live_thinking_active: bool = False
         self._md_buffer: str = ""
         self._md_stream_started: bool = False
         self._md_last_blank: bool = False
@@ -1171,8 +1180,24 @@ class TerminalRenderer:
         The header line is rewritten IN PLACE (leading carriage return, no newline)
         so the count updates in real time without ever touching the lines below it.
         Callers must ensure nothing has been printed since the last header draw.
+
+        When the interactive prompt_toolkit frame owns the screen (interactive_prompt
+        is set) the raw write is suppressed: a bare ``\\r`` line on the bottom row
+        collides with the input line and glues the two together (``◆ Thinking…
+        (~92 tokens)│ Ask anything..``). The live count is still tracked on
+        _live_thinking_tokens so the prompt's bottom toolbar can repaint it
+        atomically instead.
         """
         tokens = self._thinking_token_estimate()
+        self._live_thinking_tokens = tokens
+        self._live_thinking_active = True
+        if self.interactive_prompt:
+            # prompt_toolkit repaints the entry/toolbar rows every frame; a raw
+            # write here would land on the input row. Surface via toolbar only.
+            self._thinking_header_open = False
+            self._thinking_indicator_last_tokens = tokens
+            self._thinking_indicator_last_refresh = time.time()
+            return
         if self._show_thinking:
             self.console.print(
                 f"\r  [bold yellow]Thought[/bold yellow] [dim]· streaming… (~{tokens:,} tokens)[/dim]",
@@ -1192,10 +1217,17 @@ class TerminalRenderer:
 
     def _thinking_refresh_header(self, force: bool = False) -> None:
         """Throttled in-place token-count refresh on the live thinking header."""
-        if not self._is_thinking_visible or not self._thinking_header_open:
+        if not self._is_thinking_visible:
+            return
+        tokens = self._thinking_token_estimate()
+        if self.interactive_prompt:
+            # No on-screen line to rewrite — just keep the toolbar source fresh.
+            self._live_thinking_tokens = tokens
+            self._live_thinking_active = True
+            return
+        if not self._thinking_header_open:
             return
         now = time.time()
-        tokens = self._thinking_token_estimate()
         if not force and (
             now - self._thinking_indicator_last_refresh < _THINKING_INDICATOR_MIN_INTERVAL
             and tokens - self._thinking_indicator_last_tokens < _THINKING_INDICATOR_TOKEN_STEP
@@ -1235,6 +1267,8 @@ class TerminalRenderer:
         self._thinking_header_open = False
         self._thinking_indicator_last_refresh = 0.0
         self._thinking_indicator_last_tokens = 0
+        self._live_thinking_tokens = 0
+        self._live_thinking_active = False
 
     def _thinking_print_block(self, chunk: str):
         """Print one thinking block with prefix - mirrors _md_print_block structure.
