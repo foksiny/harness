@@ -689,51 +689,84 @@ def run_interactive(agent: HarnessAgent):
                 placeholder = HTML('<style color="#666666">Ask anything.. "What is the tech stack of this project?"</style>')
 
         def get_bottom_toolbar():
-            toks = calculate_history_tokens(agent.session.messages) if agent.session is not None else 0
-            c_win = agent.compactor.context_window
-            pct = round((toks / max(1, c_win)) * 100, 1)
-            toks_k = f"{toks / 1000:.1f}k" if toks >= 1000 else str(toks)
-            c_win_k = f"{c_win / 1000:.0f}k" if c_win >= 1000 else str(c_win)
-            cwd_str = os.getcwd()
-            short_cwd = "~" if cwd_str == os.path.expanduser("~") else os.path.basename(cwd_str) or cwd_str
-            q_sz = queue.size()
-            mode_str = agent.mode.value.capitalize()
-            model_str = agent.session.model if agent.session is not None else agent.config.model
-            effort_str = agent.config.thinking_effort
+            try:
+                import html
+                toks = calculate_history_tokens(agent.session.messages) if agent.session is not None else 0
+                c_win = agent.compactor.context_window
+                pct = round((toks / max(1, c_win)) * 100, 1)
+                toks_k = f"{toks / 1000:.1f}k" if toks >= 1000 else str(toks)
+                c_win_k = f"{c_win / 1000:.0f}k" if c_win >= 1000 else str(c_win)
+                cwd_str = os.getcwd()
+                short_cwd = "~" if cwd_str == os.path.expanduser("~") else os.path.basename(cwd_str) or cwd_str
+                short_cwd_esc = html.escape(short_cwd)
+                branch = renderer._get_git_branch()
+                branch_str = f' <style color="#666666">on</style> <ansimagenta>⎇ {html.escape(branch)}</ansimagenta>' if branch else ''
+                q_sz = queue.size()
+                raw_model = agent.session.model if agent.session is not None else agent.config.model
+                model_str = html.escape(str(raw_model or "default"))
+                effort_str = html.escape(str(agent.config.thinking_effort or "medium"))
 
-            with pending_interactive_lock:
-                is_asking = pending_interactive is not None
+                if agent.mode == Mode.SUPER:
+                    mode_badge = '<ansimagenta><b>⚡ SUPER</b></ansimagenta>'
+                elif agent.mode == Mode.PLAN:
+                    mode_badge = '<ansiblue><b>📋 PLAN</b></ansiblue>'
+                else:
+                    mode_badge = '<ansicyan><b>🔨 BUILD</b></ansicyan>'
 
-            if is_asking:
-                line1 = '<ansiyellow><b>│ [INPUT REQUIRED]</b></ansiyellow> <style color="#cccccc">Type answer or approval choice</style>'
-            else:
-                line1 = f'<ansicyan><b>│</b></ansicyan> <ansicyan><b>{mode_str}</b></ansicyan> <style color="#666666">·</style> <style color="#cccccc">{model_str}</style> <style color="#666666">·</style> <ansiyellow><b>{effort_str}</b></ansiyellow>'
-            # Live thinking counter: the renderer suppresses its raw in-place line
-            # while the prompt frame owns the screen (it would collide with the
-            # input row), and repaints the count atomically through this toolbar.
-            if agent.is_running and getattr(renderer, "_live_thinking_active", False):
-                live_tok = getattr(renderer, "_live_thinking_tokens", 0)
-                line1 += f' <style color="#888888">·</style> <style color="#e8b64c">◆ Thinking… (~{live_tok:,} tok)</style>'
+                perm_level = getattr(agent, "permission", None)
+                if perm_level is None and hasattr(agent, "permission_manager"):
+                    perm_level = getattr(agent.permission_manager, "level", None)
 
-            if agent.is_running:
-                status_tag = '<ansigreen><b>[▶ RUNNING]</b></ansigreen> '
-                action_tag = '<style color="#888888">/stop to interrupt</style>'
-            elif queue.is_paused:
-                status_tag = '<ansiyellow><b>[PAUSED]</b></ansiyellow> '
-                action_tag = '<style color="#888888">/queue resume</style>'
-            else:
-                status_tag = ''
-                action_tag = '<b>ctrl+p</b> <style color="#888888">commands</style>'
+                perm_badge = ""
+                if perm_level == PermissionLevel.SECURE:
+                    perm_badge = ' <style color="#666666">·</style> <ansiyellow>🛡️ SECURE</ansiyellow>'
+                elif perm_level == PermissionLevel.FULL:
+                    perm_badge = ' <style color="#666666">·</style> <ansigreen>🔓 FULL</ansigreen>'
 
-            q_tag = f'  <ansiyellow><b>Queue: {q_sz}</b></ansiyellow>' if q_sz > 0 else ''
+                with pending_interactive_lock:
+                    is_asking = pending_interactive is not None
 
-            line2 = (
-                f'<style color="#888888">{short_cwd}</style>    '
-                f'<style color="#888888">{toks_k}/{c_win_k} ({pct}%)</style>  '
-                f'{status_tag}{action_tag}{q_tag}  '
-                f'• <style color="#55ff55">●</style> <b>Harness {__version__}</b>'
-            )
-            return HTML(f"{line1}\n{line2}")
+                if is_asking:
+                    line1 = '<ansiyellow><b>│ [INPUT REQUIRED]</b></ansiyellow> <style color="#cccccc">Type answer or approval choice</style>'
+                else:
+                    line1 = f'<ansicyan><b>│</b></ansicyan> {mode_badge} <style color="#666666">·</style> <style color="#cccccc">{model_str}</style> <style color="#666666">·</style> <ansiyellow><b>{effort_str}</b></ansiyellow>{perm_badge}'
+
+                # Live thinking counter: the renderer suppresses its raw in-place line
+                # while the prompt frame owns the screen (it would collide with the
+                # input row), and repaints the count atomically through this toolbar.
+                if agent.is_running and getattr(renderer, "_live_thinking_active", False):
+                    live_tok = getattr(renderer, "_live_thinking_tokens", 0)
+                    line1 += f' <style color="#888888">·</style> <style color="#e8b64c">◆ Thinking… (~{live_tok:,} tok)</style>'
+
+                if agent.is_running:
+                    status_tag = '<ansigreen><b>[▶ RUNNING]</b></ansigreen> '
+                    action_tag = '<style color="#888888">/stop to interrupt</style>'
+                elif queue.is_paused:
+                    status_tag = '<ansiyellow><b>[PAUSED]</b></ansiyellow> '
+                    action_tag = '<style color="#888888">/queue resume</style>'
+                else:
+                    status_tag = ''
+                    action_tag = '<b>ctrl+p</b> <style color="#888888">commands</style>'
+
+                q_tag = f'  <ansiyellow><b>Queue: {q_sz}</b></ansiyellow>' if q_sz > 0 else ''
+
+                if pct >= 85:
+                    ctx_display = f'<ansired>{toks_k}/{c_win_k} ({pct}%)</ansired>'
+                elif pct >= 70:
+                    ctx_display = f'<ansiyellow>{toks_k}/{c_win_k} ({pct}%)</ansiyellow>'
+                else:
+                    ctx_display = f'<style color="#888888">{toks_k}/{c_win_k} ({pct}%)</style>'
+
+                line2 = (
+                    f'<style color="#888888">{short_cwd_esc}</style>{branch_str}    '
+                    f'{ctx_display}  '
+                    f'{status_tag}{action_tag}{q_tag}  '
+                    f'• <style color="#55ff55">●</style> <b>Harness {html.escape(str(__version__))}</b>'
+                )
+                return HTML(f"{line1}\n{line2}")
+            except Exception:
+                fallback_m = agent.session.model if agent.session else agent.config.model
+                return f"│ {agent.mode.value.capitalize()} · {fallback_m} · Harness {__version__}"
 
         user_input = input_handler.get_input(
             plain_prompt,
@@ -741,6 +774,7 @@ def run_interactive(agent: HarnessAgent):
             bottom_toolbar=get_bottom_toolbar,
             refresh_interval=0.5,
             placeholder=placeholder,
+            is_running=agent.is_running,
         )
 
         if user_input == SENTINEL_OPEN_AGENTS:

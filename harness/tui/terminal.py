@@ -472,9 +472,8 @@ class TerminalRenderer:
 
         # 1. Centered block logo for HARNESS
         logo = (
-            "[dim white]█[/dim white]\n"
-            "[dim white]█▀█ █▀█ █▀█ [/dim white][bold white]█▄ █ █▀█ █▀▀ █▀▀[/bold white]\n"
-            "[dim white]█ █ █▀█ █▀▄ [/dim white][bold white]█ ▀█ ██▄ ▄██ ▄██[/bold white]"
+            f"[{self.theme.primary}]█ █  █▀█  █▀▄  █▄ █  █▀▀  █▀▀  █▀▀[/{self.theme.primary}]\n"
+            f"[{self.theme.secondary}]█▀█  █ █  █ █  █ ▀█  ██▄  ▄██  ▄██[/{self.theme.secondary}]"
         )
         self.console.print()
         self.console.print(Align.center(logo))
@@ -485,7 +484,7 @@ class TerminalRenderer:
         self.console.print()
 
         # 3. Tip
-        self.console.print(Align.center("[bold yellow]• Tip[/bold yellow] [dim]Type[/dim] [bold white]/help[/bold white] [dim]for commands or[/dim] [bold white]/sidebar[/bold white] [dim]to inspect session[/dim]"))
+        self.console.print(Align.center("[bold yellow]• Tip[/bold yellow] [dim]Type[/dim] [bold white]/help[/bold white] [dim]for commands or[/dim] [bold white]/info[/bold white] [dim]to inspect session[/dim]"))
         self.console.print()
 
         # 4. Bottom status row
@@ -592,7 +591,7 @@ class TerminalRenderer:
 
         # Dynamic generation - ensures all registered commands appear, matching print_help_modal.
         def _category(cmd: str) -> str:
-            if cmd in ("help", "sidebar", "queue", "stop", "clear", "update", "discord"):
+            if cmd in ("help", "info", "sidebar", "queue", "stop", "clear", "update", "discord"):
                 return "Core Actions"
             if cmd in ("model", "models", "provider", "effort", "mode", "perm"):
                 return "Model & Provider"
@@ -1154,12 +1153,16 @@ class TerminalRenderer:
         lines = self._build_sidebar_lines(agent, queue=queue)
         return Panel("\n".join(lines), box=None, padding=(0, 2))
 
+    render_info = render_sidebar
+
     def print_sidebar(self, agent, queue=None):
         """Print the clean borderless OpenCode-style session & environment sidebar."""
         self.console.print()
         for line in self._build_sidebar_lines(agent, queue=queue):
             self.console.print(f"  {line}" if line else "")
         self.console.print()
+
+    print_info = print_sidebar
 
     def finish_thinking(self):
         """Public method to close thinking panel on turn complete or interrupt."""
@@ -1238,6 +1241,8 @@ class TerminalRenderer:
     def _finish_thinking(self):
         """Close out the thinking display panel and show timing stats."""
         if not self._is_thinking_visible:
+            if self._thinking_buffer:
+                self._thinking_buffer = ""
             return
         # Close the live header line: refresh one last time, then move to the
         # next line so buffered blocks / stats never overwrite the counter.
@@ -1726,7 +1731,9 @@ class TerminalRenderer:
             self._finish_thinking()
             data = data or {}
             tname = (data.get("name") or "").strip() or "tool"
-            tid = str(data.get("id") or data.get("index", tname))
+            call_id = data.get("id")
+            call_idx = data.get("index")
+            tid = str(call_id) if call_id is not None else (str(call_idx) if call_idx is not None else tname)
             if tid in self._generating_announced:
                 return
             self._generating_announced.add(tid)
@@ -1812,7 +1819,7 @@ class TerminalRenderer:
                 f"{before:,} -> {after:,} tokens ([bold green]-{saved:,} tokens / {pct}%[/bold green]) · {tactic_str}\n"
             )
 
-        elif etype == "step_end" and (data or {}).get("complete"):
+        elif (etype == "turn_complete") or (etype == "step_end" and (data or {}).get("complete")):
             self._finish_markdown()
             self._finish_thinking()
             self._generating_announced.clear()

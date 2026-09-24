@@ -244,6 +244,21 @@ class TestPromptContextAwareness(unittest.TestCase):
         self.assertEqual(a, b)
         clear_git_info_cache()
 
+    def test_workspace_dir_loads_custom_rules(self):
+        import tempfile
+        from pathlib import Path
+        from harness.core.prompt import SystemPromptBuilder, load_project_rules
+        with tempfile.TemporaryDirectory() as td:
+            rule_file = Path(td) / "AGENTS.md"
+            rule_file.write_text("Custom workspace rule content")
+            rules = load_project_rules(td)
+            self.assertIn("Custom workspace rule content", rules)
+
+            builder = SystemPromptBuilder()
+            prompt = builder.build(workspace_dir=td)
+            self.assertIn("Custom workspace rule content", prompt)
+            self.assertIn(td, prompt)
+
 
 class TestConfigKnobs(unittest.TestCase):
 

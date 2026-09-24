@@ -512,10 +512,16 @@ def main():
         try:
             for ev in agent.step(full_prompt):
                 renderer.render_agent_event(ev)
+            renderer.finish_markdown()
+            renderer.finish_thinking()
         except KeyboardInterrupt:
+            renderer.finish_markdown()
+            renderer.finish_thinking()
             renderer.print_warning("\nAborted by user.")
             sys.exit(130)
         except Exception as ex:
+            renderer.finish_markdown()
+            renderer.finish_thinking()
             renderer.print_error(f"\nExecution failed: {str(ex)}")
             sys.exit(1)
     else:

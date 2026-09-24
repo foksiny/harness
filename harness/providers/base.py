@@ -229,6 +229,20 @@ class BaseProvider(ABC):
             return "low" if n < 4000 else ("medium" if n < 12000 else "high")
         return "medium"
 
+    @abstractmethod
+    def stream_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        thinking_effort: str = "high",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None,
+        **kwargs,
+    ) -> Iterator[LLMChunk]:
+        """Stream response chunks from provider."""
+        pass
+
+
 
 # Default streaming timeouts (seconds). Connect stays short so dead endpoints
 # fail fast; read is generous because reasoning models (e.g. DeepSeek on
@@ -532,15 +546,3 @@ def probe_effort_options(dialect: Optional[str]) -> List[str]:
 
     return canonical
 
-    @abstractmethod
-    def stream_chat(
-        self,
-        messages: List[Dict[str, Any]],
-        model: Optional[str] = None,
-        thinking_effort: str = "high",
-        tools: Optional[List[Dict[str, Any]]] = None,
-        system_prompt: Optional[str] = None,
-        **kwargs,
-    ) -> Iterator[LLMChunk]:
-        """Stream response chunks from provider."""
-        pass

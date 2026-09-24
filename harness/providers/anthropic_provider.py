@@ -53,7 +53,18 @@ class AnthropicProvider(BaseProvider):
 
             content = msg.get("content")
             if role == "user":
-                anthropic_msgs.append({"role": "user", "content": self._anthropic_user_content(content)})
+                user_c = self._anthropic_user_content(content)
+                if anthropic_msgs and anthropic_msgs[-1]["role"] == "user":
+                    last_c = anthropic_msgs[-1]["content"]
+                    if not isinstance(last_c, list):
+                        last_c = [{"type": "text", "text": str(last_c)}] if last_c else []
+                        anthropic_msgs[-1]["content"] = last_c
+                    if isinstance(user_c, list):
+                        last_c.extend(user_c)
+                    elif user_c:
+                        last_c.append({"type": "text", "text": str(user_c)})
+                else:
+                    anthropic_msgs.append({"role": "user", "content": user_c})
             elif role == "assistant":
                 blocks = []
                 if content:
@@ -94,22 +105,30 @@ class AnthropicProvider(BaseProvider):
                             })
                         else:
                             tr_blocks.append({"type": "text", "text": f"[{t} file unavailable: {b.get('path', '')}]"})
-                    anthropic_msgs.append({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": msg.get("tool_call_id", ""),
-                            "content": tr_blocks or "",
-                        }]
-                    })
+                    tool_block = {
+                        "type": "tool_result",
+                        "tool_use_id": msg.get("tool_call_id", ""),
+                        "content": tr_blocks or "",
+                    }
+                else:
+                    tool_block = {
+                        "type": "tool_result",
+                        "tool_use_id": msg.get("tool_call_id", ""),
+                        "content": content or "",
+                    }
+
+                is_prev_tool_turn = (
+                    anthropic_msgs
+                    and anthropic_msgs[-1]["role"] == "user"
+                    and isinstance(anthropic_msgs[-1]["content"], list)
+                    and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in anthropic_msgs[-1]["content"])
+                )
+                if is_prev_tool_turn:
+                    anthropic_msgs[-1]["content"].append(tool_block)
                 else:
                     anthropic_msgs.append({
                         "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": msg.get("tool_call_id", ""),
-                            "content": content or "",
-                        }]
+                        "content": [tool_block],
                     })
         return anthropic_msgs
 
@@ -161,6 +180,7 @@ class AnthropicProvider(BaseProvider):
         current_tool_id = None
         current_tool_name = None
         current_tool_idx = 0
+        tool_blocks: Dict[int, Dict[str, Any]] = {}
         abort_gen = getattr(self, "_abort_gen", 0)
 
         for attempt in range(self.max_retries + 1):
@@ -169,6 +189,7 @@ class AnthropicProvider(BaseProvider):
             if getattr(self, "_abort_gen", 0) != abort_gen:
                 return
             saw_payload = False
+            tool_blocks.clear()
             try:
                 # httpx streams each SSE line the moment its bytes arrive
                 # with a generous read timeout so long thinking stalls
@@ -194,9 +215,15 @@ class AnthropicProvider(BaseProvider):
                                     if ev_type == "content_block_start":
                                         block = ev.get("content_block", {})
                                         if block.get("type") == "tool_use":
+                                            b_idx = ev.get("index", 0)
+                                            tool_blocks[b_idx] = {
+                                                "id": block.get("id"),
+                                                "name": block.get("name"),
+                                                "index": b_idx,
+                                            }
                                             current_tool_id = block.get("id")
                                             current_tool_name = block.get("name")
-                                            current_tool_idx = ev.get("index", 0)
+                                            current_tool_idx = b_idx
 
                                     elif ev_type == "content_block_delta":
                                         delta = ev.get("delta", {})
@@ -210,11 +237,13 @@ class AnthropicProvider(BaseProvider):
                                             yield LLMChunk(delta_reasoning=delta.get("thinking", ""))
                                         elif dtype == "input_json_delta":
                                             saw_payload = True
+                                            b_idx = ev.get("index", current_tool_idx)
+                                            tb = tool_blocks.get(b_idx, {})
                                             yield LLMChunk(
                                                 tool_calls=[ToolCallDelta(
-                                                    index=current_tool_idx,
-                                                    id=current_tool_id,
-                                                    name=current_tool_name,
+                                                    index=tb.get("index", b_idx),
+                                                    id=tb.get("id", current_tool_id),
+                                                    name=tb.get("name", current_tool_name),
                                                     arguments_delta=delta.get("partial_json", ""),
                                                 )]
                                             )

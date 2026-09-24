@@ -66,10 +66,12 @@ class TestKeybindClassification(unittest.TestCase):
     def test_learn_in_slash_commands_completion(self):
         self.assertIn("/learn", SLASH_COMMANDS)
         self.assertIn("/queue", SLASH_COMMANDS)
+        self.assertIn("/info", SLASH_COMMANDS)
         self.assertIn("/sidebar", SLASH_COMMANDS)
         self.assertIn("/status", SLASH_COMMANDS)
         from harness.tui.input_handler import COMMAND_DESCRIPTIONS
         self.assertIn("/queue", COMMAND_DESCRIPTIONS)
+        self.assertIn("/info", COMMAND_DESCRIPTIONS)
         self.assertIn("/sidebar", COMMAND_DESCRIPTIONS)
         self.assertIn("/status", COMMAND_DESCRIPTIONS)
 
@@ -154,6 +156,43 @@ class TestNoEchoGuard(unittest.TestCase):
                 pass  # must not raise
         finally:
             sys.stdin = old_stdin
+
+
+class TestSlashAndMentionCompleter(unittest.TestCase):
+    def test_slash_command_argument_completions(self):
+        try:
+            from prompt_toolkit.document import Document
+        except ImportError:
+            self.skipTest("prompt_toolkit not available")
+
+        handler = InputHandler()
+        completer = handler._pt_completer
+        self.assertIsNotNone(completer)
+
+        # Typing "/mode " should suggest "plan", "build", "super"
+        doc = Document("/mode ", cursor_position=6)
+        completions = list(completer.get_completions(doc, None))
+        texts = [c.text for c in completions]
+        self.assertIn("plan", texts)
+        self.assertIn("build", texts)
+        self.assertIn("super", texts)
+
+        # Typing "/effort h" should suggest "high"
+        doc = Document("/effort h", cursor_position=9)
+        completions = list(completer.get_completions(doc, None))
+        texts = [c.text for c in completions]
+        self.assertEqual(texts, ["high"])
+
+        # Typing "/perm s" should suggest "secure"
+        doc = Document("/perm s", cursor_position=7)
+        completions = list(completer.get_completions(doc, None))
+        texts = [c.text for c in completions]
+        self.assertEqual(texts, ["secure"])
+
+    def test_mesh_in_slash_commands(self):
+        self.assertIn("/mesh", SLASH_COMMANDS)
+        from harness.tui.input_handler import COMMAND_DESCRIPTIONS
+        self.assertIn("/mesh", COMMAND_DESCRIPTIONS)
 
 
 if __name__ == "__main__":

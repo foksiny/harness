@@ -11,12 +11,12 @@ from contextlib import contextmanager
 from typing import List, Optional, Iterator
 
 SLASH_COMMANDS = [
-    "/help", "/goal", "/ultra-goal", "/ultragoal", "/stop", "/queue", "/sidebar", "/status", "/mode", "/perm", "/theme",
+    "/help", "/goal", "/ultra-goal", "/ultragoal", "/stop", "/queue", "/info", "/sidebar", "/status", "/mode", "/perm", "/theme",
     "/provider", "/model", "/models", "/config", "/keys", "/setup",
     "/effort", "/todo", "/skills", "/reload", "/mcp", "/update", "/discord",
     "/subagent", "/agents", "/agent", "/back",
     "/compact", "/session", "/checkpoint", "/tokens", "/diff", "/clear",
-    "/learn", "/exit", "/quit"
+    "/mesh", "/learn", "/exit", "/quit"
 ]
 
 COMMAND_DESCRIPTIONS = {
@@ -26,7 +26,8 @@ COMMAND_DESCRIPTIONS = {
     "/ultragoal": "Alias of /ultra-goal",
     "/stop": "Interrupt running task (or '/stop all' to clear queue)",
     "/queue": "View, drop, pause, resume or clear prompt queue",
-    "/sidebar": "Toggle or view workspace, session & model sidebar",
+    "/info": "Inspect workspace, session, model & context info",
+    "/sidebar": "Alias of /info: workspace, session & model info",
     "/status": "Display full system, agent, budget & queue status",
     "/update": "Check for and apply latest updates from Git / PyPI",
     "/discord": "Manage Discord bot daemon and sync connection",
@@ -54,6 +55,7 @@ COMMAND_DESCRIPTIONS = {
     "/tokens": "Inspect token consumption & context budget",
     "/diff": "View git diff of workspace changes",
     "/clear": "Clear terminal screen and redraw HUD",
+    "/mesh": "Inspect API server, peer discovery & messaging",
     "/learn": "Extract and save persistent knowledge lessons",
     "/exit": "Save session and exit Harness",
     "/quit": "Save session and exit Harness",
@@ -266,6 +268,113 @@ class InputHandler:
                                 )
                         return
 
+                    # Slash command argument autocompletion
+                    stripped_before = text_before.lstrip()
+                    if stripped_before.startswith('/') and ' ' in stripped_before:
+                        parts = stripped_before.split()
+                        cmd = parts[0].lower()
+                        is_first_arg = (len(parts) == 1 and text_before.endswith(' ')) or (len(parts) == 2 and not text_before.endswith(' '))
+                        if is_first_arg:
+                            current_arg = parts[1] if len(parts) == 2 else ""
+                            arg_options = {
+                                "/mode": [
+                                    ("plan", "Investigatory & architectural mode (read-only)"),
+                                    ("build", "Standard autonomous implementation & testing"),
+                                    ("super", "Autonomous Turbo Engine with automatic swarms"),
+                                ],
+                                "/perm": [
+                                    ("default", "Standard prompt confirmation for destructive actions"),
+                                    ("secure", "Prompt confirmation for every tool execution"),
+                                    ("full", "Unrestricted autonomous execution"),
+                                ],
+                                "/effort": [
+                                    ("off", "Disable model reasoning"),
+                                    ("low", "Low reasoning effort"),
+                                    ("medium", "Medium reasoning effort"),
+                                    ("high", "High reasoning effort"),
+                                ],
+                                "/queue": [
+                                    ("pause", "Pause queue worker"),
+                                    ("resume", "Resume queue worker"),
+                                    ("clear", "Clear all queued items"),
+                                    ("drop", "Drop a specific queued item by id"),
+                                ],
+                                "/checkpoint": [
+                                    ("list", "List available checkpoints"),
+                                    ("create", "Create a new checkpoint"),
+                                    ("undo", "Revert workspace to previous checkpoint"),
+                                    ("redo", "Redo reverted checkpoint"),
+                                ],
+                                "/session": [
+                                    ("list", "List workspace sessions"),
+                                    ("create", "Create a new clean session"),
+                                    ("resume", "Resume session by id"),
+                                    ("fork", "Fork current session into new branch"),
+                                    ("delete", "Delete session by id"),
+                                    ("export", "Export session transcript"),
+                                ],
+                                "/learn": [
+                                    ("list", "List remembered insights"),
+                                    ("record", "Record a new insight lesson"),
+                                    ("forget", "Forget a lesson by id"),
+                                    ("promote", "Promote a lesson into a workspace/global skill"),
+                                    ("on", "Enable learned lessons injection"),
+                                    ("off", "Disable learned lessons injection"),
+                                ],
+                                "/theme": [
+                                    ("list", "List available color themes"),
+                                    ("preview", "Preview a theme without saving"),
+                                    ("create", "Create a new custom theme"),
+                                    ("delete", "Delete a custom theme"),
+                                ],
+                                "/config": [
+                                    ("list", "List all configuration keys"),
+                                    ("get", "Get config value: /config get <key>"),
+                                    ("set", "Set config value: /config set <key> <val>"),
+                                ],
+                                "/keys": [
+                                    ("list", "List configured provider keys"),
+                                    ("set", "Set provider key: /keys set <provider> <key>"),
+                                ],
+                                "/provider": [
+                                    ("openai", "OpenAI (GPT-4o, o1, o3-mini)"),
+                                    ("anthropic", "Anthropic (Claude 3.7 Sonnet, Claude 3.5 Haiku)"),
+                                    ("gemini", "Google Gemini (Gemini 2.5 Flash, 2.5 Pro)"),
+                                    ("groq", "Groq ultra-fast inference"),
+                                    ("deepseek", "DeepSeek (DeepSeek V3, DeepSeek R1)"),
+                                    ("openrouter", "OpenRouter universal API router"),
+                                    ("ollama", "Local Ollama models"),
+                                    ("together", "Together AI serverless inference"),
+                                    ("mistral", "Mistral AI (Codestral, Mistral Large)"),
+                                    ("nvidia", "NVIDIA NIM inference"),
+                                ],
+                                "/stop": [
+                                    ("all", "Stop task and clear execution queue"),
+                                    ("queue", "Stop task and clear queue"),
+                                ],
+                                "/mesh": [
+                                    ("status", "Check API server and mesh network status"),
+                                    ("peers", "Discover nearby running Harness instances"),
+                                    ("send", "Send a message to a peer instance"),
+                                    ("broadcast", "Broadcast a message to all peers"),
+                                ],
+                                "/todo": [
+                                    ("list", "Show current task checklist"),
+                                    ("add", "Add a new task: /todo add <title>"),
+                                    ("clear", "Clear completed tasks"),
+                                ],
+                            }
+                            if cmd in arg_options:
+                                for opt, meta in arg_options[cmd]:
+                                    if opt.startswith(current_arg.lower()):
+                                        yield Completion(
+                                            opt,
+                                            start_position=-len(current_arg),
+                                            display=opt,
+                                            display_meta=meta,
+                                        )
+                                return
+
             self._pt_completer = SlashAndMentionCompleter(SLASH_COMMANDS, COMMAND_DESCRIPTIONS)
             self._pt_history = InMemoryHistory()
             self._pt_session = PromptSession(completer=self._pt_completer, history=self._pt_history)
@@ -322,6 +431,7 @@ class InputHandler:
         bottom_toolbar=None,
         refresh_interval: Optional[float] = None,
         placeholder: Optional[str] = None,
+        is_running: bool = False,
     ) -> str:
         """Read a line of input from user with toolbar and completion support.
 
@@ -348,7 +458,9 @@ class InputHandler:
             except EOFError:
                 return "/exit"
             except KeyboardInterrupt:
-                return SENTINEL_BACK if view == VIEW_AGENTS else "/stop"
+                if view == VIEW_AGENTS:
+                    return SENTINEL_BACK
+                return "/stop" if is_running else "/exit"
 
         # Fallback without prompt_toolkit: raw terminal reader so keybinds work,
         # falling back to plain input() when stdin is not an interactive TTY.
@@ -365,10 +477,14 @@ class InputHandler:
                 try:
                     return self._raw_line(plain_str, view)
                 except (EOFError, KeyboardInterrupt):
-                    return SENTINEL_BACK if view == VIEW_AGENTS else "/exit"
+                    if view == VIEW_AGENTS:
+                        return SENTINEL_BACK
+                    return "/stop" if is_running else "/exit"
             return input(plain_str).strip()
         except (EOFError, KeyboardInterrupt):
-            return SENTINEL_BACK if view == VIEW_AGENTS else "/exit"
+            if view == VIEW_AGENTS:
+                return SENTINEL_BACK
+            return "/stop" if is_running else "/exit"
 
     def classify_keypress(self, raw: bytes, view: str = VIEW_PARENT) -> Optional[str]:
         """Classify a partial/complete keypress buffer.

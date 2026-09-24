@@ -168,7 +168,8 @@ class CommandRegistry:
         self.register("ultragoal", self._cmd_ultra_goal, "Alias of /ultra-goal: full app/game build mission.")
         self.register("stop", self._cmd_stop, "Interrupt running agent turn (use '/stop all' to also clear queue).")
         self.register("queue", self._cmd_queue, "View, drop, pause, resume, or clear prompt execution queue.")
-        self.register("sidebar", self._cmd_sidebar, "Toggle or view workspace, session, model, and context sidebar.")
+        self.register("info", self._cmd_info, "Inspect workspace, session, model, and context info.")
+        self.register("sidebar", self._cmd_info, "Alias of /info: inspect workspace, session, model, and context.")
         self.register("status", self._cmd_status, "Display full system, agent, budget, and queue status.")
         self.register("mode", self._cmd_mode, "Switch operational mode: plan, build, super.")
         self.register("perm", self._cmd_perm, "Switch permission profile: secure, default, full.")
@@ -219,6 +220,8 @@ class CommandRegistry:
             with no_echo_stdin():
                 for ev in ctx.agent.step(f"AUTONOMOUS GOAL: {ctx.args}"):
                     ctx.renderer.render_agent_event(ev)
+                ctx.renderer.finish_markdown()
+                ctx.renderer.finish_thinking()
 
     def _cmd_ultra_goal(self, ctx: CommandContext):
         """/ultra-goal: maximum-capability full app/game build.
@@ -257,6 +260,8 @@ class CommandRegistry:
             with no_echo_stdin():
                 for ev in ctx.agent.step(brief):
                     ctx.renderer.render_agent_event(ev)
+                ctx.renderer.finish_markdown()
+                ctx.renderer.finish_thinking()
 
     def _cmd_stop(self, ctx: CommandContext):
         """Cooperatively interrupt the running turn from the CLI side."""
@@ -315,9 +320,13 @@ class CommandRegistry:
         else:
             ctx.renderer.print_info("Usage: /queue [list] | /queue add <prompt> | /queue drop <id> | /queue clear | /queue pause | /queue resume")
 
-    def _cmd_sidebar(self, ctx: CommandContext):
+    def _cmd_info(self, ctx: CommandContext):
         """Display OpenCode-style right-side info panel."""
         ctx.renderer.print_sidebar(ctx.agent, queue=ctx.queue)
+
+    def _cmd_sidebar(self, ctx: CommandContext):
+        """Backward-compatible alias for /info."""
+        return self._cmd_info(ctx)
 
     def _cmd_status(self, ctx: CommandContext):
         """Display comprehensive system, agent, budget, and queue status card."""
@@ -580,7 +589,8 @@ class CommandRegistry:
     def _cmd_model(self, ctx: CommandContext):
         if not ctx.args:
             current = ctx.agent.session.model if ctx.agent.session is not None else ctx.agent.config.model
-            ctx.renderer.print_info(f"Current model: {current}\nUsage: /model <model_name>")
+            ctx.renderer.print_info(f"Current model: [bold white]{current}[/bold white]\n[dim]Available models for {ctx.agent.provider.display_name} (switch with /model <name>):[/dim]")
+            self._cmd_models(ctx)
             return
         new_model = ctx.args.strip()
         if ctx.agent.session is not None:

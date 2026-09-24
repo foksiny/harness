@@ -56,5 +56,16 @@ class TestModesAndPermissions(unittest.TestCase):
         self.assertTrue(pm_full.check_permission("write_file", {"path": "a.py"}))
         self.assertTrue(pm_full.check_permission("command", {"command": "npm install", "risk": RiskLevel.MEDIUM}))
 
+    def test_agent_permission_property_and_set(self):
+        from harness.core.agent import HarnessAgent
+        from harness.config import HarnessConfig
+        cfg = HarnessConfig()
+        cfg.permission = "secure"
+        agent = HarnessAgent(cfg)
+        self.assertEqual(agent.permission, PermissionLevel.SECURE)
+        agent.set_permission(PermissionLevel.FULL)
+        self.assertEqual(agent.permission, PermissionLevel.FULL)
+
+
 if __name__ == "__main__":
     unittest.main()

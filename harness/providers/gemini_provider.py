@@ -51,7 +51,10 @@ class GeminiProvider(BaseProvider):
 
             if role == "user":
                 parts = self._user_parts(content)
-                contents.append({"role": "user", "parts": parts})
+                if contents and contents[-1]["role"] == "user":
+                    contents[-1]["parts"].extend(parts)
+                else:
+                    contents.append({"role": "user", "parts": parts})
             elif role == "assistant":
                 if content:
                     parts.append({"text": content})
@@ -70,6 +73,8 @@ class GeminiProvider(BaseProvider):
                         })
                 contents.append({"role": "model", "parts": parts})
             elif role == "tool":
+                parts = []
+                followup = None
                 if isinstance(content, list):
                     # functionResponse carries text; attached media rides along
                     # as a synthetic follow-up user content with inline_data.
@@ -83,11 +88,9 @@ class GeminiProvider(BaseProvider):
                             "response": {"output": "\n".join(t for t in texts if t) or ""},
                         }
                     })
-                    contents.append({"role": "user", "parts": parts})
                     if media:
                         caption = f"[Image(s) attached by tool '{msg.get('name', 'tool')}' — see below.]"
-                        contents.append({"role": "user", "parts": self._user_parts(
-                            [{"type": "text", "text": caption}, *media])})
+                        followup = {"role": "user", "parts": self._user_parts([{"type": "text", "text": caption}, *media])}
                 else:
                     parts.append({
                         "functionResponse": {
@@ -95,7 +98,19 @@ class GeminiProvider(BaseProvider):
                             "response": {"output": content},
                         }
                     })
+
+                is_prev_func_resp = (
+                    contents
+                    and contents[-1]["role"] == "user"
+                    and any("functionResponse" in p for p in contents[-1]["parts"])
+                )
+                if is_prev_func_resp:
+                    contents[-1]["parts"].extend(parts)
+                else:
                     contents.append({"role": "user", "parts": parts})
+
+                if followup:
+                    contents.append(followup)
         return contents
 
     def stream_chat(
@@ -149,6 +164,7 @@ class GeminiProvider(BaseProvider):
             if getattr(self, "_abort_gen", 0) != abort_gen:
                 return
             saw_payload = False
+            tool_call_idx = 0
             try:
                 # httpx streams each SSE line the moment its bytes arrive
                 # with a generous read timeout so long thinking stalls
@@ -188,12 +204,13 @@ class GeminiProvider(BaseProvider):
                                             fc = p["functionCall"]
                                             yield LLMChunk(
                                                 tool_calls=[ToolCallDelta(
-                                                    index=0,
-                                                    id=f"gemini_call_{fc.get('name')}",
+                                                    index=tool_call_idx,
+                                                    id=f"gemini_call_{fc.get('name')}_{tool_call_idx}",
                                                     name=fc.get("name"),
                                                     arguments_delta=json.dumps(fc.get("args", {})),
                                                 )]
                                             )
+                                            tool_call_idx += 1
 
                                     finish = cand.get("finishReason")
                                     if finish:

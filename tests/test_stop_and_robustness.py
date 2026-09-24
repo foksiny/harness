@@ -389,5 +389,51 @@ class TestSseAbort(unittest.TestCase):
                          "zombie retry loop must not reconnect after abort")
 
 
+class TestTerminalRendererFlushing(unittest.TestCase):
+
+    def test_renderer_flushes_on_turn_complete(self):
+        from harness.tui.terminal import TerminalRenderer
+        from harness.core.agent import AgentEvent
+        from rich.console import Console
+        import io
+
+        buf = io.StringIO()
+        console = Console(file=buf, force_terminal=False, color_system=None)
+        renderer = TerminalRenderer()
+        renderer.console = console
+        # Put partial markdown and partial thinking in buffer
+        renderer._md_buffer = "Incomplete markdown line without newline"
+        renderer._thinking_buffer = "Incomplete thinking line"
+
+        # Render turn_complete
+        renderer.render_agent_event(AgentEvent("turn_complete", {"messages_count": 2}))
+
+        # Buffers should be cleared and flushed to output
+        self.assertEqual(renderer._md_buffer, "")
+        self.assertEqual(renderer._thinking_buffer, "")
+        output = buf.getvalue()
+        self.assertIn("Incomplete markdown line without newline", output)
+
+    def test_tool_call_delta_index_zero_not_falsy(self):
+        from harness.tui.terminal import TerminalRenderer
+        from harness.core.agent import AgentEvent
+        from rich.console import Console
+        import io
+
+        buf = io.StringIO()
+        console = Console(file=buf, force_terminal=False, color_system=None)
+        renderer = TerminalRenderer()
+        renderer.console = console
+
+        # First tool call with index 0
+        renderer.render_agent_event(AgentEvent("tool_call_delta", {"index": 0, "name": "bash"}))
+        # Second tool call with index 1, also bash
+        renderer.render_agent_event(AgentEvent("tool_call_delta", {"index": 1, "name": "bash"}))
+
+        # Both should have been announced because indices "0" and "1" are distinct
+        self.assertIn("0", renderer._generating_announced)
+        self.assertIn("1", renderer._generating_announced)
+
+
 if __name__ == "__main__":
     unittest.main()

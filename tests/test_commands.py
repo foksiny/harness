@@ -165,10 +165,11 @@ class TestCommands(unittest.TestCase):
         q = ExecutionQueue()
         self.registry.handle("/status", self.agent, self.renderer, queue=q)
 
-    def test_sidebar_command(self):
+    def test_sidebar_and_info_command(self):
         from harness.tui.queue import ExecutionQueue
         q = ExecutionQueue()
         q.enqueue("Sidebar test task")
+        self.registry.handle("/info", self.agent, self.renderer, queue=q)
         self.registry.handle("/sidebar", self.agent, self.renderer, queue=q)
 
     def test_opencode_visual_rendering(self):

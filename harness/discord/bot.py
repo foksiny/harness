@@ -36,6 +36,7 @@ import queue
 import re
 import sys
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -583,6 +584,33 @@ if HAS_DISCORD:
                     except discord.HTTPException:
                         pass
 
+            @_cmd(name="ultragoal", description="Autonomous full app/game build with mandatory verification.")
+            @app_commands.describe(goal="High-level product, app, or game objective to build.")
+            async def ultragoal_cmd(interaction: discord.Interaction, goal: str):
+                try:
+                    if not (goal and goal.strip()):
+                        await interaction.response.send_message(
+                            "⚠️ Please provide an ultra-goal. Usage: `/ultragoal <objective>`", ephemeral=True,
+                        )
+                        return
+                    from harness.commands.ultra_goal import build_ultra_goal_brief
+                    brief = build_ultra_goal_brief(goal)
+                    await self._cmd_goal(interaction, brief)
+                except Exception as exc:
+                    log.exception("Unhandled crash in /ultragoal handler")
+                    try:
+                        if interaction.response.is_done():
+                            await interaction.followup.send(f"❌ Bot error: {exc}", ephemeral=True)
+                        else:
+                            await interaction.response.send_message(f"❌ Bot error: {exc}", ephemeral=True)
+                    except discord.HTTPException:
+                        pass
+
+            @_cmd(name="ultra-goal", description="Alias of /ultragoal: full app/game build.")
+            @app_commands.describe(goal="High-level product, app, or game objective to build.")
+            async def ultra_goal_cmd(interaction: discord.Interaction, goal: str):
+                await ultragoal_cmd(interaction, goal)
+
             @_cmd(name="stop", description="Interrupt the currently running agent turn.")
             async def stop_cmd(interaction: discord.Interaction):
                 try:
@@ -657,6 +685,33 @@ if HAS_DISCORD:
                 except Exception:
                     await interaction.response.send_message(
                         "❌ Invalid mode. Choose from: `plan`, `build`, `super`.", ephemeral=True
+                    )
+
+            @_cmd(name="perm", description="Switch or view permission profile: secure, default, full.")
+            @app_commands.describe(level="Permission profile (secure, default, full). Leave empty to view current.")
+            async def perm_cmd(interaction: discord.Interaction, level: Optional[str] = None):
+                if not self._channel_allowed(interaction.channel_id):
+                    await interaction.response.send_message("⛔ Channel not allowed.", ephemeral=True)
+                    return
+                if not level:
+                    curr = self.config.discord_permission or self.config.permission or "default"
+                    await interaction.response.send_message(f"ℹ️ Current permission profile: **{curr.upper()}** (Options: `secure`, `default`, `full`)")
+                    return
+                from harness.core.permissions import PermissionLevel
+                lvl = level.lower().strip()
+                try:
+                    p = PermissionLevel.from_string(lvl)
+                    self.config.discord_permission = p.value
+                    self.config.permission = p.value
+                    for rt in self._runtimes.values():
+                        if rt.agent is not None:
+                            rt.agent.set_permission(p)
+                    await self._async_save_config()
+                    self._relay.publish_state({"permission": p.value}, origin="discord")
+                    await interaction.response.send_message(f"✅ Permission profile switched to: **{p.value.upper()}**")
+                except Exception:
+                    await interaction.response.send_message(
+                        "❌ Invalid permission profile. Choose from: `secure`, `default`, `full`.", ephemeral=True
                     )
 
             @_cmd(name="provider", description="Show or switch the active LLM provider.")
@@ -775,6 +830,33 @@ if HAS_DISCORD:
                     pass
                 await self._send_chunked(interaction, text)
 
+            @_cmd(name="effort", description="Set or view thinking effort: off, low, medium, high, or token count.")
+            @app_commands.describe(effort="Thinking effort level: off, low, medium, high, or integer tokens.")
+            async def effort_cmd(interaction: discord.Interaction, effort: Optional[str] = None):
+                if not self._channel_allowed(interaction.channel_id):
+                    await interaction.response.send_message("⛔ Channel not allowed.", ephemeral=True)
+                    return
+                if not effort:
+                    curr = self.config.thinking_effort or "off"
+                    rt = self._get_runtime(interaction.channel_id)
+                    agent = rt.ensure_agent()
+                    model = agent.session.model if agent.session else self.config.model
+                    spec = agent.provider.get_model_spec(model)
+                    dialect = spec.thinking_type or "reasoning_effort"
+                    await interaction.response.send_message(
+                        f"🧠 Current thinking effort: **{curr}** (dialect: `{dialect}`). "
+                        "Options: `off`, `low`, `medium`, `high`, or token integer."
+                    )
+                    return
+                eff = effort.strip().lower()
+                self.config.thinking_effort = eff
+                for rt in self._runtimes.values():
+                    if rt.agent is not None:
+                        rt.agent.config.thinking_effort = eff
+                await self._async_save_config()
+                self._relay.publish_state({"thinking_effort": eff}, origin="discord")
+                await interaction.response.send_message(f"✅ Thinking effort set to: **{eff}**")
+
             @_cmd(name="queue", description="Inspect execution queue.")
             @app_commands.describe(action="Optional: list, clear, pause, resume")
             async def queue_cmd(interaction: discord.Interaction, action: Optional[str] = None):
@@ -824,8 +906,8 @@ if HAS_DISCORD:
                     pass
                 await self._send_chunked(interaction, "\n".join(lines))
 
-            @_cmd(name="sidebar", description="Inspect workspace context and tasks.")
-            async def sidebar_cmd(interaction: discord.Interaction):
+            @_cmd(name="info", description="Inspect workspace context, session, and tasks info.")
+            async def info_cmd(interaction: discord.Interaction):
                 rt = self._get_runtime(interaction.channel_id)
                 agent = rt.ensure_agent()
                 cwd = self.workspace
@@ -864,7 +946,7 @@ if HAS_DISCORD:
                     f"• Tasks: {todo_summary}",
                 ]
                 try:
-                    embed = discord.Embed(title="⚡ Workspace Sidebar", description="\n".join(l.replace("**", "") for l in lines), color=0x00FFAA)
+                    embed = discord.Embed(title="⚡ Workspace Info", description="\n".join(l.replace("**", "") for l in lines), color=0x00FFAA)
                     embed.set_footer(text=f"Harness {__import__('harness').__version__} · {cwd}")
                     if not interaction.response.is_done():
                         await interaction.response.send_message(embed=embed)
@@ -874,6 +956,10 @@ if HAS_DISCORD:
                 except Exception:
                     pass
                 await self._send_chunked(interaction, "\n".join(lines))
+
+            @_cmd(name="sidebar", description="Alias of /info: inspect workspace context.")
+            async def sidebar_cmd(interaction: discord.Interaction):
+                await info_cmd(interaction)
 
             @_cmd(name="session", description="Manage sessions: list, create, resume.")
             @app_commands.describe(action="list, create, or resume", arg="Session ID or title")
@@ -1165,6 +1251,193 @@ if HAS_DISCORD:
                     f"**Token usage:** {status.total_tokens:,} / {status.context_window:,} "
                     f"({status.usage_ratio * 100:.1f}%) | **Turns:** {len(agent.session.messages)} | **RAM:** {ram} MB"
                 )
+
+            @_cmd(name="diff", description="Show uncommitted git changes in the workspace.")
+            async def diff_cmd(interaction: discord.Interaction):
+                if not self._channel_allowed(interaction.channel_id):
+                    await interaction.response.send_message("⛔ Channel not allowed.", ephemeral=True)
+                    return
+                rt = self._get_runtime(interaction.channel_id)
+                agent = rt.ensure_agent()
+                try:
+                    res = agent.tool_registry.execute("git_diff", {}, agent.mode)
+                    if not res or not res.strip():
+                        await interaction.response.send_message("ℹ️ Clean working directory — no uncommitted changes.")
+                        return
+                    if len(res) > 1900:
+                        res = res[:1850] + "\n... [diff truncated]"
+                    await interaction.response.send_message(f"```diff\n{res}\n```")
+                except Exception as exc:
+                    await interaction.response.send_message(f"❌ Error getting git diff: {exc}", ephemeral=True)
+
+            @_cmd(name="mcp", description="Inspect Model Context Protocol (MCP) servers and tools.")
+            async def mcp_cmd(interaction: discord.Interaction):
+                if not self._channel_allowed(interaction.channel_id):
+                    await interaction.response.send_message("⛔ Channel not allowed.", ephemeral=True)
+                    return
+                rt = self._get_runtime(interaction.channel_id)
+                agent = rt.ensure_agent()
+                servers = agent.mcp_manager.get_configured_servers() if hasattr(agent, "mcp_manager") else {}
+                if not servers:
+                    await interaction.response.send_message("ℹ️ No MCP servers configured.")
+                    return
+                lines = [f"**🔌 Configured MCP Servers ({len(servers)}):**"]
+                for name, s_cfg in servers.items():
+                    cmd = s_cfg.get("command", "")
+                    args = " ".join(s_cfg.get("args", []))
+                    connected = "🟢 connected" if (hasattr(agent, "mcp_manager") and name in agent.mcp_manager.clients) else "⚪ registered"
+                    lines.append(f"• **{name}** ({connected}): `{cmd} {args}`".strip())
+                await self._send_chunked(interaction, "\n".join(lines))
+
+            @_cmd(name="checkpoint", description="Manage checkpoints: list, create, undo, redo.")
+            @app_commands.describe(action="list, create, undo, or redo", arg="Label for create, or checkpoint ID for undo/redo")
+            async def checkpoint_cmd(interaction: discord.Interaction, action: Optional[str] = "list", arg: Optional[str] = None):
+                if not self._channel_allowed(interaction.channel_id):
+                    await interaction.response.send_message("⛔ Channel not allowed.", ephemeral=True)
+                    return
+                rt = self._get_runtime(interaction.channel_id)
+                agent = rt.ensure_agent()
+                cp_manager = agent.checkpoint_manager
+                act = (action or "list").lower().strip()
+                if act == "list":
+                    cps = cp_manager.list_checkpoints()
+                    if not cps:
+                        await interaction.response.send_message("ℹ️ No checkpoints recorded.")
+                        return
+                    lines = ["**📍 Saved Checkpoints:**"]
+                    for cp in cps:
+                        curr = " ▸ *(current)*" if cp.get("is_current") else ""
+                        ts = time.strftime("%H:%M:%S", time.localtime(cp.get("timestamp", 0)))
+                        lines.append(f"• `{cp['id']}` [{ts}]: **{cp['label']}** (files: {cp.get('file_changes_count', 0)}, msgs: {cp.get('message_changes_count', 0)}){curr}")
+                    await self._send_chunked(interaction, "\n".join(lines))
+                elif act == "create":
+                    label = arg.strip() if arg else f"Discord checkpoint {len(cp_manager.checkpoints) + 1}"
+                    cp = cp_manager.create_checkpoint(label)
+                    if cp:
+                        await interaction.response.send_message(f"✅ Created checkpoint `{cp.id}`: **{cp.label}**")
+                    else:
+                        await interaction.response.send_message("ℹ️ No pending changes to checkpoint.")
+                elif act == "undo":
+                    if arg:
+                        target, moved = cp_manager.navigate_to(arg.strip())
+                        if target is None:
+                            await interaction.response.send_message(f"❌ Checkpoint `{arg}` not found.", ephemeral=True)
+                        elif not moved:
+                            await interaction.response.send_message(f"ℹ️ Already at checkpoint `{target.id}`.")
+                        else:
+                            await interaction.response.send_message(f"⏮ Undone to checkpoint `{target.id}` ({target.label}).")
+                        return
+                    if not cp_manager.can_undo():
+                        await interaction.response.send_message("⚠️ Nothing to undo.", ephemeral=True)
+                        return
+                    target = cp_manager.undo()
+                    if target:
+                        await interaction.response.send_message(f"⏮ Undone to checkpoint `{target.id}`: **{target.label}**")
+                    else:
+                        await interaction.response.send_message("⏮ Undone to initial state.")
+                elif act == "redo":
+                    if not cp_manager.can_redo():
+                        await interaction.response.send_message("⚠️ Nothing to redo.", ephemeral=True)
+                        return
+                    target = cp_manager.redo()
+                    if target:
+                        await interaction.response.send_message(f"⏭ Redone to checkpoint `{target.id}`: **{target.label}**")
+                    else:
+                        await interaction.response.send_message("❌ Redo failed.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("Usage: `/checkpoint list`, `/checkpoint create [label]`, `/checkpoint undo [id]`, `/checkpoint redo`", ephemeral=True)
+
+            @_cmd(name="learn", description="Manage learned memory: list, record, forget, on, off.")
+            @app_commands.describe(action="list, record, forget, on, off", arg="Summary to record, or ID to forget")
+            async def learn_cmd(interaction: discord.Interaction, action: Optional[str] = "list", arg: Optional[str] = None):
+                if not self._channel_allowed(interaction.channel_id):
+                    await interaction.response.send_message("⛔ Channel not allowed.", ephemeral=True)
+                    return
+                rt = self._get_runtime(interaction.channel_id)
+                agent = rt.ensure_agent()
+                lm = agent.learning_manager
+                act = (action or "list").lower().strip()
+                if act == "list":
+                    lessons = sorted(lm.list(), key=lambda l: l.created_at, reverse=True)
+                    if not lessons:
+                        await interaction.response.send_message("ℹ️ No learned lessons yet.")
+                        return
+                    lines = [f"**🧠 Learned Lessons ({len(lessons)}):**"]
+                    for l in lessons[:15]:
+                        promoted = " *(promoted)*" if l.promoted else ""
+                        lines.append(f"• `{l.id}`{promoted}: {l.summary}")
+                    await self._send_chunked(interaction, "\n".join(lines))
+                elif act == "record":
+                    if not arg or not arg.strip():
+                        await interaction.response.send_message("⚠️ Please provide a summary. Usage: `/learn record <summary>`", ephemeral=True)
+                        return
+                    lid = lm.record(summary=arg.strip(), tags=["discord"], source_session=agent.session.id if agent.session else "")
+                    if lid:
+                        await interaction.response.send_message(f"✅ Recorded memory lesson `{lid}`.")
+                    else:
+                        await interaction.response.send_message("❌ Failed to record memory lesson.", ephemeral=True)
+                elif act == "forget":
+                    if not arg or not arg.strip():
+                        await interaction.response.send_message("⚠️ Please provide a lesson ID. Usage: `/learn forget <id>`", ephemeral=True)
+                        return
+                    if lm.forget(arg.strip()):
+                        await interaction.response.send_message(f"✅ Forgot lesson `{arg.strip()}`.")
+                    else:
+                        await interaction.response.send_message(f"❌ Lesson `{arg.strip()}` not found.", ephemeral=True)
+                elif act == "on":
+                    self.config.learning_enabled = True
+                    agent.config.learning_enabled = True
+                    await self._async_save_config()
+                    await interaction.response.send_message("✅ Agent learning enabled.")
+                elif act == "off":
+                    self.config.learning_enabled = False
+                    agent.config.learning_enabled = False
+                    await self._async_save_config()
+                    await interaction.response.send_message("ℹ️ Agent learning disabled.")
+                else:
+                    await interaction.response.send_message("Usage: `/learn list`, `/learn record <summary>`, `/learn forget <id>`, `/learn on`, `/learn off`", ephemeral=True)
+
+            @_cmd(name="config", description="View, get, or set configuration settings.")
+            @app_commands.describe(action="list, get, or set", key="Config key", value="Value (for set)")
+            async def config_cmd(interaction: discord.Interaction, action: Optional[str] = "list", key: Optional[str] = None, value: Optional[str] = None):
+                if not self._channel_allowed(interaction.channel_id):
+                    await interaction.response.send_message("⛔ Channel not allowed.", ephemeral=True)
+                    return
+                act = (action or "list").lower().strip()
+                if act == "list":
+                    lines = [
+                        "**⚙️ Current Configuration:**",
+                        f"• Provider: `{self.config.provider}` | Model: `{self.config.model}`",
+                        f"• Mode: `{self.config.mode}` | Permission: `{self.config.permission}`",
+                        f"• Discord permission: `{self.config.discord_permission}`",
+                        f"• Thinking effort: `{self.config.thinking_effort}`",
+                        f"• Theme: `{self.config.theme}` | Learning: `{self.config.learning_enabled}`",
+                        f"• Workspace: `{self.workspace}`",
+                    ]
+                    await interaction.response.send_message("\n".join(lines))
+                elif act == "get" and key:
+                    k = key.lower().strip()
+                    val = getattr(self.config, k, None)
+                    if val is not None:
+                        await interaction.response.send_message(f"⚙️ `{k}` = `{val}`")
+                    else:
+                        await interaction.response.send_message(f"❌ Unknown config key `{k}`.", ephemeral=True)
+                elif act == "set" and key and value is not None:
+                    if not self._user_allowed(interaction.user.id):
+                        await interaction.response.send_message("⛔ You are not allowed to modify config.", ephemeral=True)
+                        return
+                    k = key.lower().strip()
+                    if k in ("discord_bot_token", "api_keys"):
+                        await interaction.response.send_message("⛔ Keys must not be set via public chat.", ephemeral=True)
+                        return
+                    success = self.config.set_field(k, value)
+                    if success:
+                        await self._async_save_config()
+                        await interaction.response.send_message(f"✅ Updated config: `{k}` = `{value}`")
+                    else:
+                        await interaction.response.send_message(f"❌ Failed to set `{k}`. Check key name and type.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("Usage: `/config list`, `/config get <key>`, `/config set <key> <val>`", ephemeral=True)
 
             # ── /discord management command ──────────────────────────────
 

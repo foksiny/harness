@@ -93,11 +93,19 @@ the bot is launched from, using your configured provider/model.
   - Upload an attachment alongside `/ask` to mention a file.
   - Reference files inline with `@path/to/file` or `@/abs/path`.
 - **`/goal <objective>`** — start an autonomous **Super Mode** loop toward a goal.
+- **`/ultragoal <objective>`** — autonomous full app/game build with verification (alias: `/ultra-goal`).
 - **`/stop`** — interrupt the currently running turn (any channel + CLI side).
+- **`/info`** — inspect workspace, session, model, and context info (alias: `/sidebar`).
 - **`/mode <plan|build|super>`** — switch operational mode (synced with the CLI).
-- **`/perm <secure|default|full>`** — switch permission profile (synced with the CLI).
+- **`/perm <secure|default|full>`** — switch or view permission profile (synced with the CLI).
+- **`/effort [level]`** — set or view thinking / reasoning effort level (synced).
 - **`/provider [name]`** — show or switch the active LLM provider (synced).
 - **`/model [name]`** — show or change the current model (synced).
+- **`/diff`** — show uncommitted git changes in the workspace.
+- **`/checkpoint <list|create [label]|undo [id]|redo>`** — manage checkpoints.
+- **`/learn <list|record <summary>|forget <id>|on|off>`** — manage agent memory lessons.
+- **`/mcp`** — inspect configured MCP servers and tools.
+- **`/config <list|get <key>|set <key> <val>>`** — view or update configuration.
 - **`/session <list|all|create [title]|resume <id>|fork [title]|delete <id>|rename <id> <title>>`** — manage conversation sessions (synced; each session is associated to the workspace folder it was created in).
 - **`/todo <list|add|clear>`** — manage the task list.
 - **`/skills [list|reload]`** — view or reload available skills.

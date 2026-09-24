@@ -334,6 +334,20 @@ class TestDiscordBotFlow(unittest.IsolatedAsyncioTestCase):
         await bot._cmd_ask(interaction, "hello")  # channel 4242 is not allowed
         self.assertTrue(any("not allowed" in m for m in self._messages))
 
+    def test_registered_slash_commands(self):
+        if not _HAS_DISCORD:
+            self.skipTest("discord.py not installed")
+        cfg = HarnessConfig()
+        bot = HarnessDiscordBot(cfg, token="fake")
+        cmd_names = {c.name for c in bot.tree.get_commands()}
+        for expected in (
+            "ask", "goal", "ultragoal", "ultra-goal", "stop", "help", "status",
+            "mode", "perm", "effort", "provider", "model", "models", "queue",
+            "info", "sidebar", "session", "todo", "clear", "skills", "reload",
+            "diff", "checkpoint", "learn", "mcp", "config", "compact", "tokens", "discord"
+        ):
+            self.assertIn(expected, cmd_names)
+
 
 class TestMessageRelay(unittest.TestCase):
 

@@ -360,8 +360,9 @@ class OpenAICompatibleProvider(BaseProvider):
                                 if isinstance(delta.get("tool_calls"), list):
                                     for tc in delta["tool_calls"]:
                                         fn = tc.get("function", {})
+                                        t_idx = tc.get("index")
                                         tool_calls.append(ToolCallDelta(
-                                            index=tc.get("index", 0),
+                                            index=t_idx if t_idx is not None else 0,
                                             id=tc.get("id"),
                                             name=fn.get("name"),
                                             arguments_delta=fn.get("arguments", ""),
@@ -435,7 +436,12 @@ class OpenAICompatibleProvider(BaseProvider):
                             yield LLMChunk(delta_text=f"\n[Error from {self.display_name}: {err_msg}]\n", finish_reason="error")
                         else:
                             yield LLMChunk(delta_text=f"\n[Error from {self.display_name}: stream ended without a response]\n", finish_reason="error")
+                    else:
+                        rem_text, rem_reasoning = think_parser.flush()
+                        if rem_text or rem_reasoning:
+                            yield LLMChunk(delta_text=rem_text, delta_reasoning=rem_reasoning)
                     return
+
 
             except StreamHTTPError as he:
                 err_body = he.body

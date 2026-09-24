@@ -233,7 +233,15 @@ class MeshHandler(BaseHTTPRequestHandler):
                                     self.wfile.write(f"data: {payload}\n\n".encode())
                                     self.wfile.flush()
                                 elif etype == "tool_call_start":
-                                    payload = json.dumps({"tool": data})
+                                    payload = json.dumps({"tool": data, "type": "tool_call_start"})
+                                    self.wfile.write(f"data: {payload}\n\n".encode())
+                                    self.wfile.flush()
+                                elif etype == "tool_call_result":
+                                    payload = json.dumps({"tool_result": data, "type": "tool_call_result"})
+                                    self.wfile.write(f"data: {payload}\n\n".encode())
+                                    self.wfile.flush()
+                                elif etype == "error":
+                                    payload = json.dumps({"error": data, "type": "error"})
                                     self.wfile.write(f"data: {payload}\n\n".encode())
                                     self.wfile.flush()
                                 elif etype == "turn_complete":

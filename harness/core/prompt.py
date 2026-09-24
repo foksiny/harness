@@ -49,13 +49,17 @@ Your mission is to solve complex engineering, architecture, and programming task
 0. **Skills-First Investigation**: Before beginning any task, review the skills catalog that Harness pre-fetches at the start of every task via the `list_skills` tool. If any listed skill matches the user's use case, call `read_skill` with that skill's name to load its full instructions, and follow them.
 1. **Precision & Investigation First**: Never guess file contents or assumptions about APIs. Always inspect relevant files, search the codebase, and verify context before writing or editing code.
 2. **Minimal, Atomic Changes**: Make clean, targeted, non-breaking modifications. Do not perform indiscriminate full-file rewrites when surgical edits suffice. Maintain existing code conventions, styles, and comments.
-3. **Verify Everything**: After modifying code, proactively run tests, linters, or typecheckers to confirm correctness. Do not declare a task done until you have verified the solution works.
-3b. **Verification Mandate**: After modifying code, proactively run tests, linters, or typecheckers to confirm correctness. For visual work (frontend, GUI, TUI), verify via tests or user confirmation rather than screenshots.
+3. **Verify Everything**: After modifying code, proactively run tests, linters, or typecheckers to confirm correctness. For visual work (frontend, GUI, TUI), verify via tests or user confirmation rather than screenshots. Do not declare a task done until you have verified the solution works.
 4. **Proactive Clarification**: When you encounter genuine ambiguity, conflicting requirements, or critical architecture trade-offs that require user input, use the `ask_user` tool to present structured choices.
 5. **Structured Task Tracking**: For any non-trivial multi-step task (3+ steps), maintain clarity by initializing and updating tasks via `todo_create` and `todo_update`.
 6. **Delegation & Swarms**: Delegate whenever a subtask is parallelizable, requires deep isolated investigation, or maps to a specialized role. Dispatch a `spawn_swarm` of concurrent subagents (`researcher`, `planner`, `coder`, `tester`, `reviewer`) for independent work streams and let them coordinate through `swarm_send_message` / `swarm_read_messages`. Always write precise task prompts with acceptance criteria and an expected output format, then synthesize each agent's report into your final answer. Do NOT delegate trivial single-step work — context-switching overhead outweighs the benefit.
 7. **Explicit Completion via `finish`**: When the task is complete and you are ready to deliver your final answer — or when you determine no further tool calls are needed — stop iterating by calling the `finish` tool with a concise summary of what was accomplished, or simply produce your final answer text without calling any tools. Never respond with an empty message, begin redundant re-work, or keep iterating after the goal has been achieved.
 8. **Continuous Learning**: When you discover a reusable insight — a project convention, a tricky pitfall, a fix that worked, a command sequence — record it once with `learn_record` so future sessions benefit. When starting work related to something you may have faced before, use `learn_recall` to check prior lessons; honor the `## LEARNED LESSONS` section injected above. Promote proven, reused lessons into real skills with `learn_promote`. **Scope judgment**: if the lesson is specific to this codebase (project conventions, file paths, local tooling), promote it as a **workspace** skill. If it applies broadly across projects (coding patterns, debugging techniques, general tool tricks, language pitfalls), promote it as a **global** skill so it benefits every project you work on.
+9. **Maximum Execution & Cognition Efficiency (Do More, Think Leaner)**:
+   - **Lean, Purposeful Reasoning**: Keep internal reasoning dense, direct, and focused on essential architectural decisions, root causes, and non-obvious trade-offs. Avoid conversational stream-of-consciousness filler, repetitive self-talk, quoting entire files, or summarizing what tools do.
+   - **Batch Independent Operations**: Execute independent searches, reads, or file operations concurrently in the same turn instead of staggering them over multiple back-and-forth round-trips.
+   - **Zero Conversational Overhead**: When calling tools, proceed immediately to the tool invocation without introductory or transitional chatter ("I will now check file X...", "Now let me run...").
+   - **Direct Resolution in Minimal Turns**: Swiftly navigate inspection → diagnosis → edit → verification → completion with the minimum required turns. Never stall or re-read files you already inspected.
 
 """
 
@@ -95,29 +99,29 @@ _git_cache: Dict[str, Tuple[float, str]] = {}
 _GIT_CACHE_TTL = 2.0
 
 
-def get_git_info() -> str:
+def get_git_info(cwd: Optional[str] = None) -> str:
     """Retrieve active git branch and status if inside repository (cached)."""
-    cwd = os.getcwd()
+    target_cwd = os.path.abspath(cwd) if cwd else os.getcwd()
     now = time.monotonic()
     with _git_cache_lock:
-        cached = _git_cache.get(cwd)
+        cached = _git_cache.get(target_cwd)
         if cached and now - cached[0] < _GIT_CACHE_TTL:
             return cached[1]
     try:
         branch = subprocess.check_output(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            stderr=subprocess.DEVNULL, timeout=1
+            stderr=subprocess.DEVNULL, timeout=1, cwd=target_cwd
         ).decode().strip()
         status = subprocess.check_output(
             ["git", "status", "--porcelain"],
-            stderr=subprocess.DEVNULL, timeout=1
+            stderr=subprocess.DEVNULL, timeout=1, cwd=target_cwd
         ).decode().strip()
         diff_count = len([l for l in status.split("\n") if l.strip()])
         result = f"Git: branch `{branch}` ({diff_count} uncommitted changes)"
     except Exception:
         result = "Git: not a repository or git unavailable"
     with _git_cache_lock:
-        _git_cache[cwd] = (time.monotonic(), result)
+        _git_cache[target_cwd] = (time.monotonic(), result)
     return result
 
 
@@ -126,13 +130,14 @@ def clear_git_info_cache() -> None:
     with _git_cache_lock:
         _git_cache.clear()
 
-def load_project_rules() -> str:
+def load_project_rules(workspace_dir: Optional[str] = None) -> str:
     """Load project-specific custom instructions if available."""
+    base_path = Path(workspace_dir) if workspace_dir else Path.cwd()
     candidates = [
-        Path("HARNESS.md"),
-        Path(".harness/rules.md"),
-        Path("AGENTS.md"),
-        Path("CLAUDE.md"),
+        base_path / "HARNESS.md",
+        base_path / ".harness/rules.md",
+        base_path / "AGENTS.md",
+        base_path / "CLAUDE.md",
     ]
     rules_text = []
     for c in candidates:
@@ -171,7 +176,7 @@ class SystemPromptBuilder:
         """
         cwd = workspace_dir or os.getcwd()
         now_str = time.strftime("%Y-%m-%d %H:%M:%S %Z")
-        git_info = get_git_info()
+        git_info = get_git_info(cwd)
 
         sections = [SYSTEM_PROMPT_BASE]
 
@@ -209,7 +214,7 @@ class SystemPromptBuilder:
         if ultra_goal:
             sections.append(ULTRA_GOAL_PROTOCOL)
 
-        # 2. Permission Guidance
+        # 3. Permission Guidance
         sections.append("\n## PERMISSION PROFILE:")
         if self.permission == PermissionLevel.SECURE:
             sections.append(
@@ -226,19 +231,19 @@ class SystemPromptBuilder:
                 "- **DEFAULT PROFILE**: Standard developer workflow. Safe reads, edits, and standard build commands execute seamlessly. Potentially destructive commands prompt for user confirmation."
             )
 
-        # 3. Environment & Workspace Context
+        # 4. Environment & Workspace Context
         sections.append(f"\n## WORKSPACE CONTEXT:")
         sections.append(f"- Current Working Directory: `{cwd}`")
         sections.append(f"- System Time: {now_str}")
         sections.append(f"- OS / Platform: {platform.system()} {platform.machine()}")
         sections.append(f"- Version Control: {git_info}")
 
-        # 4. Project Rules
-        project_rules = load_project_rules()
+        # 5. Project Rules
+        project_rules = load_project_rules(cwd)
         if project_rules:
             sections.append(f"\n## PROJECT SPECIFIC INSTRUCTIONS:\n{project_rules}")
 
-        # 5. MCP Servers
+        # 6. MCP Servers
         if mcp_tools_summary:
             if degrade_verbose:
                 # In tight budgets drop the verbose per-tool MCP summaries,
@@ -246,19 +251,19 @@ class SystemPromptBuilder:
                 mcp_tools_summary = self._shrink_mcp(mcp_tools_summary)
             sections.append(f"\n## MODEL CONTEXT PROTOCOL (MCP) INTEGRATION:\n{mcp_tools_summary}")
 
-        # 6. Active To-Dos
+        # 7. Active To-Dos
         if active_todos:
             sections.append(f"\n## ACTIVE TASK LIST:\n{active_todos}")
 
-        # 6b. Learned lessons (persistent agent memory, matched to current task)
+        # 8. Learned lessons (persistent agent memory, matched to current task)
         if learned_lessons:
             sections.append(f"\n## LEARNED LESSONS (PRIOR MEMORY):\n{learned_lessons}")
 
-        # 6c. API server (replaces old mesh)
+        # 9. API server (replaces old mesh)
         if mesh_info:
             sections.append(f"\n## API SERVER:\n{mesh_info}")
 
-        # 7. Custom instructions
+        # 10. Custom instructions
         if custom_instructions:
             sections.append(f"\n## USER OVERRIDE INSTRUCTIONS:\n{custom_instructions}")
 

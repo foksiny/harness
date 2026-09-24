@@ -299,6 +299,10 @@ class HarnessAgent:
         self.subagent_orchestrator.parent_mode = mode
         self.emit("mode_change", mode.value)
 
+    @property
+    def permission(self) -> PermissionLevel:
+        return self.permission_manager.level
+
     def set_permission(self, perm: PermissionLevel):
         self.permission_manager.set_level(perm)
         self.prompt_builder.permission = perm
@@ -385,9 +389,11 @@ class HarnessAgent:
                 if chunk.delta_text:
                     text_acc += chunk.delta_text
                 for tc in chunk.tool_calls:
-                    idx = tc.index
+                    idx = tc.index if tc.index is not None else len(tool_calls_acc)
                     if idx not in tool_calls_acc:
                         tool_calls_acc[idx] = {"id": tc.id or f"tc_{idx}", "name": tc.name or "", "arguments": ""}
+                    if tc.id:
+                        tool_calls_acc[idx]["id"] = tc.id
                     if tc.name:
                         tool_calls_acc[idx]["name"] = tc.name
                     if tc.arguments_delta:
@@ -967,7 +973,7 @@ class HarnessAgent:
                             yield AgentEvent("text_delta", chunk.delta_text)
 
                         for tc in chunk.tool_calls:
-                            idx = tc.index
+                            idx = tc.index if tc.index is not None else len(tool_calls_accumulator)
                             if idx not in tool_calls_accumulator:
                                 tool_calls_accumulator[idx] = {
                                     "id": tc.id or f"tc_{idx}_{time.time()}",
