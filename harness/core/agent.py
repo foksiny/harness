@@ -722,11 +722,32 @@ class HarnessAgent:
             err = "vision fallback crashed unexpectedly"
         return events, description, err
 
+    def _notify_turn_end(self, outcome: Dict[str, Any]) -> None:
+        """Fire the end-of-turn OS notification (task complete / task failed).
+
+        Best-effort and never raises: a notification problem must never affect
+        the agent. User interrupts (``type == "interrupted"``) are silent —
+        the user is by definition already at the keyboard.
+        """
+        if not getattr(self.config, "notifications_enabled", True):
+            return
+        try:
+            from harness.core.notifications import notify_task_complete, notify_task_failed
+            if outcome.get("type") == "success":
+                notify_task_complete(outcome.get("summary", ""))
+            elif outcome.get("type") == "error":
+                notify_task_failed(outcome.get("error", ""))
+        except Exception:
+            pass
+
     def step(self, user_prompt: Optional[str] = None) -> Generator[AgentEvent, None, None]:
         """Execute a single or multi-step agent turn, yielding live events."""
         self.is_running = True
         self.clear_stop()
         tools_executed_this_turn = 0
+        # End-of-turn outcome for desktop notifications. "interrupted" is the
+        # default so a user Ctrl-C never pings the user who just pressed it.
+        turn_outcome: Dict[str, Any] = {"type": "interrupted"}
 
         if user_prompt is not None and not user_prompt.strip():
             user_prompt = None
@@ -739,6 +760,7 @@ class HarnessAgent:
             ok, err = validate_input_length(user_prompt, MAX_TUI_INPUT_LENGTH, "user prompt")
             if not ok:
                 yield AgentEvent("error", {"message": err})
+                self._notify_turn_end({"type": "error", "error": err})
                 self.is_running = False
                 return
 
@@ -746,14 +768,14 @@ class HarnessAgent:
             from harness.core.security import detect_injection, sanitize_input
             severity, matches = detect_injection(user_prompt)
             if severity == "block":
-                yield AgentEvent("error", {
-                    "message": (
-                        "⚠️  Security: Prompt blocked — potential injection detected. "
-                        f"Matched patterns: {', '.join(matches[:3])}. "
-                        "If this is a legitimate request, rephrase without instructions like "
-                        "'ignore previous', 'you are now', or 'system prompt'."
-                    )
-                })
+                blocked_msg = (
+                    "⚠️  Security: Prompt blocked — potential injection detected. "
+                    f"Matched patterns: {', '.join(matches[:3])}. "
+                    "If this is a legitimate request, rephrase without instructions like "
+                    "'ignore previous', 'you are now', or 'system prompt'."
+                )
+                yield AgentEvent("error", {"message": blocked_msg})
+                self._notify_turn_end({"type": "error", "error": "Prompt blocked: potential injection detected"})
                 self.is_running = False
                 return
             elif severity == "warn":
@@ -1067,6 +1089,12 @@ class HarnessAgent:
                 if error_accumulator:
                     yield AgentEvent("text_delta", f"\n[Harness] {self.provider.display_name} returned an error; ending this turn.\n")
                     yield AgentEvent("step_end", {"step": current_loop, "complete": True})
+                    turn_outcome = {
+                        "type": "error",
+                        "error": f"{self.provider.display_name}: " + (
+                            (error_accumulator.strip().splitlines() or ["unknown provider error"])[0][:200]
+                        ),
+                    }
                     break
                 empty_streak += 1
                 if tools_executed_this_turn:
@@ -1271,6 +1299,7 @@ class HarnessAgent:
                 yield AgentEvent("tool_call_result", {"name": "finish", "result": finish_summary})
                 yield AgentEvent("text_delta", finish_summary)
                 yield AgentEvent("step_end", {"step": current_loop, "complete": True})
+                turn_outcome = {"type": "success", "summary": finish_summary}
                 break
 
             if interrupted or self._stop_requested.is_set():
@@ -1302,10 +1331,22 @@ class HarnessAgent:
             yield AgentEvent("step_end", {"step": current_loop, "complete": False})
 
         self.is_running = False
-        self.clear_stop()
         self._sync_todos_to_session()
         self.session_manager.save(self.session)
         self._maybe_auto_learn(user_prompt)
+
+        # End-of-turn desktop notification. The stop flag is still set when the
+        # user interrupted, so that case stays silent — only clean completions
+        # and recorded errors notify. (Exception here cannot happen: if the
+        # generator raised, the tail never runs at all.)
+        if turn_outcome["type"] == "interrupted" and not self._stop_requested.is_set():
+            # No error was recorded and the stop flag is clear: a normal,
+            # completed answer — surface it as a success.
+            summary = self._last_assistant_text()
+            turn_outcome = {"type": "success", "summary": summary}
+        self.clear_stop()
+        self._notify_turn_end(turn_outcome)
+
         yield AgentEvent("turn_complete", {"messages_count": len(self.session.messages)})
 
     def _proactive_budget_check(self, sys_prompt: str):

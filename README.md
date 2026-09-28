@@ -23,6 +23,11 @@
 - 🌐 **16+ First-Class Providers**:
   - Anthropic, OpenAI, Google Gemini, OpenRouter, NVIDIA NIM, OpenCode Zen, Groq, DeepSeek, Mistral AI, xAI (Grok), Ollama (Local), Together AI, Fireworks AI, Cohere, Perplexity Sonar, and an Offline Mock Engine.
   - **Resilient streaming**: httpx-based SSE with per-line delivery (no buffering stalls), a generous 300s read timeout so long reasoning pauses don't surface as `read operation timed out` (tunable via `provider_stream_timeout` or `HARNESS_STREAM_TIMEOUT`), and retries for transient failures (resets, 5xx, rate limits) with exponential backoff — 5s/10s/20s by default, configurable via `provider_max_retries` and `provider_retry_base_delay`. If a stream dies mid-way (e.g. a long-thinking stall), the agent re-issues the whole model call after discarding the partial output; fatal errors (auth, bad request, context overflow) are never retried. Every retry is surfaced as a `🔁` notice.
+- 🔔 **Desktop Notifications**:
+  - When the agent finishes its task — or stops because of an error — you get a native OS notification, so you can switch to another window and come back the moment the run is over. Works on **macOS** (`osascript`), **Linux** (`notify-send`), and **Windows** (PowerShell balloon tip + sound), with a terminal-bell fallback when no desktop backend exists. Zero dependencies.
+  - Success notifications carry the agent's final summary (or `finish` summary); error notifications carry the first line of the provider error with an urgent sound/icon.
+  - User interrupts (Ctrl-C) stay silent — you're already at the keyboard. Notifications never crash or delay the agent: every dispatch is time-boxed and best-effort.
+  - Toggle anytime via `/config`: `notifications_enabled` (default `true`).
 - 🖼️ **Visual & Multimodal Models**:
   - Send image or video files to vision-capable models by typing the path, **swiping/dropping** the file into the terminal, or **pasting** the file path — auto-detected and converted into the model's native format (OpenAI `image_url`, Gemini `inline_data`, Anthropic `image`/`video` blocks, NVIDIA NIM `input_video`, and `data:` URIs).
   - Model-aware gating: images attach only when the model supports vision, videos only when the provider accepts native video (Gemini, Anthropic, NVIDIA NIM); otherwise the path degrades into a text reference with a clear warning.
