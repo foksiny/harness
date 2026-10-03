@@ -723,22 +723,36 @@ class HarnessAgent:
         return events, description, err
 
     def _notify_turn_end(self, outcome: Dict[str, Any]) -> None:
-        """Fire the end-of-turn OS notification (task complete / task failed).
+        """Fire the end-of-turn OS notification + sound cue.
 
-        Best-effort and never raises: a notification problem must never affect
-        the agent. User interrupts (``type == "interrupted"``) are silent —
-        the user is by definition already at the keyboard.
+        Best-effort and never raises: a notification or sound problem must never
+        affect the agent. User interrupts (``type == "interrupted"``) are silent
+        — the user is by definition already at the keyboard.
+
+        Sound is gated by its own ``sound_effects_enabled`` flag so it can be
+        toggled independently from the desktop toast.
         """
-        if not getattr(self.config, "notifications_enabled", True):
+        outcome_type = outcome.get("type")
+        if outcome_type == "interrupted":
             return
-        try:
-            from harness.core.notifications import notify_task_complete, notify_task_failed
-            if outcome.get("type") == "success":
-                notify_task_complete(outcome.get("summary", ""))
-            elif outcome.get("type") == "error":
-                notify_task_failed(outcome.get("error", ""))
-        except Exception:
-            pass
+        if getattr(self.config, "notifications_enabled", True):
+            try:
+                from harness.core.notifications import notify_task_complete, notify_task_failed
+                if outcome_type == "success":
+                    notify_task_complete(outcome.get("summary", ""))
+                elif outcome_type == "error":
+                    notify_task_failed(outcome.get("error", ""))
+            except Exception:
+                pass
+        if getattr(self.config, "sound_effects_enabled", True):
+            try:
+                from harness.core.sounds import play_task_complete, play_task_failed
+                if outcome_type == "success":
+                    play_task_complete()
+                elif outcome_type == "error":
+                    play_task_failed()
+            except Exception:
+                pass
 
     def step(self, user_prompt: Optional[str] = None) -> Generator[AgentEvent, None, None]:
         """Execute a single or multi-step agent turn, yielding live events."""

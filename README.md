@@ -1,6 +1,6 @@
-# Harness ⚡ — v0.10.0 (Beta)
+# Harness ⚡ — v0.10.3 (Beta)
 
-> **The Premier Agentic AI Engineering Harness & CLI** — now in **v0.10.0 Beta**
+> **The Premier Agentic AI Engineering Harness & CLI** — now in **v0.10.3 Beta**
 > Built for developers, autonomous AI workflows, and software engineers who demand speed, low memory (~24MB RAM), subagent orchestration, and multi-provider intelligence.
 
 ```
@@ -26,8 +26,15 @@
 - 🔔 **Desktop Notifications**:
   - When the agent finishes its task — or stops because of an error — you get a native OS notification, so you can switch to another window and come back the moment the run is over. Works on **macOS** (`osascript`), **Linux** (`notify-send`), and **Windows** (PowerShell balloon tip + sound), with a terminal-bell fallback when no desktop backend exists. Zero dependencies.
   - Success notifications carry the agent's final summary (or `finish` summary); error notifications carry the first line of the provider error with an urgent sound/icon.
+  - Banners stay on screen for **5 seconds** (`notify-send --expire-time` on Linux, `ShowBalloonTip(5000)` on Windows); macOS Notification Center governs its own dismissal timing.
   - User interrupts (Ctrl-C) stay silent — you're already at the keyboard. Notifications never crash or delay the agent: every dispatch is time-boxed and best-effort.
   - Toggle anytime via `/config`: `notifications_enabled` (default `true`).
+- 🔊 **Completion Sound Effects**:
+  - When the agent finishes its task you also get a **sweet synthesized chime** — an ascending C6–E6–G6 major triad with soft decaying harmonics — so your ears tell you the run is over even when the terminal is buried.
+  - Failed turns play a distinct low minor *fall* instead, so "done" and "broken" never sound alike.
+  - Works everywhere with **zero dependencies**: the tone is generated as raw PCM/WAV with the stdlib (`math` + `wave`) and played by whatever the system already ships — `afplay` (macOS), `paplay`/`pw-play`/`aplay` (Linux PulseAudio/PipeWire/ALSA), or PowerShell `SoundPlayer` (Windows) — with a terminal-bell fallback when no player exists.
+  - Playback is fire-and-forget (detached `Popen`), so audio never blocks or delays the agent, and it degrades silently to nothing at all if the platform has no audio.
+  - Toggle anytime via `/config`: `sound_effects_enabled` (default `true`).
 - 🖼️ **Visual & Multimodal Models**:
   - Send image or video files to vision-capable models by typing the path, **swiping/dropping** the file into the terminal, or **pasting** the file path — auto-detected and converted into the model's native format (OpenAI `image_url`, Gemini `inline_data`, Anthropic `image`/`video` blocks, NVIDIA NIM `input_video`, and `data:` URIs).
   - Model-aware gating: images attach only when the model supports vision, videos only when the provider accepts native video (Gemini, Anthropic, NVIDIA NIM); otherwise the path degrades into a text reference with a clear warning.

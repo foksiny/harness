@@ -78,6 +78,7 @@ class HarnessConfig:
     compact_summary: str = "auto"  # auto | llm | heuristic
     learning_enabled: bool = True    # Persistent cross-session lessons (learn_record/recall/promote)
     notifications_enabled: bool = True  # OS desktop notification when a turn finishes or errors
+    sound_effects_enabled: bool = True  # Chime/fall sound cue when a turn finishes or errors
     max_subagents: int = 4
     timeout_seconds: int = 120
     swarm_enabled: bool = False      # Enable agent swarms (always active in SUPER mode)

@@ -11,6 +11,11 @@ mechanism:
 - Windows:  PowerShell balloon tip (rendered as a toast on Win10+) + sound
 - Fallback: terminal bell (BEL byte) when no OS backend is available
 
+Banners stay on screen for ``_NOTIFY_DURATION`` seconds (5s) on the backends
+that let us set it — ``notify-send --expire-time`` on Linux and
+``ShowBalloonTip(ms)`` on Windows. macOS Notification Center owns its own
+dismissal timing, so the toast there follows system settings.
+
 Everything here is best-effort: a notification must NEVER crash or delay
 the agent. Every call is wrapped, time-boxed, and silently degrades to
 the bell (or a no-op when stderr is not a TTY).
@@ -24,6 +29,12 @@ _TIMEOUT = 8  # seconds; generous enough for a cold-starting PowerShell
 
 APP_NAME = "Harness"
 _MAX_MESSAGE = 220  # keep toasts to a single readable banner
+
+# How long the banner stays on screen before the OS reclaims it. Honoured by
+# every backend that exposes a duration knob (``notify-send -t``, WinForms
+# ``ShowBalloonTip(ms)``); macOS Notification Center owns its own dismissal
+# timing, so the toast there is governed by system settings instead.
+_NOTIFY_DURATION = 5   # seconds on screen
 
 
 def _in_test_sandbox() -> bool:
@@ -59,6 +70,7 @@ def _linux_args(title: str, message: str, urgent: bool) -> List[str]:
         "notify-send",
         "--app-name", APP_NAME,
         "--urgency", "critical" if urgent else "normal",
+        "--expire-time", str(_NOTIFY_DURATION * 1000),
         title,
         message,
     ]
@@ -77,7 +89,7 @@ def _windows_args(title: str, message: str, urgent: bool) -> List[str]:
         f"$n.BalloonTipTitle = '{_escape_powershell(title)}'",
         f"$n.BalloonTipText = '{_escape_powershell(message)}'",
         f"$n.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::{tip_icon}",
-        "$n.ShowBalloonTip(6000)",
+        f"$n.ShowBalloonTip({_NOTIFY_DURATION * 1000})",
         f"[System.Media.SystemSounds]::{sound}.Play()",
         "Start-Sleep -Milliseconds 1200",
         "$n.Dispose()",

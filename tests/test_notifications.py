@@ -66,12 +66,22 @@ class TestNotificationDispatch(unittest.TestCase):
         urgent_args = notif._macos_args("T", "M", urgent=True)
         self.assertIn('"Basso"', urgent_args[2])
 
+    def test_notify_duration_is_five_seconds(self):
+        self.assertEqual(notif._NOTIFY_DURATION, 5)
+
     def test_linux_args_use_notify_send_and_urgency(self):
         args = notif._linux_args("Title", "Message", urgent=True)
         self.assertEqual(args[0], "notify-send")
         self.assertIn("--app-name", args)
         self.assertIn("Harness", args)
         self.assertIn("critical", args)
+
+    def test_linux_args_pin_expire_time_to_five_seconds(self):
+        args = notif._linux_args("Title", "Message", urgent=False)
+        self.assertIn("--expire-time", args)
+        expire = args[args.index("--expire-time") + 1]
+        self.assertEqual(int(expire), notif._NOTIFY_DURATION * 1000)
+        self.assertEqual(expire, "5000")
 
     def test_windows_args_build_balloon_tip_script(self):
         args = notif._windows_args("It's done", "a 'quoted' thing", urgent=False)
@@ -81,6 +91,7 @@ class TestNotificationDispatch(unittest.TestCase):
         self.assertIn("It''s done", joined)  # single quotes doubled for PS
         self.assertIn("a ''quoted'' thing", joined)
         self.assertIn("Asterisk", joined)
+        self.assertIn("ShowBalloonTip(5000)", joined)  # stays on screen 5s
 
     def test_windows_args_urgent_uses_error_icon_and_sound(self):
         args = notif._windows_args("T", "M", urgent=True)
