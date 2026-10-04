@@ -45,7 +45,7 @@ from harness.config import HarnessConfig
 from harness.core.agent import HarnessAgent
 from harness.discord.renderer import DiscordRenderState, DiscordOutgoing, chunk_message, chunk_quote
 from harness.discord.help_text import DISCORD_HELP_TEXT, GENERAL_HELP_TEXT
-from harness.discord.sync import get_relay
+from harness.discord.sync import get_relay, STREAM, is_self_echo
 
 log = logging.getLogger("harness.discord")
 
@@ -256,6 +256,15 @@ if HAS_DISCORD:
             # CLI ↔ Discord synchronization (best-effort; never blocks Discord).
             self._relay = get_relay()
             self._sync_cursor = self._relay.bus.new_cursor()
+            # Live CLI turn rendering: stream_id → text rendered so far, and
+            # (channel_id, stream_id) → the message being edited in place.
+            self._live_streams: Dict[str, str] = {}
+            self._live_messages: Dict[tuple, object] = {}
+            # Live-stream deltas are queued so the agent's worker thread never
+            # blocks on a Discord round-trip while streaming tokens.
+            self._live_queue: queue.Queue = queue.Queue()
+            self._live_writer: Optional[threading.Thread] = None
+            self._live_writer_stop = threading.Event()
             self._agent_lock = threading.Lock()
             self._loop: Optional[asyncio.AbstractEventLoop] = None
             self._bus_task = None
@@ -277,6 +286,7 @@ if HAS_DISCORD:
             try:
                 self._relay.register_state_listener(self._on_state_event)
                 self._relay.register_cli(self._on_cli_message)
+                self._relay.register_stream(self._on_cli_stream)
             except Exception:
                 log.debug("Sync wiring failed (relay unavailable)", exc_info=True)
             try:
@@ -287,6 +297,49 @@ if HAS_DISCORD:
                 self._bus_task = None
                 return
             self._bus_task = loop.create_task(self._bus_poller())
+
+        def _on_cli_stream(self, delta: str, stream_id: str, channel_id: Optional[int]) -> None:
+            """In-process: the TUI-hosted turn is streaming its answer here."""
+            self._dispatch_live_stream(stream_id, delta)
+
+        def _dispatch_live_stream(self, stream_id: str, delta: str) -> None:
+            """Schedule an in-place edit of the live answer message.
+
+            Runs on the TUI's agent worker thread (one call per token), so the
+            work is queued to a single-writer thread instead of blocking token
+            streaming on a round-trip to Discord.
+            """
+            if not delta:
+                return
+            self._live_queue.put((stream_id, delta))
+
+        def _live_stream_writer() -> None:
+            """Drain live-stream deltas sequentially (keeps edit ordering)."""
+            while True:
+                try:
+                    stream_id, delta = self._live_queue.get(timeout=0.5)
+                except queue.Empty:
+                    if self._live_writer_stop.is_set():
+                        return
+                    continue
+                if self._loop is None:
+                    continue
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self._render_live_stream(stream_id, delta), self._loop,
+                    )
+                    fut.result(timeout=10)
+                except Exception:
+                    log.debug("Live stream render failed", exc_info=True)
+
+        def _start_live_stream_writer() -> None:
+            if self._live_writer is not None and self._live_writer.is_alive():
+                return
+            self._live_writer_stop.clear()
+            self._live_writer = threading.Thread(
+                target=_live_stream_writer, daemon=True, name="harness-discord-live",
+            )
+            self._live_writer.start()
 
         async def _bus_poller(self) -> None:
             """Periodically consume cross-process bus events (separate CLI process)."""
@@ -305,6 +358,8 @@ if HAS_DISCORD:
             origin = ev.get("origin", "")
             if origin == "discord":
                 return  # our own publish — applied locally before publishing
+            if is_self_echo(ev, self._relay.instance_id):
+                return  # already applied through the in-process callbacks
             try:
                 if kind == "state":
                     payload = ev.get("payload", {})
@@ -325,6 +380,13 @@ if HAS_DISCORD:
                 elif kind == "message":
                     # A prompt typed in the TUI was executed there; mirror as activity.
                     await self._broadcast_activity(f"⌨️ CLI: {str(ev.get('text', ''))[:400]}")
+                elif kind == STREAM:
+                    stream_id = str(ev.get("stream_id") or "")
+                    if stream_id:
+                        if ev.get("opening") or ev.get("final"):
+                            self._close_live_stream(stream_id)
+                        else:
+                            await self._render_live_stream(stream_id, str(ev.get("delta", "")))
                 elif kind == "output":
                     txt = str(ev.get("text", "")).strip()
                     if txt:
@@ -332,6 +394,40 @@ if HAS_DISCORD:
                         await self._broadcast_activity(txt[:1900])
             except Exception:
                 log.debug("Failed handling sync event", exc_info=True)
+
+        async def _render_live_stream(self, stream_id: str, delta: str) -> None:
+            """Append *delta* to the live answer message of a CLI turn.
+
+            One message per (channel, turn), edited in place — never one message
+            per token. Over-long answers are truncated with a pointer to the CLI.
+            """
+            if not stream_id:
+                return
+            text = self._live_streams.get(stream_id, "") + delta
+            if len(text) > self.max_message_len - 8:
+                text = f"{text[: self.max_message_len - 8]}\n…(+{len(text) - self.max_message_len} chars — see the CLI for the full answer)"
+            for channel_id in list(self._runtimes.keys()):
+                if not self._channel_allowed(channel_id):
+                    continue
+                try:
+                    ch = self.bot.get_channel(channel_id)
+                    if ch is None:
+                        continue
+                    key = (channel_id, stream_id)
+                    msg = self._live_messages.get(key)
+                    if msg is None:
+                        msg = await ch.send(f"💻 {text}")
+                        self._live_messages[key] = msg
+                    else:
+                        await msg.edit(content=f"💻 {text}")
+                except Exception:
+                    continue
+            self._live_streams[stream_id] = text
+
+        def _close_live_stream(self, stream_id: str) -> None:
+            self._live_streams.pop(stream_id, None)
+            for key in [k for k in self._live_messages if k[1] == stream_id]:
+                self._live_messages.pop(key, None)
 
         def _on_cli_message(self, text: str) -> None:
             """In-process: text typed in the TUI (prompt or command) — show in allowed channels."""
@@ -492,6 +588,7 @@ if HAS_DISCORD:
                 if self._bus_task is None or self._bus_task.done():
                     # Start the cross-process sync poller now that the loop runs.
                     self._bus_task = self._loop.create_task(self._bus_poller())
+                self._start_live_stream_writer()
                 guild_id = self.config.discord_guild_id.strip()
                 try:
                     # Always sync globally — our commands are registered globally
@@ -1448,7 +1545,7 @@ if HAS_DISCORD:
                         f"• Provider: `{self.config.provider}` | Model: `{self.config.model}`",
                         f"• Mode: `{self.config.mode}` | Permission: `{self.config.permission}`",
                         f"• Discord permission: `{self.config.discord_permission}`",
-                        f"• Thinking effort: `{self.config.thinking_effort}`",
+                        f"• Thinking effort: `{self.config.thinking_effort}` | Temperature: `{self.config.temperature}`",
                         f"• Theme: `{self.config.theme}` | Learning: `{self.config.learning_enabled}`",
                         f"• Workspace: `{self.workspace}`",
                     ]
@@ -1887,6 +1984,15 @@ if HAS_DISCORD:
                 relay = self._relay
                 relay.relay_from_discord(full_user_prompt, interaction.channel_id)
                 event_count = 0
+                # Stream the answer back to the CLI as one growing text instead
+                # of relaying every rendered chunk as a separate OUTPUT event.
+                # Discord itself still posts the full answer at the end, so the
+                # CLI receives the same text progressively.
+                relay_stream_id = f"discord-{interaction.channel_id}-{id(interaction)}"
+                streamed: list[str] = []
+                last_published = 0.0
+                relay.begin_stream(relay_stream_id, origin="discord",
+                                   channel_id=interaction.channel_id)
 
                 while True:
                     try:
@@ -1897,11 +2003,24 @@ if HAS_DISCORD:
                         break
                     if isinstance(item, Exception):
                         await self._send_fallback(interaction, f"❌ **Execution error**: {item}")
+                        relay.relay_output(f"❌ {item}", origin="discord", channel_id=interaction.channel_id)
+                        relay.end_stream(relay_stream_id, origin="discord",
+                                         channel_id=interaction.channel_id)
                         sent_any = True
                         break
                     for out in state.add_event(item):
                         await self._send_out(interaction, out)
                         sent_any = True
+                    if getattr(item, "type", "") == "text_delta":
+                        streamed.append(str(item.data or ""))
+                        # Throttled publish: one bus write per ~0.4s of typing
+                        # instead of one per token.
+                        now = asyncio.get_running_loop().time()
+                        if now - last_published >= 0.4:
+                            last_published = now
+                            relay.publish_stream(relay_stream_id, "".join(streamed),
+                                                 origin="discord",
+                                                 channel_id=interaction.channel_id)
                     event_count += 1
 
                 # Wait for worker thread to finish (callback restoration).
@@ -1914,6 +2033,11 @@ if HAS_DISCORD:
                 for out in state.finish():
                     await self._send_out(interaction, out)
                     sent_any = True
+
+                relay.publish_stream(relay_stream_id, "".join(streamed), origin="discord",
+                                     channel_id=interaction.channel_id)
+                relay.end_stream(relay_stream_id, origin="discord",
+                                 channel_id=interaction.channel_id)
 
                 if agent.stop_requested():
                     await self._send_fallback(interaction, "⏹ Turn interrupted by /stop.")
@@ -1932,6 +2056,13 @@ if HAS_DISCORD:
                 try:
                     await interaction.followup.send(f"❌ **Internal error**: {exc}", ephemeral=True)
                 except discord.HTTPException:
+                    pass
+                try:
+                    self._relay.end_stream(
+                        f"discord-{interaction.channel_id}-{id(interaction)}",
+                        origin="discord", channel_id=interaction.channel_id,
+                    )
+                except Exception:
                     pass
             finally:
                 rt.active_channels.discard(interaction.channel_id)
@@ -2078,12 +2209,15 @@ if HAS_DISCORD:
         # ── Discord message helpers ──────────────────────────────────────
 
         async def _send_out(self, interaction: discord.Interaction, out: DiscordOutgoing) -> None:
+            # Only the final answer streams to the CLI; thinking/notice blocks are
+            # internal Discord rendering and would only add noise on the CLI side.
+            mirror = out.kind == "response"
             if out.kind == "thinking":
                 chunks = chunk_quote(out.text, self.max_message_len)
             else:
                 chunks = chunk_message(out.text, self.max_message_len)
             for chunk in chunks:
-                await self._send_fallback(interaction, chunk)
+                await self._send_fallback(interaction, chunk, mirror=mirror)
 
         async def _send_chunked(self, interaction: discord.Interaction, text: str) -> None:
             if interaction.response.is_done():
@@ -2096,7 +2230,7 @@ if HAS_DISCORD:
                     else:
                         await self._send_fallback(interaction, chunk)
 
-        async def _send_fallback(self, interaction: discord.Interaction, content: str) -> None:
+        async def _send_fallback(self, interaction: discord.Interaction, content: str, mirror: bool = True) -> None:
             """Send a message, retrying with halved content if it exceeds Discord's limit."""
             for attempt in range(3):
                 try:
@@ -2105,10 +2239,11 @@ if HAS_DISCORD:
                     else:
                         await interaction.response.send_message(content, ephemeral=False)
                     # Mirror agent output to the CLI side (display only)
-                    try:
-                        self._relay.relay_output(content, origin="discord", channel_id=interaction.channel_id)
-                    except Exception:
-                        pass
+                    if mirror:
+                        try:
+                            self._relay.relay_output(content, origin="discord", channel_id=interaction.channel_id)
+                        except Exception:
+                            pass
                     return
                 except discord.HTTPException as exc:
                     if "Must be 2000 or fewer" in str(exc) and attempt < 2:

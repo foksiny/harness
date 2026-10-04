@@ -19,7 +19,9 @@ from harness.discord.renderer import (
     chunk_message,
     chunk_quote,
 )
-from harness.discord.sync import MessageRelay, get_relay, SyncBus, MESSAGE, OUTPUT, STATE, STOP
+from harness.discord.sync import (
+    MessageRelay, get_relay, SyncBus, is_self_echo, MESSAGE, OUTPUT, STREAM, STATE, STOP,
+)
 
 
 class _EV:
@@ -342,7 +344,7 @@ class TestDiscordBotFlow(unittest.IsolatedAsyncioTestCase):
         cmd_names = {c.name for c in bot.tree.get_commands()}
         for expected in (
             "ask", "goal", "ultragoal", "ultra-goal", "stop", "help", "status",
-            "mode", "perm", "effort", "provider", "model", "models", "queue",
+            "mode", "perm", "effort", "temperature", "provider", "model", "models", "queue",
             "info", "sidebar", "session", "todo", "clear", "skills", "reload",
             "diff", "checkpoint", "learn", "mcp", "config", "compact", "tokens", "discord"
         ):
@@ -482,6 +484,277 @@ class TestSyncBus(unittest.TestCase):
     def test_publish_never_raises_on_bad_path(self):
         bus = SyncBus(path=Path("/proc/definitely/not/writable/bus.jsonl"))
         bus.publish({"kind": MESSAGE, "origin": "cli", "text": "x"})  # must not raise
+
+
+class TestLiveStreamSync(unittest.TestCase):
+    """Streaming a turn must be incremental, single-message and echo-free."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "bus.jsonl"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _relay(self):
+        return MessageRelay(bus_path=self.path)
+
+    def _poll_all(self):
+        from harness.discord.sync import SyncCursor
+        return SyncBus(path=self.path).poll(SyncCursor(offset=0, start_ts=time.time() - 60))
+
+    def test_stream_publishes_deltas_not_full_text(self):
+        relay = self._relay()
+        relay.begin_stream("t1", origin="cli")
+        relay.publish_stream("t1", "Hel", origin="cli")
+        relay.publish_stream("t1", "Hello", origin="cli")
+        relay.publish_stream("t1", "Hello world", origin="cli")
+        deltas = [e["delta"] for e in self._poll_all() if e.get("kind") == STREAM and not e.get("opening")]
+        self.assertEqual(deltas, ["Hel", "lo", " world"])
+
+    def test_stream_callback_receives_deltas(self):
+        relay = self._relay()
+        got = []
+        relay.register_stream(lambda delta, sid, cid: got.append((delta, sid, cid)))
+        relay.begin_stream("t2", origin="cli")
+        relay.publish_stream("t2", "abc", origin="cli")
+        relay.publish_stream("t2", "abcdef", origin="cli")
+        self.assertEqual([d for d, _, _ in got], ["abc", "def"])
+        self.assertEqual({sid for _, sid, _ in got}, {"t2"})
+
+    def test_stream_deltas_survive_a_bus_restart(self):
+        """A second consumer polling from offset 0 sees the answer only once."""
+        relay = self._relay()
+        relay.begin_stream("t3", origin="cli")
+        relay.publish_stream("t3", "one two", origin="cli")
+        relay.publish_stream("t3", "one two three", origin="cli")
+
+        from harness.discord.sync import SyncCursor
+        cur = SyncCursor(offset=0, start_ts=time.time() - 60)
+        first = [e["delta"] for e in SyncBus(path=self.path).poll(cur)
+                 if e.get("kind") == STREAM and not e.get("opening")]
+        self.assertEqual(first, ["one two", " three"])
+        # Polling again yields nothing — no replay of the same stream.
+        self.assertEqual(SyncBus(path=self.path).poll(cur), [])
+
+    def test_end_stream_marks_final(self):
+        relay = self._relay()
+        relay.begin_stream("t4", origin="cli")
+        relay.publish_stream("t4", "done", origin="cli")
+        relay.end_stream("t4", origin="cli")
+        finals = [e for e in self._poll_all() if e.get("final")]
+        self.assertTrue(finals)
+        self.assertEqual(finals[-1]["delta"], "")
+        self.assertEqual(finals[-1]["stream_id"], "t4")
+
+    def test_end_stream_unknown_is_noop(self):
+        relay = self._relay()
+        relay.end_stream("never-opened", origin="cli")  # must not raise
+        self.assertEqual([e for e in self._poll_all()], [])
+
+
+class TestEchoSuppression(unittest.TestCase):
+    """In-process consumers must not double-apply their own bus events."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "bus.jsonl"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_in_process_callbacks_are_additive(self):
+        """The in-TUI bot registering must NOT unregister the TUI's handler."""
+        relay = MessageRelay(bus_path=self.path)
+        tui_msgs, bot_msgs = [], []
+        relay.register_cli(lambda text: tui_msgs.append(text))
+        relay.register_cli(lambda text: bot_msgs.append(text))
+        relay.relay_from_discord("hello", channel_id=7)
+        self.assertEqual(tui_msgs, ["hello"])
+        self.assertEqual(bot_msgs, ["hello"])
+
+    def test_discord_callbacks_are_additive(self):
+        relay = MessageRelay(bus_path=self.path)
+        first, second = [], []
+        relay.register_discord(lambda text, cid: first.append(text))
+        relay.register_discord(lambda text, cid: second.append(text))
+        relay.relay_from_cli("hi")
+        self.assertEqual(first, ["hi"])
+        self.assertEqual(second, ["hi"])
+
+    def test_state_listeners_are_additive(self):
+        relay = MessageRelay(bus_path=self.path)
+        seen_a, seen_b = [], []
+        relay.register_state_listener(lambda p, o: seen_a.append(p))
+        relay.register_state_listener(lambda p, o: seen_b.append(p))
+        relay.publish_state({"mode": "plan"}, origin="discord")
+        self.assertEqual(seen_a, [{"mode": "plan"}])
+        self.assertEqual(seen_b, [{"mode": "plan"}])
+
+    def test_self_echo_detected_only_for_same_instance(self):
+        relay = MessageRelay(bus_path=self.path)
+        relay.relay_from_cli("typed in TUI")
+        from harness.discord.sync import SyncCursor
+        cur = SyncCursor(offset=0, start_ts=time.time() - 60)
+        events = SyncBus(path=self.path).poll(cur)
+        self.assertTrue(events)
+        ev = events[0]
+        self.assertTrue(is_self_echo(ev, relay.instance_id))
+        self.assertFalse(is_self_echo(ev, "a-different-instance"))
+
+    def test_stream_events_are_never_self_echo(self):
+        relay = MessageRelay(bus_path=self.path)
+        relay.begin_stream("s1", origin="cli")
+        relay.publish_stream("s1", "text", origin="cli")
+        from harness.discord.sync import SyncCursor
+        cur = SyncCursor(offset=0, start_ts=time.time() - 60)
+        events = SyncBus(path=self.path).poll(cur)
+        self.assertTrue(events)
+        for ev in events:
+            self.assertFalse(is_self_echo(ev, relay.instance_id))
+
+    def test_two_relays_do_not_see_each_others_backlog(self):
+        tui = MessageRelay(bus_path=self.path)
+        bot = MessageRelay(bus_path=self.path)
+        tui.relay_from_cli("from cli")
+        bot.relay_from_discord("from discord", channel_id=1)
+        # Each relay polls from the position it had when it started.
+        self.assertEqual(tui.bus.poll(tui.bus.new_cursor()), [])
+        self.assertEqual(bot.bus.poll(bot.bus.new_cursor()), [])
+
+
+class _StubAgent:
+    """Agent stand-in for _poll_sync_bus tests."""
+
+    def __init__(self):
+        self.is_running = False
+        self.stops = 0
+        self.session = None
+        self.config = HarnessConfig()
+        self.mode = None
+        self.permission_manager = None
+
+    def request_stop(self):
+        self.stops += 1
+
+
+class _StubRenderer:
+    def __init__(self):
+        self.lines = []
+
+    def print_info(self, msg):
+        self.lines.append(msg)
+
+    print_warning = print_success = print_info
+
+
+class TestCliPollSyncBus(unittest.TestCase):
+    """_poll_sync_bus must react to remote events without a screen refresh."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "bus.jsonl"
+        import harness.discord.sync as sync_mod
+        from harness.tui import interactive as interactive_mod
+        self._sync_mod = sync_mod
+        self._old_relay = sync_mod._global_relay
+        self.relay = MessageRelay(bus_path=self.path)
+        sync_mod._global_relay = self.relay
+        self._old_bus_env = os.environ.get("HARNESS_SYNC_BUS")
+        os.environ["HARNESS_SYNC_BUS"] = str(self.path)
+        self.agent = _StubAgent()
+        self.renderer = _StubRenderer()
+        self.activity: list = []
+        self.notices: list = []
+        self.cursor = self.relay.bus.new_cursor()
+        self.interactive_mod = interactive_mod
+
+    def tearDown(self):
+        self._sync_mod._global_relay = self._old_relay
+        if self._old_bus_env is None:
+            os.environ.pop("HARNESS_SYNC_BUS", None)
+        else:
+            os.environ["HARNESS_SYNC_BUS"] = self._old_bus_env
+        self._tmp.cleanup()
+
+    def _poll(self, queue=None, worker_wake=None):
+        self.interactive_mod._poll_sync_bus(
+            self.agent, self.renderer, self.cursor, self.activity,
+            queue=queue, worker_wake=worker_wake, notice_sink=self.notices,
+        )
+
+    def _remote(self):
+        """A second relay = the other process (standalone Discord bot)."""
+        return MessageRelay(bus_path=self.path)
+
+    def test_discord_stop_interrupts_running_agent(self):
+        remote = self._remote()
+        self.agent.is_running = True
+        remote.publish_stop(origin="discord", channel_id=7)
+        self._poll()
+        self.assertEqual(self.agent.stops, 1)
+        self.assertTrue(any("Stop requested" in n for n in self.notices))
+
+    def test_discord_prompt_is_enqueued_and_announced(self):
+        remote = self._remote()
+        from harness.tui.queue import ExecutionQueue
+        q = ExecutionQueue()
+        remote.relay_from_discord("summarize README", channel_id=42)
+        self._poll(queue=q)
+        self.assertEqual(q.size(), 1)
+        self.assertEqual(q.peek().prompt, "summarize README")
+        self.assertTrue(any("Enqueued prompt" in n for n in self.notices))
+
+    def test_cli_activity_echo_line_is_not_enqueued(self):
+        remote = self._remote()
+        from harness.tui.queue import ExecutionQueue
+        q = ExecutionQueue()
+        remote.relay_from_discord("⌨️ CLI: /mode plan", channel_id=1)
+        self._poll(queue=q)
+        self.assertEqual(q.size(), 0)
+        self.assertIn(("⌨️ CLI: /mode plan", 1), self.activity)
+
+    def test_queue_control_from_discord(self):
+        remote = self._remote()
+        from harness.tui.queue import ExecutionQueue
+        q = ExecutionQueue()
+        q.enqueue("a")
+        q.enqueue("b")
+        remote.publish_state({"queue_action": "pause"}, origin="discord")
+        self._poll(queue=q)
+        self.assertTrue(q.is_paused)
+        remote.publish_state({"queue_action": "resume"}, origin="discord")
+        self._poll(queue=q)
+        self.assertFalse(q.is_paused)
+        remote.publish_state({"queue_action": "clear"}, origin="discord")
+        self._poll(queue=q)
+        self.assertEqual(q.size(), 0)
+
+    def test_discord_streamed_answer_is_incremental(self):
+        remote = self._remote()
+        remote.begin_stream("dc-1", origin="discord", channel_id=42)
+        for cum in ("I read", "I read the", "I read the README"):
+            remote.publish_stream("dc-1", cum, origin="discord", channel_id=42)
+        remote.end_stream("dc-1", origin="discord", channel_id=42)
+        self._poll()
+        text = "".join(t if isinstance(t, str) else t[0] for t in self.activity)
+        self.assertEqual(text, "I read the README")
+        # Rendered as chunks, never as repeated full copies.
+        self.assertGreater(len(self.activity), 1)
+
+    def test_own_cli_events_are_ignored(self):
+        self.relay.relay_from_cli("typed locally")
+        self.relay.relay_output("local output", origin="cli")
+        self._poll()
+        self.assertEqual(self.activity, [])
+
+    def test_own_cli_stream_is_not_echoed_back(self):
+        """The TUI publishes the stream it is already rendering itself."""
+        self.relay.begin_stream("cli-1", origin="cli")
+        for cum in ("Here", "Here is", "Here is the plan"):
+            self.relay.publish_stream("cli-1", cum, origin="cli")
+        self._poll()
+        self.assertEqual(self.activity, [])
 
 
 class TestAgentCooperativeStop(unittest.TestCase):

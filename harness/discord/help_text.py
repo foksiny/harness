@@ -66,8 +66,10 @@ and the two sides stay fully synchronized.
 ### How output is rendered
 - **Thinking** appears as `> ` quote blocks as the model iterates.
 - **Tools** are announced live: `🔧 Using tool: name` with a short result.
-- The **final response is not streamed** — the full answer is posted in one message
-  (or several, if longer than 2000 characters) when the turn completes.
+- The **final response is not streamed** to Discord — the full answer is posted in
+  one message (or several, if longer than 2000 characters) when the turn
+  completes. Answers produced *in the CLI* do stream: one `💻` message that grows
+  as the turn progresses.
 
 ### When the agent asks you a question
 When the model calls the `ask_user` tool (clarification, design decisions, or
@@ -77,14 +79,22 @@ confirmation), the question is posted **directly in the channel**:
 - The agent waits (up to 15 minutes) until someone answers.
 
 ## 7. CLI ↔ Discord synchronization
-The TUI and the bot mirror each other **live**:
+The TUI and the bot mirror each other **live** — no refresh, `/clear`, or restart:
 - **Prompts and commands** typed on one side are shown on the other (`⌨️ CLI: …` / Discord activity lines).
+- **Agent answers stream both ways** as a single message that grows token by token
+  (`💻` on Discord), instead of one message per chunk.
+- Incoming Discord activity (prompts, streamed answers, state changes, `/stop`)
+  appears in the CLI's bottom toolbar the moment it arrives, even while the input
+  prompt is idle — no screen clear needed.
 - **State commands** — `/mode`, `/perm`, `/provider`, `/model`, `/effort`,
-  `/session`, `/goal` — apply on **both sides** at once.
+  `/temperature`, `/session`, `/goal` — apply on **both sides** at once.
 - **`/stop`** interrupts the running turn wherever it is running (CLI or Discord).
 - Cross-process sync uses `~/.harness/sync_bus.jsonl` (configurable via
   `HARNESS_SYNC_BUS`), so a standalone `harness discord` process and an
-  interactive TUI stay in sync automatically.
+  interactive TUI stay in sync automatically. Each side tracks its own read
+  position, so running both at once (or in-process via `discord_auto_start`)
+  never double-applies an event.
+- `/discord sync` forces a full state snapshot to the other side.
 """
 
 GENERAL_HELP_TEXT = """# ⚡ Harness Discord Bot

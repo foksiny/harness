@@ -33,6 +33,7 @@ _BUS_KEEP_BYTES = 64_000
 
 MESSAGE = "message"   # user-typed text (prompt / command line)
 OUTPUT = "output"     # agent-produced text mirrored for display
+STREAM = "stream"     # cumulative in-flight agent text (edited in place downstream)
 STATE = "state"       # config/agent state change (mode, provider, session, …)
 STOP = "stop"         # interrupt request
 
@@ -44,15 +45,42 @@ def default_bus_path() -> Path:
     return Path.home() / ".harness" / "sync_bus.jsonl"
 
 
-class SyncCursor:
-    """Per-consumer read position + de-duplication state for a :class:`SyncBus`."""
+def is_self_echo(event: Dict, instance_id: str) -> bool:
+    """True when *event* was already delivered in-process by this relay.
 
-    __slots__ = ("offset", "seen", "start_ts")
+    Events that have an in-process counterpart carry an ``inproc`` marker plus the
+    publishing relay's ``src`` id. Bus-only events (streamed agent output) are
+    never marked, so they are always consumed — including by a consumer that
+    lives in the publishing process.
+    """
+    return bool(event.get("inproc")) and event.get("src") == instance_id
+
+
+class SyncCursor:
+    """Per-consumer read position + de-duplication state for a :class:`SyncBus`.
+
+    ``streams`` remembers the last offset a :data:`STREAM` event was rendered at,
+    keyed by turn id, so a consumer can render an in-flight answer incrementally
+    instead of replaying the whole cumulative text on every poll.
+    """
+
+    __slots__ = ("offset", "seen", "start_ts", "streams")
 
     def __init__(self, offset: int = 0, start_ts: Optional[float] = None):
         self.offset = offset
         self.seen: Deque[str] = deque(maxlen=2048)
         self.start_ts = start_ts if start_ts is not None else time.time()
+        self.streams: Dict[str, str] = {}
+
+    def stream_tail(self, stream_id: str) -> str:
+        """Text of *stream_id* already handed to the consumer."""
+        return self.streams.get(stream_id, "")
+
+    def advance_stream(self, stream_id: str, text: str) -> None:
+        self.streams[stream_id] = text
+
+    def drop_stream(self, stream_id: str) -> None:
+        self.streams.pop(stream_id, None)
 
 
 class SyncBus:
@@ -108,7 +136,13 @@ class SyncBus:
             pass
 
     def poll(self, cursor: SyncCursor, limit: int = 64) -> List[Dict]:
-        """Return unconsumed events for this cursor and advance it. Never raises."""
+        """Return unconsumed events for this cursor and advance it. Never raises.
+
+        ``STREAM`` events carry the *cumulative* text of a turn; only the tail
+        beyond :meth:`SyncCursor.stream_tail` is returned and the cursor is
+        advanced, so a consumer can append deltas instead of re-rendering the
+        whole answer on every tick.
+        """
         events: List[Dict] = []
         try:
             if not self.path.exists():
@@ -118,6 +152,7 @@ class SyncBus:
                 # File was rotated/truncated under us — restart from the top;
                 # the cursor's ``seen`` set de-duplicates replayed tail events.
                 cursor.offset = 0
+                cursor.streams.clear()
             if cursor.offset == size:
                 return events
             with open(self.path, "r", encoding="utf-8") as f:
@@ -142,6 +177,44 @@ class SyncBus:
                 if ts < cursor.start_ts or (now - ts) > ttl:
                     continue
                 seen.append(eid)
+                if ev.get("kind") == STREAM:
+                    sid = str(ev.get("stream_id") or eid)
+                    if ev.get("opening"):
+                        cursor.streams[sid] = ""
+                        events.append(ev)
+                        if len(events) >= limit:
+                            break
+                        continue
+                    text = str(ev.get("text", ""))
+                    prev = cursor.stream_tail(sid)
+                    if prev and text.startswith(prev):
+                        delta = text[len(prev):]
+                    else:
+                        delta = text  # diverged (id reused) or first chunk — resend
+                    is_final = bool(ev.get("final"))
+                    if not delta:
+                        # A zero-delta ``final`` still carries the last text: pass
+                        # it through so consumers can flush their live message.
+                        if is_final:
+                            cursor.drop_stream(sid)
+                            ev = dict(ev)
+                            ev["delta"] = ""
+                            ev["stream_id"] = sid
+                            ev["text"] = text
+                            events.append(ev)
+                            if len(events) >= limit:
+                                break
+                        continue
+                    cursor.advance_stream(sid, text)
+                    ev = dict(ev)
+                    ev["delta"] = delta
+                    ev["stream_id"] = sid
+                    if is_final:
+                        cursor.drop_stream(sid)
+                    events.append(ev)
+                    if len(events) >= limit:
+                        break
+                    continue
                 events.append(ev)
                 if len(events) >= limit:
                     break
@@ -162,32 +235,65 @@ class MessageRelay:
 
     def __init__(self, bus_path: Optional[Path] = None):
         self._lock = threading.Lock()
-        self._cli_callback: Optional[Callable[[str], None]] = None
-        self._discord_callback: Optional[Callable[[str, Optional[int]], None]] = None
+        # Registrations are *lists*, not single slots: the TUI and an in-process
+        # bot share this relay, and the bot used to overwrite the TUI's
+        # Discord→CLI callback (breaking in-process sync entirely).
+        self._cli_callbacks: List[Callable[[str], None]] = []
+        self._discord_callbacks: List[Callable[[str, Optional[int]], None]] = []
+        self._stream_callbacks: List[Callable[[str, str, Optional[int]], None]] = []
         self._state_listeners: List[Callable[[Dict, str], None]] = []
         self._history: List[dict] = []
         self.bus = SyncBus(bus_path) if bus_path is not None else SyncBus()
+        # Identifies this relay inside bus events so a consumer that already got
+        # an event through the in-process callbacks skips its bus twin.
+        self.instance_id = uuid.uuid4().hex
         # Status tracking for plan compliance
         self.is_connected: bool = False
         self.active_channel: Optional[int] = None
         self.last_sync_ts: float = 0.0
         self._queue_ref = None  # optional ExecutionQueue integration
+        self._stream_state: Dict[str, Dict] = {}
 
     # ── Callback registration ───────────────────────────────────────────
 
     def register_cli(self, callback: Callable[[str], None]) -> None:
-        with self._lock:
-            self._cli_callback = callback
+        """Subscribe to Discord→CLI in-process messages (additive)."""
+        self._add(self._cli_callbacks, callback)
 
     def register_discord(self, callback: Callable[[str, Optional[int]], None]) -> None:
-        with self._lock:
-            self._discord_callback = callback
+        """Subscribe to CLI→Discord in-process messages (additive)."""
+        self._add(self._discord_callbacks, callback)
+
+    def register_stream(
+        self, callback: Callable[[str, str, Optional[int]], None]
+    ) -> None:
+        """Register ``callback(delta, stream_id, channel_id)`` for live output.
+
+        Fired from :meth:`publish_stream` so both the in-process consumer and a
+        peer process (which receives the event through the bus) can stream the
+        same answer without either side having to know about the other.
+        """
+        self._add(self._stream_callbacks, callback)
 
     def register_state_listener(self, callback: Callable[[Dict, str], None]) -> None:
         """Register ``callback(state_dict, origin)`` for state sync events."""
+        self._add(self._state_listeners, callback)
+
+    def _add(self, bucket: List[Callable], callback: Callable) -> None:
+        if callback is None:
+            return
         with self._lock:
-            if callback not in self._state_listeners:
-                self._state_listeners.append(callback)
+            if callback not in bucket:
+                bucket.append(callback)
+
+    def _fire(self, bucket: List[Callable], *args) -> None:
+        with self._lock:
+            callbacks = list(bucket)
+        for cb in callbacks:
+            try:
+                cb(*args)
+            except Exception:
+                pass
 
     # ── Message relay (in-process callbacks + bus mirror) ────────────────
 
@@ -196,13 +302,8 @@ class MessageRelay:
         with self._lock:
             self._history.append({"source": "cli", "text": text})
             self.last_sync_ts = time.time()
-            cb = self._discord_callback
-        self.bus.publish({"kind": MESSAGE, "origin": "cli", "text": text, **(meta or {})})
-        if cb:
-            try:
-                cb(text, None)
-            except Exception:
-                pass
+        self.bus.publish(self._event(MESSAGE, {"text": text, **(meta or {})}, origin="cli"))
+        self._fire(self._discord_callbacks, text, None)
 
     def relay_from_discord(self, text: str, channel_id: Optional[int] = None, meta: Optional[Dict] = None) -> None:
         """Discord received user input; relay to CLI (callbacks + bus)."""
@@ -211,15 +312,10 @@ class MessageRelay:
             self.last_sync_ts = time.time()
             if channel_id is not None:
                 self.active_channel = channel_id
-            cb = self._cli_callback
-        self.bus.publish({
-            "kind": MESSAGE, "origin": "discord", "text": text, "channel_id": channel_id, **(meta or {}),
-        })
-        if cb:
-            try:
-                cb(text)
-            except Exception:
-                pass
+        self.bus.publish(self._event(
+            MESSAGE, {"text": text, "channel_id": channel_id, **(meta or {})}, origin="discord",
+        ))
+        self._fire(self._cli_callbacks, text)
 
     def relay_output(self, text: str, origin: str, channel_id: Optional[int] = None) -> None:
         """Agent output text, mirrored to the *other* side for display only."""
@@ -227,9 +323,77 @@ class MessageRelay:
             self.last_sync_ts = time.time()
             if channel_id is not None:
                 self.active_channel = channel_id
-        self.bus.publish({
-            "kind": OUTPUT, "origin": origin, "text": text, "channel_id": channel_id,
-        })
+        self.bus.publish(self._event(
+            OUTPUT, {"text": text, "channel_id": channel_id}, origin=origin,
+        ))
+
+    # ── Live output streaming ──────────────────────────────────────────
+
+    def begin_stream(self, stream_id: str, origin: str, channel_id: Optional[int] = None) -> None:
+        """Open a live output stream for a turn (resets any previous text)."""
+        with self._lock:
+            self._stream_state[stream_id] = {"origin": origin, "channel_id": channel_id, "text": ""}
+        self.publish_stream(stream_id, "", origin=origin, channel_id=channel_id, opening=True)
+
+    def publish_stream(
+        self,
+        stream_id: str,
+        text: str,
+        origin: str,
+        channel_id: Optional[int] = None,
+        opening: bool = False,
+        final: bool = False,
+    ) -> str:
+        """Publish the cumulative text of a live stream; returns the delta.
+
+        Consumers (in-process callback *and* peer processes polling the bus)
+        render only ``delta`` on a live message and keep editing it in place.
+        """
+        with self._lock:
+            state = self._stream_state.get(stream_id)
+            prev = state["text"] if state else ""
+            if channel_id is not None:
+                self.active_channel = channel_id
+            self.last_sync_ts = time.time()
+        if text.startswith(prev):
+            delta = text[len(prev):]
+        elif prev:
+            delta = text  # stream id reused for a different turn — resend
+        else:
+            delta = text
+        if state is not None:
+            with self._lock:
+                state["text"] = text
+                if final:
+                    self._stream_state.pop(stream_id, None)
+        if opening:
+            self.bus.publish(self._event(
+                STREAM, {"stream_id": stream_id, "text": "", "delta": "", "opening": True,
+                         "final": False, "channel_id": channel_id},
+                origin=origin, inproc=False,
+            ))
+        if delta:
+            self.bus.publish(self._event(
+                STREAM, {"stream_id": stream_id, "text": text, "delta": delta, "opening": False,
+                         "final": final, "channel_id": channel_id},
+                origin=origin, inproc=False,
+            ))
+            self._fire(self._stream_callbacks, delta, stream_id, channel_id)
+        return delta
+
+    def end_stream(self, stream_id: str, origin: str, channel_id: Optional[int] = None) -> None:
+        """Close a live stream (no-op text-wise; marks the turn finished)."""
+        with self._lock:
+            state = self._stream_state.get(stream_id)
+            text = state["text"] if state else ""
+            self._stream_state.pop(stream_id, None)
+        if state is None:
+            return
+        self.bus.publish(self._event(
+            STREAM, {"stream_id": stream_id, "text": text, "delta": "", "opening": False,
+                     "final": True, "channel_id": channel_id},
+            origin=origin, inproc=False,
+        ))
 
     def set_connected(self, connected: bool, channel_id: Optional[int] = None) -> None:
         with self._lock:
@@ -275,19 +439,26 @@ class MessageRelay:
         with self._lock:
             self._history.append({"source": origin, "kind": "state", "payload": dict(payload)})
             self.last_sync_ts = time.time()
-            listeners = list(self._state_listeners)
-        self.bus.publish({"kind": STATE, "origin": origin, "payload": dict(payload)})
-        for cb in listeners:
-            try:
-                cb(dict(payload), origin)
-            except Exception:
-                pass
+        self.bus.publish(self._event(STATE, {"payload": dict(payload)}, origin=origin))
+        self._fire(self._state_listeners, dict(payload), origin)
 
     def publish_stop(self, origin: str, channel_id: Optional[int] = None) -> None:
         """Broadcast an interrupt request for any running agent turn."""
         with self._lock:
             self.last_sync_ts = time.time()
-        self.bus.publish({"kind": STOP, "origin": origin, "channel_id": channel_id})
+        self.bus.publish(self._event(STOP, {"channel_id": channel_id}, origin=origin))
+
+    def _event(self, kind: str, payload: Dict, origin: str, inproc: bool = True) -> Dict:
+        """Build a bus event tagged with the publishing relay's instance id.
+
+        ``inproc`` marks events that this relay *also* delivered through its
+        callbacks, so a consumer in the same process can drop the bus twin.
+        """
+        event = {"kind": kind, "origin": origin, "src": self.instance_id}
+        if inproc:
+            event["inproc"] = True
+        event.update(payload)
+        return event
 
     def get_history(self, limit: int = 50) -> List[dict]:
         with self._lock:

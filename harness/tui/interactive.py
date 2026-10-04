@@ -27,6 +27,30 @@ from harness.tui.queue import ExecutionQueue, QueuedItem
 from harness.core.compaction import calculate_history_tokens
 
 
+def _notify(sink, text: str) -> None:
+    """Queue a user-visible notice for the next safe screen write.
+
+    While the prompt owns the screen only the input frame can repaint, so remote
+    notices are collected in a list the toolbar renders (and the main loop flushes
+    once the prompt returns). Falls back to nothing when no sink was wired.
+    """
+    if sink is None:
+        return
+    try:
+        sink.append(text)
+    except Exception:
+        pass
+
+
+def _get_relay_safe():
+    """Return the global relay, or ``None`` when Discord sync is unavailable."""
+    try:
+        from harness.discord.sync import get_relay
+        return get_relay()
+    except Exception:
+        return None
+
+
 def _apply_remote_state(agent: HarnessAgent, payload: dict, origin: str) -> None:
     """Apply a state change published by the other side (usually Discord).
 
@@ -96,7 +120,11 @@ def _mirror_prompt(agent: HarnessAgent, text: str) -> None:
 def _drain_discord_activity(agent: HarnessAgent, renderer: TerminalRenderer, queue: "list") -> None:
     """Render any messages produced by Discord-driven runs since the last poll."""
     while queue:
-        text, channel_id = queue.pop(0)
+        item = queue.pop(0)
+        if isinstance(item, str):
+            text, channel_id = item, None
+        else:
+            text, channel_id = item
         if text and text.strip():
             renderer.print_info(f"[Discord] {text.strip()}")
 
@@ -108,16 +136,30 @@ def _poll_sync_bus(
     activity_queue: "list",
     queue: Optional[ExecutionQueue] = None,
     worker_wake: Optional[threading.Event] = None,
+    notice_sink: Optional["callable"] = None,
 ) -> None:
-    """Pull new events from the cross-process bus (standalone ``harness discord``)."""
+    """Pull new events from the cross-process bus (standalone ``harness discord``).
+
+    ``notice_sink`` receives human-readable notices for events that cannot be
+    shown safely while the prompt owns the screen (permission questions,
+    interrupts). They are surfaced by the prompt's bottom toolbar on the next
+    repaint instead of being written into the input frame.
+    """
     try:
-        from harness.discord.sync import get_relay, STATE, STOP, MESSAGE, OUTPUT
+        from harness.discord.sync import (
+    get_relay, STATE, STOP, MESSAGE, OUTPUT, STREAM, is_self_echo,
+)
         relay = get_relay()
         for ev in relay.bus.poll(cursor, limit=32):
             kind = ev.get("kind")
             origin = ev.get("origin", "")
             if origin == "cli":
                 continue
+            # Skip bus twins of events this process already delivered through the
+            # in-process callbacks (the in-TUI bot sees both paths).
+            if is_self_echo(ev, relay.instance_id):
+                continue
+            channel_id = ev.get("channel_id")
             if kind == STATE:
                 payload = ev.get("payload", {})
                 # Queue management from Discord
@@ -125,13 +167,13 @@ def _poll_sync_bus(
                 if q_action and queue is not None:
                     if q_action == "clear":
                         cleared = queue.clear()
-                        renderer.print_info(f"[Discord] Queue cleared ({cleared} tasks).")
+                        _notify(notice_sink, f"[Discord] Queue cleared ({cleared} tasks).")
                     elif q_action == "pause":
                         queue.pause()
-                        renderer.print_warning("[Discord] Queue paused.")
+                        _notify(notice_sink, "[Discord] Queue paused.")
                     elif q_action == "resume":
                         queue.resume()
-                        renderer.print_success("[Discord] Queue resumed.")
+                        _notify(notice_sink, "[Discord] Queue resumed.")
                         if worker_wake:
                             worker_wake.set()
                 _apply_remote_state(agent, payload, origin)
@@ -141,25 +183,39 @@ def _poll_sync_bus(
                         capsule += f" · {payload.get('tokens')}t"
                     activity_queue.append((capsule, None))
                 elif not q_action:
-                    renderer.print_info("[Discord] State synchronized.")
+                    changes = ", ".join(f"{k}={v}" for k, v in payload.items()
+                                        if k in ("mode", "provider", "model", "permission",
+                                                 "thinking_effort", "temperature", "session_id"))
+                    _notify(notice_sink, f"[Discord] Synced{f': {changes}' if changes else ''}.")
             elif kind == STOP:
                 if agent.is_running:
                     agent.request_stop()
-                    renderer.print_warning("[Discord] Stop requested — interrupting execution…")
+                    _notify(notice_sink, "[Discord] Stop requested — interrupting execution…")
+            elif kind == STREAM:
+                # Live answer streaming from a Discord-driven run.
+                sid = str(ev.get("stream_id") or "")
+                if ev.get("opening"):
+                    continue
+                delta = str(ev.get("delta", ""))
+                if ev.get("final"):
+                    # Turn closed — flush any tail the deltas did not carry so the
+                    # user always sees the complete answer.
+                    if delta.strip():
+                        activity_queue.append((delta.strip(), channel_id))
+                elif delta.strip():
+                    activity_queue.append((delta, channel_id))
             elif kind == MESSAGE:
                 text = str(ev.get("text", "")).strip()
-                channel_id = ev.get("channel_id")
                 if text:
                     activity_queue.append((text, channel_id))
                     # Auto-enqueue Discord prompt into ExecutionQueue if not an activity echo
                     if queue is not None and not text.startswith("⌨️"):
                         item = queue.enqueue(text)
-                        renderer.print_info(f"[Discord] Enqueued prompt #{item.id} from channel {channel_id or 'main'}: {text[:60]}")
+                        _notify(notice_sink, f"[Discord] Enqueued prompt #{item.id}: {text[:60]}")
                         if worker_wake is not None:
                             worker_wake.set()
             elif kind == OUTPUT:
                 text = str(ev.get("text", "")).strip()
-                channel_id = ev.get("channel_id")
                 if text:
                     activity_queue.append((text, channel_id))
     except Exception:
@@ -527,6 +583,15 @@ def run_interactive(agent: HarnessAgent):
                 # Accumulate response for Discord mirroring
                 response_parts: list[str] = []
                 tokens_est = 0
+                # Live stream id: consumers edit one message in place instead of
+                # receiving a new (huge, duplicated) chunk per token.
+                relay = _get_relay_safe()
+                stream_id = f"cli-{item.id}-{int(t_start)}"
+                if relay is not None:
+                    try:
+                        relay.begin_stream(stream_id, origin="cli")
+                    except Exception:
+                        relay = None
                 for ev in agent.step(item.prompt):
                     renderer.render_agent_event(ev)
                     # Mirror incremental output to Discord side (best-effort)
@@ -537,19 +602,20 @@ def run_interactive(agent: HarnessAgent):
                             txt = str(data) if data else ""
                             if txt:
                                 response_parts.append(txt)
-                            # Also stream incremental to bus for live Discord view
-                            if etype == "text_delta" and txt:
-                                from harness.discord.sync import get_relay
-                                get_relay().relay_output(txt, origin="cli")
+                            # Stream the answer as one cumulative text
+                            if etype == "text_delta" and txt and relay is not None:
+                                relay.publish_stream(
+                                    stream_id, "".join(response_parts), origin="cli",
+                                )
                         elif etype == "tool_call_start":
-                            from harness.discord.sync import get_relay
-                            tname = (data or {}).get("name", "tool")
-                            get_relay().relay_output(f"🔧 Using `{tname}`", origin="cli")
+                            if relay is not None:
+                                tname = (data or {}).get("name", "tool")
+                                relay.relay_output(f"🔧 Using `{tname}`", origin="cli")
                         elif etype == "tool_call_result":
-                            from harness.discord.sync import get_relay
-                            res = str((data or {}).get("result", ""))[:200]
-                            if res:
-                                get_relay().relay_output(f"✔ {res.split(chr(10))[0]}", origin="cli")
+                            if relay is not None:
+                                res = str((data or {}).get("result", ""))[:200]
+                                if res:
+                                    relay.relay_output(f"✔ {res.split(chr(10))[0]}", origin="cli")
                     except Exception:
                         pass
                 renderer.finish_markdown()
@@ -570,11 +636,13 @@ def run_interactive(agent: HarnessAgent):
                     pct = 0
                 # Relay final response back to Discord (mirrored output)
                 try:
-                    from harness.discord.sync import get_relay
                     from harness.discord.renderer import format_capsule_card
                     final_text = "".join(response_parts).strip()
-                    if final_text:
-                        get_relay().relay_output(final_text[:4000], origin="cli")
+                    if relay is not None:
+                        # Close the live message; its final text is the answer.
+                        if not final_text:
+                            relay.relay_output("_no response_", origin="cli")
+                        relay.end_stream(stream_id, origin="cli")
                     # Enriched turn capsule with tokens/context
                     capsule_text = format_capsule_card(
                         agent.mode.value,
@@ -584,19 +652,25 @@ def run_interactive(agent: HarnessAgent):
                     )
                     if pct:
                         capsule_text += f" · `{pct}% ctx`"
-                    get_relay().relay_output(capsule_text, origin="cli")
-                    get_relay().publish_state({
-                        "turn_capsule": True,
-                        "mode": agent.mode.value,
-                        "model": agent.session.model if agent.session is not None else agent.config.model,
-                        "duration": round(turn_dur, 2),
-                        "tokens": tokens_est,
-                        "context_pct": pct,
-                    }, origin="cli")
+                    if relay is not None:
+                        relay.relay_output(capsule_text, origin="cli")
+                        relay.publish_state({
+                            "turn_capsule": True,
+                            "mode": agent.mode.value,
+                            "model": agent.session.model if agent.session is not None else agent.config.model,
+                            "duration": round(turn_dur, 2),
+                            "tokens": tokens_est,
+                            "context_pct": pct,
+                        }, origin="cli")
                 except Exception:
                     pass
                 queue.finish_current(status="completed")
             except KeyboardInterrupt:
+                if relay is not None:
+                    try:
+                        relay.end_stream(stream_id, origin="cli")
+                    except Exception:
+                        pass
                 renderer.finish_markdown()
                 renderer.finish_thinking()
                 renderer.print_warning("\nExecution interrupted by user.")
@@ -604,6 +678,12 @@ def run_interactive(agent: HarnessAgent):
                 agent.clear_stop()
                 queue.finish_current(status="cancelled")
             except Exception as ex:
+                if relay is not None:
+                    try:
+                        relay.relay_output(f"❌ {str(ex)[:200]}", origin="cli")
+                        relay.end_stream(stream_id, origin="cli")
+                    except Exception:
+                        pass
                 renderer.finish_markdown()
                 renderer.finish_thinking()
                 renderer.print_error(f"\nExecution error: {str(ex)}")
@@ -630,7 +710,10 @@ def run_interactive(agent: HarnessAgent):
 
     # ── Discord sync wiring ──────────────────────────────────────────
     activity_queue: list = []
+    notices: list = []
     sync_cursor = None
+    sync_poller_stop = threading.Event()
+    sync_thread = None
     try:
         from harness.discord.sync import get_relay
         relay = get_relay()
@@ -643,6 +726,26 @@ def run_interactive(agent: HarnessAgent):
         relay.register_cli(_cli_callback)
         sync_cursor = relay.bus.new_cursor()
         relay.register_state_listener(lambda payload, origin: _apply_remote_state(agent, payload, origin))
+
+        # The bus must be consumed *continuously*: prompt_toolkit blocks the main
+        # thread inside session.prompt(), so a poll that only runs between user
+        # inputs would only show Discord activity after a screen refresh (or a
+        # keypress). A daemon thread keeps the cursor hot and the toolbar live.
+        def _sync_poller_loop() -> None:
+            while not sync_poller_stop.is_set():
+                try:
+                    _poll_sync_bus(
+                        agent, renderer, sync_cursor, activity_queue,
+                        queue=queue, worker_wake=worker_wake, notice_sink=notices,
+                    )
+                except Exception:
+                    pass
+                sync_poller_stop.wait(0.25)
+
+        sync_thread = threading.Thread(
+            target=_sync_poller_loop, daemon=True, name="harness-sync-poller",
+        )
+        sync_thread.start()
     except Exception:
         sync_cursor = None
 
@@ -653,9 +756,14 @@ def run_interactive(agent: HarnessAgent):
     renderer.interactive_prompt = True
     while True:
         _drain_discord_activity(agent, renderer, activity_queue)
-        if sync_cursor is not None:
-            _poll_sync_bus(agent, renderer, sync_cursor, activity_queue, queue=queue, worker_wake=worker_wake)
+        if sync_thread is None and sync_cursor is not None:
+            # Poller unavailable — fall back to the between-inputs poll.
+            _poll_sync_bus(agent, renderer, sync_cursor, activity_queue, queue=queue,
+                            worker_wake=worker_wake, notice_sink=notices)
             _drain_discord_activity(agent, renderer, activity_queue)
+        for _notice in list(notices):
+            notices.remove(_notice)
+            renderer.print_info(_notice)
 
         # Check API server external prompts
         if api_server is not None:
@@ -765,7 +873,24 @@ def run_interactive(agent: HarnessAgent):
                     f'{status_tag}{action_tag}{q_tag}  '
                     f'• <style color="#55ff55">●</style> <b>Harness {html.escape(str(__version__))}</b>'
                 )
-                return HTML(f"{line1}\n{line2}")
+                toolbar = f"{line1}\n{line2}"
+                # Remote (Discord) notices and streamed output: the prompt frame
+                # repaints every 0.5s, so surfacing them here means they appear
+                # the moment they arrive — no screen clear / keypress required.
+                if notices or activity_queue:
+                    feed: list = []
+                    if notices:
+                        feed.append("<b>[Discord]</b> " + html.escape(str(notices[-1])))
+                    if activity_queue:
+                        tail = activity_queue[-1]
+                        pending = len(activity_queue)
+                        tail_text = tail[0] if isinstance(tail, tuple) else tail
+                        label = "🔴" if pending > 1 else "💬"
+                        snippet = html.escape(" ".join(str(tail_text).split())[:90])
+                        more = f" (+{pending - 1})" if pending > 1 else ""
+                        feed.append(f'<style color="#7b68ee">{label} Discord</style> {snippet}{more}')
+                    toolbar += "\n" + "\n".join(feed)
+                return HTML(toolbar)
             except Exception:
                 fallback_m = agent.session.model if agent.session else agent.config.model
                 return f"│ {agent.mode.value.capitalize()} · {fallback_m} · Harness {__version__}"
@@ -847,3 +972,5 @@ def run_interactive(agent: HarnessAgent):
             # Enqueue and wake worker thread to begin processing
             item = queue.enqueue(user_input)
             worker_wake.set()
+
+    sync_poller_stop.set()

@@ -13,7 +13,18 @@ from harness.discord.renderer import (
     DISCORD_MAX_MESSAGE_LEN,
 )
 from harness.discord.help_text import DISCORD_HELP_TEXT, GENERAL_HELP_TEXT
-from harness.discord.sync import get_relay, MessageRelay
+from harness.discord.sync import (
+    get_relay,
+    MessageRelay,
+    SyncBus,
+    SyncCursor,
+    is_self_echo,
+    MESSAGE,
+    OUTPUT,
+    STREAM,
+    STATE,
+    STOP,
+)
 
 __all__ = [
     "DiscordRenderState",
@@ -25,6 +36,14 @@ __all__ = [
     "GENERAL_HELP_TEXT",
     "get_relay",
     "MessageRelay",
+    "SyncBus",
+    "SyncCursor",
+    "is_self_echo",
+    "MESSAGE",
+    "OUTPUT",
+    "STREAM",
+    "STATE",
+    "STOP",
 ]
 
 try:  # pragma: no cover - depends on optional discord.py install

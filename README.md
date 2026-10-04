@@ -1,6 +1,6 @@
-# Harness ⚡ — v0.10.3 (Beta)
+# Harness ⚡ — v0.10.4 (Beta)
 
-> **The Premier Agentic AI Engineering Harness & CLI** — now in **v0.10.3 Beta**
+> **The Premier Agentic AI Engineering Harness & CLI** — now in **v0.10.4 Beta**
 > Built for developers, autonomous AI workflows, and software engineers who demand speed, low memory (~24MB RAM), subagent orchestration, and multi-provider intelligence.
 
 ```
@@ -183,6 +183,7 @@ cat logs/error.log | harness "Diagnose this stack trace"
 | `/keys [list\|set\|remove]` | Manage, mask, and test provider API keys |
 | `/setup` | Launch interactive onboarding setup wizard |
 | `/effort <level>` | Set thinking effort (`off`, `low`, `medium`, `high`, or tokens) |
+| `/temperature [0.0-1.0]` | Show or set model sampling temperature — `0.0` most focused/deterministic, `1.0` most creative (also `50%` and `default`). Synced with the Discord bot |
 | `/theme` | Theme gallery, preview, switching, and custom creation: `/theme`, `/theme list`, `/theme <name>`, `/theme preview <name>`, `/theme create`, `/theme delete <name>` |
 | `/todo [list\|add\|clear]` | Manage active task items |
 | `/skills [reload]` | List or reload registered skills |

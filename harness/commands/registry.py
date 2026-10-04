@@ -1283,8 +1283,27 @@ class CommandRegistry:
             relay.publish_state({"discord_stop": True}, origin="cli")
             ctx.renderer.print_success("Discord auto-start disabled. Restart Harness to fully stop background bot (daemon threads exit on process exit).")
         elif sub == "sync":
-            relay.publish_state({"manual_sync": True, "ts": time.time()}, origin="cli")
-            ctx.renderer.print_success("Broadcasted manual sync pulse to Discord bus.")
+            # Full snapshot: let the peer re-apply every shared setting and
+            # confirm the link in both directions.
+            ctx.agent.config.mode = ctx.agent.mode.value
+            ctx.agent.config.provider = ctx.agent.config.provider
+            snapshot = {
+                "mode": ctx.agent.mode.value,
+                "permission": getattr(getattr(ctx.agent, "permission_manager", None), "level", None),
+                "provider": ctx.agent.config.provider,
+                "model": ctx.agent.session.model if getattr(ctx.agent, "session", None) else ctx.agent.config.model,
+                "thinking_effort": ctx.agent.config.thinking_effort,
+                "temperature": ctx.agent.config.temperature,
+                "manual_sync": True,
+            }
+            snapshot = {k: v for k, v in snapshot.items() if v is not None}
+            relay.publish_state(snapshot, origin="cli")
+            relay.relay_output(
+                f"🔄 Manual sync pulse from CLI · {ctx.agent.mode.value} · "
+                f"{snapshot.get('provider')}/{snapshot.get('model')}",
+                origin="cli",
+            )
+            ctx.renderer.print_success(f"Broadcasted sync pulse to Discord ({relay.bus.path}).")
         else:
             ctx.renderer.print_info("Usage: /discord [status|start [token]|stop|sync|token <val>]")
 
