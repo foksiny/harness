@@ -120,6 +120,7 @@ class GeminiProvider(BaseProvider):
         thinking_effort: str = "high",
         tools: Optional[List[Dict[str, Any]]] = None,
         system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
         **kwargs,
     ) -> Iterator[LLMChunk]:
         active_model = model or self.default_model
@@ -142,6 +143,9 @@ class GeminiProvider(BaseProvider):
             }
 
         gen_config: Dict[str, Any] = {}
+        clamped_temp = self.resolve_temperature(model_spec, temperature)
+        if clamped_temp is not None:
+            gen_config["temperature"] = clamped_temp
         thinking_param = self.normalize_thinking_effort(model_spec, thinking_effort)
         if thinking_param and "thinking_config" in thinking_param:
             cfg = thinking_param["thinking_config"]

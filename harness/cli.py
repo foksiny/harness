@@ -394,6 +394,7 @@ Examples:
     parser.add_argument("--model", help="Specific model name.")
     parser.add_argument("--theme", help="Color theme (14 available).")
     parser.add_argument("--effort", help="Thinking / reasoning effort (off, low, medium, high, or integer tokens).")
+    parser.add_argument("--temperature", type=float, help="Model sampling temperature (0.0 - 1.0).")
     parser.add_argument("--resume", help="Resume existing session by ID.")
     parser.add_argument("--host", help="API server bind host (for serve mode, default 127.0.0.1)")
     parser.add_argument("--port", type=int, help="API server port (0=auto)")
@@ -447,6 +448,8 @@ def main():
         config.theme = args.theme
     if args.effort:
         config.thinking_effort = args.effort
+    if args.temperature is not None:
+        config.temperature = max(0.0, min(1.0, args.temperature))
     # Server activation: disabled by default for `harness` TUI, requires explicit flag
     # `harness serve` subcommand always enables (handled separately), but for `harness`
     # we enable only if --server or --host/--port is given, or config server_enabled=true

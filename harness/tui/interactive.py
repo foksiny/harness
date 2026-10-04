@@ -70,6 +70,8 @@ def _apply_remote_state(agent: HarnessAgent, payload: dict, origin: str) -> None
                 pass
         if "thinking_effort" in payload:
             agent.config.thinking_effort = payload["thinking_effort"]
+        if "temperature" in payload:
+            agent.config.temperature = payload["temperature"]
         session_action = payload.get("session_action")
         if session_action in ("create", "resume", "fork"):
             sid = payload.get("session_id")

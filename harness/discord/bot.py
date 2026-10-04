@@ -352,7 +352,7 @@ if HAS_DISCORD:
             applied = self._apply_state_to_agents(payload)
             # Mirror config-level settings so CLI and bot stay consistent.
             try:
-                for key in ("mode", "permission", "provider", "model", "thinking_effort"):
+                for key in ("mode", "permission", "provider", "model", "thinking_effort", "temperature"):
                     if key in payload:
                         setattr(self.config, key, payload[key])
             except Exception:
@@ -416,6 +416,8 @@ if HAS_DISCORD:
                                 log.warning("Failed to switch model to %s", payload.get("model"))
                         if "thinking_effort" in payload:
                             agent.config.thinking_effort = str(payload["thinking_effort"])
+                        if "temperature" in payload:
+                            agent.config.temperature = payload["temperature"]
                         if payload.get("session_action") in ("create", "resume", "fork"):
                             sid = payload.get("session_id")
                             if sid:
@@ -431,7 +433,7 @@ if HAS_DISCORD:
             """Cross-process variant: apply a state payload and notify channels."""
             applied = self._apply_state_to_agents(payload)
             try:
-                for key in ("mode", "permission", "provider", "model", "thinking_effort"):
+                for key in ("mode", "permission", "provider", "model", "thinking_effort", "temperature"):
                     if key in payload:
                         setattr(self.config, key, payload[key])
                 if applied and source == "cli":
@@ -856,6 +858,42 @@ if HAS_DISCORD:
                 await self._async_save_config()
                 self._relay.publish_state({"thinking_effort": eff}, origin="discord")
                 await interaction.response.send_message(f"✅ Thinking effort set to: **{eff}**")
+
+            @_cmd(name="temperature", description="Set or view model temperature (0.0 - 1.0).")
+            @app_commands.describe(temperature="Sampling temperature between 0.0 and 1.0, or 'default' to reset.")
+            async def temperature_cmd(interaction: discord.Interaction, temperature: Optional[str] = None):
+                if not self._channel_allowed(interaction.channel_id):
+                    await interaction.response.send_message("⛔ Channel not allowed.", ephemeral=True)
+                    return
+                if not temperature:
+                    rt = self._get_runtime(interaction.channel_id)
+                    agent = rt.ensure_agent()
+                    model = agent.session.model if agent.session else self.config.model
+                    sent = agent.provider.clamp_temperature(self.config.temperature)
+                    shown = f"**{sent:.2f}**" if sent is not None else "provider default (1.0)"
+                    await interaction.response.send_message(
+                        f"🌡️ Current temperature: {shown} (model: `{model}`). "
+                        "Range: `0.0` (focused) – `1.0` (creative). Set with `/temperature <0.0-1.0>`."
+                    )
+                    return
+                # Shared parser so the bot accepts exactly what the CLI /temperature accepts.
+                from harness.commands.registry import parse_temperature_arg
+                parsed = parse_temperature_arg(temperature)
+                if parsed is None:
+                    await interaction.response.send_message(
+                        f"❌ Invalid temperature `{temperature.strip()}`. Use a number between "
+                        "0.0 and 1.0 (e.g. `0.3`), or `default` to reset.", ephemeral=True
+                    )
+                    return
+                self.config.temperature = parsed
+                for rt in self._runtimes.values():
+                    if rt.agent is not None:
+                        rt.agent.config.temperature = parsed
+                await self._async_save_config()
+                self._relay.publish_state({"temperature": parsed}, origin="discord")
+                await interaction.response.send_message(
+                    f"✅ Temperature set to: **{parsed:.2f}** — applies from the next turn."
+                )
 
             @_cmd(name="queue", description="Inspect execution queue.")
             @app_commands.describe(action="Optional: list, clear, pause, resume")

@@ -33,6 +33,7 @@ harness config set discord_guild_id    333...           # guild to sync slash co
 harness config set discord_workspace   /path/to/workdir # directory the bot operates in (default: launch dir)
 harness config set discord_permission  full             # full | default | secure (bot approval profile)
 harness config set discord_auto_start  true             # auto-host the bot inside the interactive TUI
+harness config set temperature         0.3              # sampling temperature (0.0 focused - 1.0 creative)
 ```
 - **`discord_permission`** defaults to `full` so the bot can edit files and run
   commands without a human at a keyboard. With `default`/`secure`, write/risky
@@ -54,6 +55,10 @@ and the two sides stay fully synchronized.
 - `/ask <prompt>` with an **attachment** uploaded alongside — the file is saved and mentioned.
 - Mention files inline with `@path/to/file` (or `@/abs/path`) in your prompt, exactly like the TUI.
 - `/goal <objective>` — start an autonomous **Super Mode** loop toward a high-level goal.
+- `/temperature [0.0-1.0]` — set or view the model sampling temperature (synced).
+  `0.0` = most focused/deterministic, `1.0` = most creative; `default` resets it.
+  Models with fixed sampling (`o3-mini`, `gpt-5`, `deepseek-reasoner`, …) reject
+  custom values — tune those with `/effort` instead.
 - `/stop` — interrupt the running turn (any channel, and the CLI side too).
 - `/help discord` — this guide.
 - `/status` — show provider, model, mode, workspace and channel restrictions.
@@ -99,6 +104,8 @@ the bot is launched from, using your configured provider/model.
 - **`/mode <plan|build|super>`** — switch operational mode (synced with the CLI).
 - **`/perm <secure|default|full>`** — switch or view permission profile (synced with the CLI).
 - **`/effort [level]`** — set or view thinking / reasoning effort level (synced).
+- **`/temperature [0.0-1.0]`** — set or view the model sampling temperature (synced).
+  `0.0` = most focused/deterministic, `1.0` = most creative; `default` resets it.
 - **`/provider [name]`** — show or switch the active LLM provider (synced).
 - **`/model [name]`** — show or change the current model (synced).
 - **`/diff`** — show uncommitted git changes in the workspace.

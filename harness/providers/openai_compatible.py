@@ -194,9 +194,35 @@ class OpenAICompatibleProvider(BaseProvider):
         # Be permissive: if the message says unsupported at all while we sent thinking params, retry.
         return any(k in low for k in ("reason", "thinking", "chat_template"))
 
+    @staticmethod
+    def _is_unsupported_temperature_error(text: str) -> bool:
+        """Return True when the provider rejects our ``temperature`` parameter.
+
+        Covers both phrasings seen in the wild, e.g. "Unsupported parameter:
+        'temperature' is not supported with this model." and "deepseek-reasoner
+        does not support the parameter temperature". This is the safety net for
+        reasoning models ``detect_temperature_support`` does not know about
+        (aggregators re-hosting families under new ids).
+        """
+        low = (text or "").lower()
+        if "temperature" not in low:
+            return False
+        return any(k in low for k in (
+            "unsupported",
+            "does not support",
+            "not supported",
+            "is not allowed",
+            "unrecognized",
+            "unknown parameter",
+        ))
+
     def _strip_thinking_params(self, body: Dict[str, Any]) -> None:
         for k in ("reasoning", "reasoning_effort", "thinking", "thinking_config", "chat_template_kwargs"):
             body.pop(k, None)
+
+    def _strip_temperature(self, body: Dict[str, Any]) -> None:
+        """Drop ``temperature`` so the retry falls back to the model default."""
+        body.pop("temperature", None)
 
     def _is_retryable_error_message(self, msg: str, code: Any = None) -> bool:
         low = (msg or "").lower()
@@ -219,6 +245,7 @@ class OpenAICompatibleProvider(BaseProvider):
         thinking_effort: str = "high",
         tools: Optional[List[Dict[str, Any]]] = None,
         system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
         **kwargs,
     ) -> Iterator[LLMChunk]:
         active_model = model or self.default_model
@@ -252,6 +279,14 @@ class OpenAICompatibleProvider(BaseProvider):
         thinking_params = self.normalize_thinking_effort(model_spec, thinking_effort)
         body.update(thinking_params)
 
+        # Sampling temperature (/temperature). Sent whenever the model accepts it:
+        # OpenAI-compatible endpoints default to 1.0, and users expect 0.0 to
+        # actually be greedy. Omitted for fixed-sampling reasoning models
+        # (o3-mini, gpt-5, ...) which 400 on any custom value.
+        clamped_temp = self.resolve_temperature(model_spec, temperature)
+        if clamped_temp is not None:
+            body["temperature"] = clamped_temp
+
         if tools and model_spec.supports_tools:
             body["tools"] = tools
 
@@ -261,6 +296,8 @@ class OpenAICompatibleProvider(BaseProvider):
         base_delay = getattr(self, "base_delay", 5.0)
         # Track if we already stripped thinking params (only once)
         thinking_stripped = False
+        # Track if we already stripped temperature (only once, same escape hatch)
+        temperature_stripped = False
         # Total attempts = 1 initial + max_retries backoff retries + 1 extra for thinking strip if needed
         # We use a manual loop with attempt counter for backoff
         attempt = 0
@@ -285,6 +322,8 @@ class OpenAICompatibleProvider(BaseProvider):
                     body_lines = []
                     sse_error_msg: Optional[str] = None
                     sse_retryable = False
+                    # Which param to drop on the immediate retry ("thinking" / "temperature").
+                    sse_strip: Optional[str] = None
                     for line in stream:
                         body_lines.append(line + "\n")
                         buffer += line + "\n"
@@ -325,6 +364,15 @@ class OpenAICompatibleProvider(BaseProvider):
                                     if not saw_payload and not thinking_stripped and thinking_params and self._is_unsupported_param_error(err_msg):
                                         sse_error_msg = err_msg
                                         sse_retryable = False
+                                        sse_strip = "thinking"
+                                        buffer = ""
+                                        break
+                                    # Temperature rejected by a fixed-sampling reasoning model
+                                    # we did not recognise up front: strip it and retry once.
+                                    if not saw_payload and not temperature_stripped and "temperature" in body and self._is_unsupported_temperature_error(err_msg):
+                                        sse_error_msg = err_msg
+                                        sse_retryable = False
+                                        sse_strip = "temperature"
                                         buffer = ""
                                         break
                                     # Check for retryable error in SSE payload (e.g. overloaded)
@@ -384,9 +432,13 @@ class OpenAICompatibleProvider(BaseProvider):
                         if not sse_retryable:
                             # Unsupported param → strip and retry immediately
                             # (body dict is passed fresh to the next attempt)
-                            self._strip_thinking_params(body)
-                            thinking_params = {}
-                            thinking_stripped = True
+                            if sse_strip == "temperature":
+                                self._strip_temperature(body)
+                                temperature_stripped = True
+                            else:
+                                self._strip_thinking_params(body)
+                                thinking_params = {}
+                                thinking_stripped = True
                             # Do not increment backoff attempt for this, retry immediately
                             continue
                         else:
@@ -427,6 +479,11 @@ class OpenAICompatibleProvider(BaseProvider):
                                 self._strip_thinking_params(body)
                                 thinking_params = {}
                                 thinking_stripped = True
+                                continue
+                            # Temperature rejected by an unrecognised fixed-sampling model.
+                            if not temperature_stripped and "temperature" in body and self._is_unsupported_temperature_error(err_msg):
+                                self._strip_temperature(body)
+                                temperature_stripped = True
                                 continue
                             if self._is_retryable_error_message(err_msg, err_code) and attempt < max_retries:
                                 delay = self._retry_delay(attempt)

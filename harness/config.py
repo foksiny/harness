@@ -67,6 +67,7 @@ class HarnessConfig:
     mode: str = "build"              # plan, build, super
     permission: str = "default"      # secure, default, full
     thinking_effort: str = "high"    # off, low, medium, high, or token count
+    temperature: float = 1.0        # Sampling temperature sent with every request (0.0 - 1.0); 1.0 = provider default
     terminal_show_thinking: bool = False  # Stream raw reasoning text in the terminal; when off, show a compact Thinking indicator + token count instead
     theme: str = "cyberpunk"
     auto_compact: bool = True

@@ -81,6 +81,33 @@ REASONING_MARKERS = (
     "qwq", "r1", "o1", "o3", "o4", "o5", "muse",
 )
 
+# ─── Fixed-sampling (reasoning-only) models ────────────────────────────────
+#
+# Some reasoning models reject the ``temperature`` request parameter outright
+# with a 400 instead of ignoring it:
+#
+#   OpenAI  o1 / o3 / o4-mini / gpt-5*  -> "Unsupported parameter: 'temperature'
+#            is not supported with this model."  (sampling knobs have no effect)
+#   DeepSeek deepseek-reasoner / R1     -> "does not support the parameter
+#            temperature" (same for top_p and the penalty knobs)
+#
+# For those models ``/temperature`` must be OMITTED from the body, never clamped
+# to a "safe" 1.0 -- gpt-5.2 has been observed rejecting even nominal defaults.
+# Matched on the model id via ordered (longest-first) prefixes/regexes so that
+# e.g. "gpt-4o" never matches the "gpt-5" family. Non-reasoning models are
+# untouched: they must keep receiving temperature=0 for true greedy decoding.
+FIXED_SAMPLING_PATTERNS = (
+    r"^gpt-5",           # gpt-5, gpt-5.1, gpt-5-codex, gpt-5-mini/nano ...
+    r"^o1(?:[-_.]|$)",   # o1, o1-mini, o1-preview
+    r"^o3(?:[-_.]|$)",   # o3, o3-mini, o3-pro
+    r"^o4(?:[-_.]|$)",   # o4-mini
+    r"deepseek-?r1",
+    r"deepseek-?reasoner",
+    r"(?:^|[-_/])r1(?:[-_.]|$)",
+    r"(?:^|[-_/])qwq(?:[-_.]|$)",
+    r"magistral",
+)
+
 # Marker normalisation map: a marker substring in a model id maps to a strong
 # (True) or strong-negative (False) capability answer.
 _MARKER_SIGNALS = {m: True for m in VISION_MARKERS}
@@ -98,6 +125,7 @@ class ModelSpec:
     supports_tools: bool = True
     supports_vision: bool = False
     supports_video: bool = False
+    supports_temperature: bool = True  # False => fixed-sampling reasoning model; omit the param
     reasoning_options: List[str] = field(default_factory=list)  # server-advertised reasoning mechanisms
     source: str = "default"      # catalog | server | universal | literal | provider | default
 
@@ -537,6 +565,29 @@ def detect_thinking_support(model_name: str, provider: str = "") -> Tuple[bool, 
     return False, None
 
 
+def detect_temperature_support(model_name: str, provider: str = "") -> bool:
+    """Resolve whether the model accepts a custom ``temperature`` parameter.
+
+    Reasoning-only models such as ``o3-mini``, ``gpt-5`` or ``deepseek-reasoner``
+    reject the parameter with a 400 rather than ignoring it, so it must be
+    omitted from the request body for them. Every other model accepts it --
+    including temperature 0, which must still reach the wire for greedy decoding.
+
+    This is a capability question about the *model id*, so it is resolved from
+    the id alone (never from the provider name, since the same family behaves
+    the same way across OpenAI, Groq, OpenRouter, Together, ...).
+    """
+    name = (model_name or "").strip().lower()
+    if not name:
+        return True
+    # Strip OpenRouter/aggregator prefixes ("openai/o3-mini", "deepseek/deepseek-r1").
+    base = name.split(":")[0].split("/")[-1]
+    for pattern in FIXED_SAMPLING_PATTERNS:
+        if re.search(pattern, base):
+            return False
+    return True
+
+
 def detect_vision_support(model_name: str, provider: str = "") -> bool:
     """Resolve vision-language (image input) support for any model id.
 
@@ -632,6 +683,7 @@ def inspect_model(model_name: str, provider: str = "") -> ModelSpec:
         supports_tools=True,
         supports_vision=detect_vision_support(clean_name, provider),
         supports_video=_model_supports_video(clean_name, provider),
+        supports_temperature=detect_temperature_support(clean_name, provider),
         reasoning_options=reasoning_options,
         source=source,
     )

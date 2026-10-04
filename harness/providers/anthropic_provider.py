@@ -139,6 +139,7 @@ class AnthropicProvider(BaseProvider):
         thinking_effort: str = "high",
         tools: Optional[List[Dict[str, Any]]] = None,
         system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
         **kwargs,
     ) -> Iterator[LLMChunk]:
         active_model = model or self.default_model
@@ -167,12 +168,23 @@ class AnthropicProvider(BaseProvider):
 
         # Dynamic thinking
         thinking_param = self.normalize_thinking_effort(model_spec, thinking_effort)
-        if thinking_param and "thinking" in thinking_param:
+        thinking_on = bool(thinking_param and "thinking" in thinking_param)
+        if thinking_on:
             body["thinking"] = thinking_param["thinking"]
             # Ensure max_tokens > budget_tokens
             budget = thinking_param["thinking"]["budget_tokens"]
             if body["max_tokens"] <= budget:
                 body["max_tokens"] = budget + 4096
+
+        # Sampling temperature (/temperature).
+        # Resolved AFTER thinking because Anthropic rejects any temperature other
+        # than 1 while extended thinking is enabled ("temperature may only be set
+        # to 1 when thinking is enabled"), so we omit the parameter entirely in
+        # that case instead of letting /temperature 400 the whole request.
+        # With thinking off, 0.0 is valid and reaches the wire (greedy decoding).
+        clamped_temp = None if thinking_on else self.resolve_temperature(model_spec, temperature)
+        if clamped_temp is not None:
+            body["temperature"] = clamped_temp
 
         if tools and model_spec.supports_tools:
             body["tools"] = tools

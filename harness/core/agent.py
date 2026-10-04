@@ -991,6 +991,7 @@ class HarnessAgent:
                         thinking_effort=self.config.thinking_effort,
                         tools=active_tools,
                         system_prompt=sys_prompt,
+                        temperature=getattr(self.config, "temperature", None),
                     )
                 )
                 try:

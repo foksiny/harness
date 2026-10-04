@@ -207,6 +207,44 @@ class BaseProvider(ABC):
         return {"reasoning_effort": self._level_effort(eff)}
 
     @staticmethod
+    def clamp_temperature(value: Any) -> Optional[float]:
+        """Normalize a sampling temperature into the 0.0 - 1.0 range.
+
+        Returns ``None`` (meaning "let the provider use its own default") when the
+        value is unset or unparseable, so callers can omit the parameter entirely.
+        Never raises: a bad ``/temperature`` input must not break a request.
+        """
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            temp = float(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        if temp != temp:  # NaN
+            return None
+        return max(0.0, min(1.0, temp))
+
+    @classmethod
+    def resolve_temperature(cls, model_spec: Any, value: Any) -> Optional[float]:
+        """Decide the ``temperature`` to put on the wire for a given model.
+
+        Returns ``None`` when the parameter must be OMITTED so the model keeps
+        its own default:
+
+        * the user never set one (or set garbage) — see :meth:`clamp_temperature`;
+        * the model is a fixed-sampling reasoning model (``o3-mini``, ``gpt-5``,
+          ``deepseek-reasoner``, ...) which answers 400 to any custom value.
+
+        Never raises: a bad ``/temperature`` must never break a request.
+        """
+        clamped = cls.clamp_temperature(value)
+        if clamped is None:
+            return None
+        if getattr(model_spec, "supports_temperature", True) is False:
+            return None
+        return clamped
+
+    @staticmethod
     def _level_tokens(eff: str, low_t: int, med_t: int, high_t: int) -> int:
         if eff in ("low", "minimal", "light", "brief", "shallow"):
             return low_t
@@ -237,6 +275,7 @@ class BaseProvider(ABC):
         thinking_effort: str = "high",
         tools: Optional[List[Dict[str, Any]]] = None,
         system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
         **kwargs,
     ) -> Iterator[LLMChunk]:
         """Stream response chunks from provider."""

@@ -100,6 +100,47 @@ def _model_belongs_to_provider(model_name: str, provider: str) -> bool:
     return False
 
 
+# Default sampling temperature: 1.0, the value virtually every provider uses when
+# the parameter is absent. Kept here so the CLI and Discord bot agree on what
+# "reset" means.
+DEFAULT_TEMPERATURE = 1.0
+TEMPERATURE_MIN = 0.0
+TEMPERATURE_MAX = 1.0
+
+
+def _parse_temperature(raw: str) -> Optional[float]:
+    """Parse a /temperature argument into a 0.0 - 1.0 float.
+
+    Reset keywords ("default", "reset", ...) map back to :data:`DEFAULT_TEMPERATURE`
+    so the CLI and the Discord bot accept exactly the same inputs. Returns ``None``
+    when the input is neither a keyword nor a number inside the supported range.
+    Percentages ("50%") and shorthand ("50" -> 0.5) are accepted for convenience.
+    """
+    text = (raw or "").strip().lower().rstrip("%")
+    if not text:
+        return None
+    if text in ("off", "default", "reset", "auto", "none"):
+        return DEFAULT_TEMPERATURE
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if value != value:  # NaN
+        return None
+    if value > TEMPERATURE_MAX:
+        # Bare integers are read as a percentage (0-100), decimals as-is (0.0-1.0).
+        if value <= 100.0 and "." not in text and float(value).is_integer():
+            value = value / 100.0
+        else:
+            return None
+    if value < TEMPERATURE_MIN or value > TEMPERATURE_MAX:
+        return None
+    return value
+
+
+parse_temperature_arg = _parse_temperature
+
+
 class CommandContext:
     def __init__(self, agent: Any, renderer: Any, raw_args: str, queue: Any = None):
         self.agent = agent
@@ -181,6 +222,7 @@ class CommandRegistry:
         self.register("provider", self._cmd_provider, "Switch active LLM provider (16+ supported).")
         self.register("model", self._cmd_model, "Change model name for the active provider.")
         self.register("effort", self._cmd_effort, "Set thinking effort: off, low, medium, high, or token count.")
+        self.register("temperature", self._cmd_temperature, "Set model temperature: 0.0 (focused) - 1.0 (creative).")
         self.register("todo", self._cmd_todo, "Manage task list: /todo, /todo add <title>, /todo clear.")
         self.register("skills", self._cmd_skills, "List or reload available skills.")
         self.register("reload", self._cmd_reload, "Reload config, skills, and permissions from disk.")
@@ -629,6 +671,68 @@ class CommandRegistry:
         if params:
             ctx.renderer.print_info(f"Request params: {params}")
         _publish_state({"thinking_effort": setting}, ctx)
+
+    def _cmd_temperature(self, ctx: CommandContext):
+        """Show or set the model sampling temperature (/temperature 0.0 - 1.0)."""
+        arg = ctx.args.strip()
+        model = ctx.agent.session.model if ctx.agent.session else ctx.agent.config.model
+        spec = ctx.agent.provider.get_model_spec(model)
+
+        def _ignored_reason() -> Optional[Dict[str, str]]:
+            """Why this model will not honour a custom temperature, if it won't.
+
+            Returns ``{"reason": ..., "hint": ...}`` so the hint can name the
+            actual escape hatch for this model instead of a generic suggestion.
+            """
+            # Fixed-sampling reasoning models 400 on any custom value; only the
+            # effort level is tunable there.
+            if getattr(spec, "supports_temperature", True) is False:
+                return {
+                    "reason": "this model uses fixed sampling and rejects a custom temperature",
+                    "hint": "tune its output with '/effort' instead, or pick a non-reasoning model",
+                }
+            # Anthropic rejects temperature != 1 while extended thinking is on.
+            thinking = ctx.agent.provider.normalize_thinking_effort(
+                spec, ctx.agent.config.thinking_effort
+            )
+            if getattr(ctx.agent.provider, "name", "") == "anthropic" and thinking:
+                return {
+                    "reason": "extended thinking is enabled, and Claude only accepts temperature 1 with thinking on",
+                    "hint": "run '/effort off' to control temperature on this model",
+                }
+            return None
+
+        if not arg:
+            sent = ctx.agent.provider.resolve_temperature(spec, ctx.agent.config.temperature)
+            shown = f"{sent:.2f}" if sent is not None else "model default (not applied)"
+            note = _ignored_reason()
+            ctx.renderer.print_info(
+                f"Current temperature: {shown} | Model: {model} | "
+                f"Range: 0.0 (focused) - 1.0 (creative). Set with '/temperature <0.0-1.0>'."
+                + (f" | Note: {note['reason']}." if note else "")
+            )
+            return
+
+        raw = arg.split()[0].strip()
+        parsed = _parse_temperature(raw)
+        if parsed is None:
+            ctx.renderer.print_error(
+                f"Invalid temperature: '{raw}'. Use a number between 0.0 and 1.0 (e.g. /temperature 0.3), "
+                "or 'default' to reset."
+            )
+            return
+
+        ctx.agent.config.temperature = parsed
+        save_config(ctx.agent.config)
+        ctx.renderer.print_success(f"Temperature set to: {parsed:.2f} (model: {model})")
+        # The value is stored either way, but say so when this model ignores it
+        # rather than leaving the user wondering why behaviour did not change.
+        note = _ignored_reason()
+        if note:
+            ctx.renderer.print_warning(
+                f"Saved, but not sent on this model: {note['reason']}. {note['hint'].capitalize()}."
+            )
+        _publish_state({"temperature": parsed}, ctx)
 
     def _cmd_todo(self, ctx: CommandContext):
         args = ctx.args.strip()

@@ -28,6 +28,7 @@ class MockProvider(BaseProvider):
         thinking_effort: str = "high",
         tools: Optional[List[Dict[str, Any]]] = None,
         system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
         **kwargs,
     ) -> Iterator[LLMChunk]:
         self.call_history.append({
@@ -35,6 +36,8 @@ class MockProvider(BaseProvider):
             "model": model,
             "tools": tools,
             "system_prompt": system_prompt,
+            "temperature": temperature,
+            "thinking_effort": thinking_effort,
         })
 
         if self.preset_responses:

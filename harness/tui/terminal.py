@@ -306,6 +306,7 @@ class TerminalRenderer:
             f"  [bold]Provider:[/bold]    {agent.provider.display_name} ({agent.config.provider})",
             f"  [bold]Model:[/bold]       {agent.session.model if agent.session else agent.config.model}",
             f"  [bold]Effort:[/bold]      {agent.config.thinking_effort}",
+            f"  [bold]Temp:[/bold]        {getattr(agent.config, 'temperature', 1.0):.2f}",
             f"  [bold]Context:[/bold]     {self._render_context_bar(tokens, c_win)}",
             f"  [bold]System RAM:[/bold]  {ram_mb} MB",
             f"  [bold]Queue:[/bold]       {q_size} pending" + (f" (Active: #{q_curr.id})" if q_curr else " (Idle)"),
@@ -763,6 +764,7 @@ class TerminalRenderer:
         effort_str = "medium"
         mode_str = "BUILD"
         perm_str = "normal"
+        temp_str = "1.00"
         if agent:
             if getattr(agent, "session", None) is not None:
                 from harness.core.compaction import calculate_history_tokens
@@ -775,6 +777,8 @@ class TerminalRenderer:
             model_str = agent.session.model if (agent.session and hasattr(agent.session, "model")) else (getattr(agent.config, "model", "claude-3-7-sonnet") if hasattr(agent, "config") else "claude-3-7-sonnet")
             if hasattr(agent, "config") and hasattr(agent.config, "thinking_effort"):
                 effort_str = str(agent.config.thinking_effort)
+            if hasattr(agent, "config"):
+                temp_str = f"{float(getattr(agent.config, 'temperature', 1.0) or 0.0):.2f}"
             if hasattr(agent, "mode"):
                 mode_str = agent.mode.value.upper()
             if hasattr(agent, "permission_manager"):
@@ -795,6 +799,7 @@ class TerminalRenderer:
             f"  [white]Model:[/white]    [bold cyan]{model_str}[/bold cyan]",
             f"  [white]Context:[/white]  [dim]{tokens:,} / {c_win:,} ({pct}%)[/dim]",
             f"  [white]Effort:[/white]   [bold yellow]{effort_str}[/bold yellow]",
+            f"  [white]Temp:[/white]     [bold yellow]{temp_str}[/bold yellow]",
             f"  [white]RAM:[/white]      [dim]{ram_mb} MB[/dim]",
             "",
             "[bold magenta]Queue & Execution[/bold magenta]",
@@ -972,6 +977,7 @@ class TerminalRenderer:
         effort_str = "medium"
         mode_str = "BUILD"
         perm_str = "normal"
+        temp_str = "1.00"
         if agent:
             if getattr(agent, "session", None) is not None:
                 from harness.core.compaction import calculate_history_tokens
@@ -984,6 +990,8 @@ class TerminalRenderer:
             model_str = agent.session.model if (agent.session and hasattr(agent.session, "model")) else (getattr(agent.config, "model", "claude-3-7-sonnet") if hasattr(agent, "config") else "claude-3-7-sonnet")
             if hasattr(agent, "config") and hasattr(agent.config, "thinking_effort"):
                 effort_str = str(agent.config.thinking_effort)
+            if hasattr(agent, "config"):
+                temp_str = f"{float(getattr(agent.config, 'temperature', 1.0) or 0.0):.2f}"
             if hasattr(agent, "mode"):
                 mode_str = agent.mode.value.upper()
             if hasattr(agent, "permission_manager"):
@@ -1002,6 +1010,7 @@ class TerminalRenderer:
             f"  [white]Model:[/white]    [bold cyan]{model_str}[/bold cyan]",
             f"  [white]Context:[/white]  [dim]{tokens:,} / {c_win:,} ({pct}%)[/dim]",
             f"  [white]Effort:[/white]   [bold yellow]{effort_str}[/bold yellow]",
+            f"  [white]Temp:[/white]     [bold yellow]{temp_str}[/bold yellow]",
             f"  [white]RAM:[/white]      [dim]{ram_mb} MB[/dim]",
             "",
             "[bold magenta]Queue & Execution[/bold magenta]",

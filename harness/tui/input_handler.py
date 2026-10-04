@@ -13,7 +13,7 @@ from typing import List, Optional, Iterator
 SLASH_COMMANDS = [
     "/help", "/goal", "/ultra-goal", "/ultragoal", "/stop", "/queue", "/info", "/sidebar", "/status", "/mode", "/perm", "/theme",
     "/provider", "/model", "/models", "/config", "/keys", "/setup",
-    "/effort", "/todo", "/skills", "/reload", "/mcp", "/update", "/discord",
+    "/effort", "/temperature", "/todo", "/skills", "/reload", "/mcp", "/update", "/discord",
     "/subagent", "/agents", "/agent", "/back",
     "/compact", "/session", "/checkpoint", "/tokens", "/diff", "/clear",
     "/mesh", "/learn", "/exit", "/quit"
@@ -41,6 +41,7 @@ COMMAND_DESCRIPTIONS = {
     "/keys": "Manage provider API keys securely",
     "/setup": "Run interactive configuration setup wizard",
     "/effort": "Adjust thinking / reasoning effort level",
+    "/temperature": "Set model sampling temperature (0.0 - 1.0)",
     "/todo": "Inspect or update session task list",
     "/skills": "Browse available agent skills catalog",
     "/reload": "Reload custom skills and MCP tools",
@@ -292,6 +293,13 @@ class InputHandler:
                                     ("low", "Low reasoning effort"),
                                     ("medium", "Medium reasoning effort"),
                                     ("high", "High reasoning effort"),
+                                ],
+                                "/temperature": [
+                                    ("0.0", "Lowest randomness — most focused & deterministic"),
+                                    ("0.3", "Low randomness — stable code edits"),
+                                    ("0.7", "Balanced creativity"),
+                                    ("1.0", "Maximum randomness (provider default)"),
+                                    ("default", "Reset to the provider default (1.0)"),
                                 ],
                                 "/queue": [
                                     ("pause", "Pause queue worker"),
