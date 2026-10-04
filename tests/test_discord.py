@@ -786,6 +786,66 @@ class TestDiscordBotGoalStopAsk(unittest.IsolatedAsyncioTestCase):
             for ev in events
         ))
 
+    async def test_cmd_temperature_sets_and_persists(self):
+        from harness.discord.bot import HarnessDiscordBot
+
+        cfg = self._cfg()
+        cfg.temperature = 1.0
+        bot = HarnessDiscordBot(cfg, token="fake")
+
+        sent = []
+
+        class _Response:
+            def __init__(self):
+                self._done = False
+
+            def is_done(self):
+                return self._done
+
+            async def defer(self, thinking=False):
+                self._done = True
+
+            async def send_message(self, content, ephemeral=False):
+                self._done = True
+                sent.append(content)
+
+        class _User:
+            id = 1
+
+        class _Interaction:
+            def __init__(self):
+                self.channel_id = 77
+                self.data = {}
+                self.response = _Response()
+                self.channel = None
+                self.followup = None
+                self.user = _User()
+
+        # Never touch the real user config from a unit test.
+        async def _fake_save():
+            saved.append(dict(bot.config.to_dict()))
+        saved = []
+        bot._async_save_config = _fake_save
+
+        tree_cb = next(
+            c for c in bot.tree.get_commands() if c.name == "temperature"
+        )
+        # /temperature 0.25 → persisted to config, applied to live channel agents,
+        # and published so the CLI mirrors it.
+        rt = bot._get_runtime(77)
+        rt.ensure_agent()
+        await tree_cb.callback(_Interaction(), "0.25")
+        self.assertAlmostEqual(bot.config.temperature, 0.25, places=6)
+        self.assertAlmostEqual(rt.agent.config.temperature, 0.25, places=6)
+        self.assertEqual(saved[-1]["temperature"], 0.25)
+        # Invalid input must not mutate anything.
+        await tree_cb.callback(_Interaction(), "5.5")
+        self.assertAlmostEqual(bot.config.temperature, 0.25, places=6)
+        # Viewing reports the current value.
+        await tree_cb.callback(_Interaction(), None)
+        joined = "\n".join(sent)
+        self.assertIn("0.25", joined)
+
     def test_stop_requests_agent_interrupt(self):
         from harness.discord.bot import HarnessDiscordBot
         from harness.core.agent import HarnessAgent
