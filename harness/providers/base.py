@@ -23,6 +23,11 @@ class LLMChunk:
     tool_calls: List[ToolCallDelta] = field(default_factory=list)
     finish_reason: Optional[str] = None
     usage: Optional[Dict[str, int]] = None
+    # The provider's actual decoded streaming event (SSE JSON object, Anthropic
+    # event dict, Gemini candidate payload, ...). Providers preserve one native
+    # event per LLMChunk so advanced consumers never have to reconstruct or
+    # invent "chunks" — they can read the wire payload directly.
+    native: Optional[Any] = None
 
 
 # Errors that retrying cannot fix (auth, bad request, missing model, context
@@ -146,11 +151,11 @@ class BaseProvider(ABC):
             return {}
 
         ttype = model_spec.thinking_type or "reasoning_effort"
-        # NVIDIA NIM does not support the Together-style reasoning toggle.
-        # For models wrongly marked toggle but hosted on NVIDIA, silently disable
-        # reasoning so we never send {"reasoning": {"enabled": true}} to NIM.
-        if ttype == "reasoning_toggle" and getattr(self, "name", "") == "nvidia":
-            return {}
+        # NVIDIA NIM rejects the Together-style reasoning toggle, but accepts
+        # reasoning_effort. Convert toggle -> effort instead of disabling
+        # thinking, so minimax/glm families keep working on NIM.
+        if ttype == "reasoning_toggle" and getattr(self, "name", "") in ("nvidia", "nim"):
+            ttype = "reasoning_effort"
         eff = effort_setting.lower().strip()
         off = eff in ("off", "none", "false", "disabled", "no", "0", "disable", "stop", "cancel")
 

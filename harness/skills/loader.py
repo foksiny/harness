@@ -13,9 +13,33 @@ class Skill:
     name: str
     description: str
     triggers: List[str] = field(default_factory=list)
-    instructions: str = ""
     source_path: Optional[str] = None
     is_builtin: bool = False
+    allowed_tools: List[str] = field(default_factory=list)  # H10 capability manifest (empty = unrestricted)
+    trusted: bool = True  # H10: workspace skills need approval before first use
+    # Instruction bodies are large (the built-in motion catalog alone holds ~560KB),
+    # so they are read on first access instead of at discovery time. Use load_instructions().
+    _instructions: Optional[str] = field(default=None, repr=False, compare=False)
+
+    def load_instructions(self) -> str:
+        """Return the skill body, reading it from disk on first access."""
+        if self._instructions is None:
+            try:
+                if not self.source_path:
+                    self._instructions = ""
+                    return self._instructions
+                with open(self.source_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except (OSError, TypeError):
+                self._instructions = ""
+                return self._instructions
+            m = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", content, re.DOTALL)
+            self._instructions = (m.group(2) if m else content).strip()
+        return self._instructions
+
+    @property
+    def instructions(self) -> str:
+        return self.load_instructions()
 
     def matches(self, query: str) -> bool:
         """Check if query or task triggers this skill."""
@@ -31,8 +55,19 @@ class Skill:
                 return True
         return False
 
-def parse_skill_markdown(content: str, source_path: Optional[str] = None, is_builtin: bool = False) -> Optional[Skill]:
-    """Parse a SKILL.md file with YAML frontmatter."""
+def parse_skill_markdown(content: str, source_path: Optional[str] = None, is_builtin: bool = False,
+                         allow_bare_markdown: bool = False) -> Optional[Skill]:
+    """Parse a SKILL.md file with YAML frontmatter.
+
+    Returns None when the file is not a skill definition. A markdown document with no
+    frontmatter is only accepted when allow_bare_markdown is set, which the manager does
+    for user skill dirs (~/.harness/skills, .harness/skills) where a bare `my_skill.md` is
+    a legitimate way to define one. The builtin dir ships non-skill docs (license and
+    provenance records) alongside its skills, so those must carry frontmatter.
+
+    Only the frontmatter is parsed; the instruction body is discarded and re-read
+    lazily by Skill.load_instructions() (see the _instructions field).
+    """
     meta = {}
     instructions = content
 
@@ -53,6 +88,11 @@ def parse_skill_markdown(content: str, source_path: Optional[str] = None, is_bui
                 else:
                     meta[k] = v.strip("'\"")
 
+    if not meta and not allow_bare_markdown:
+        # A loose markdown file with no frontmatter is documentation, not a skill
+        # (e.g. the attribution record in the builtin dir).
+        return None
+
     name = meta.get("name")
     if not name and source_path:
         name = Path(source_path).parent.name if Path(source_path).name == "SKILL.md" else Path(source_path).stem
@@ -64,12 +104,21 @@ def parse_skill_markdown(content: str, source_path: Optional[str] = None, is_bui
     triggers = meta.get("triggers", [])
     if isinstance(triggers, str):
         triggers = [triggers]
+    allowed = meta.get("allowed_tools", [])
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    # Trusted only when builtin or explicitly approved; workspace skills start untrusted.
+    trusted = bool(is_builtin or (meta.get("trusted") or "").lower() in ("true", "yes", "1"))
 
     return Skill(
         name=name,
         description=desc,
         triggers=triggers,
-        instructions=instructions.strip(),
+        allowed_tools=allowed,
+        trusted=trusted,
+        # With a source_path the body is re-read on demand; without one the only
+        # available body is the content we just parsed.
+        _instructions=None if source_path else instructions.strip(),
         source_path=str(source_path) if source_path else None,
         is_builtin=is_builtin,
     )
@@ -92,15 +141,16 @@ class SkillsManager:
         # 1. Builtin skills
         self._scan_directory(self.builtin_dir, is_builtin=True)
 
-        # 2. Global user skills
+        # 2. Global user skills (a bare <name>.md with no frontmatter is valid here)
         if self.global_dir.exists():
-            self._scan_directory(self.global_dir, is_builtin=False)
+            self._scan_directory(self.global_dir, is_builtin=False, allow_bare_markdown=True)
 
         # 3. Workspace skills (highest override priority)
         if self.workspace_dir.exists():
-            self._scan_directory(self.workspace_dir, is_builtin=False)
+            self._scan_directory(self.workspace_dir, is_builtin=False, allow_bare_markdown=True)
 
-    def _scan_directory(self, dir_path: Path, is_builtin: bool = False) -> None:
+    def _scan_directory(self, dir_path: Path, is_builtin: bool = False,
+                        allow_bare_markdown: bool = False) -> None:
         if not dir_path.exists():
             return
 
@@ -119,7 +169,8 @@ class SkillsManager:
             elif item.is_file() and item.suffix == ".md":
                 try:
                     with open(item, "r", encoding="utf-8") as f:
-                        skill = parse_skill_markdown(f.read(), str(item), is_builtin)
+                        skill = parse_skill_markdown(f.read(), str(item), is_builtin,
+                                                      allow_bare_markdown)
                         if skill:
                             self.skills[skill.name] = skill
                 except Exception:

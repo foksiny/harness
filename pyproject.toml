@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "harness-cli"
-version = "0.10.4"
+version = "0.11.0"
 description = "Harness: The Ultimate Agentic AI Coding & Task Orchestration CLI (Beta)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -53,6 +53,15 @@ harness = "harness.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["harness*"]
+# harness/skills/builtin/<skill>/{SKILL.md,references/,scripts/,templates/,examples/} hold no
+# __init__.py, so plain find_packages() silently dropped every skill from the wheel.
+namespaces = true
+
+[tool.setuptools.package-data]
+# Ship the built-in skill catalog as package data (SKILL.md + its references/scripts/templates).
+"harness.skills" = ["builtin/**/*.md", "builtin/**/*.sh", "builtin/**/*.mjs",
+                     "builtin/**/*.js", "builtin/**/*.html", "builtin/**/*.jsx",
+                     "builtin/MOTION_SKILLS_LICENSE", "builtin/MOTION_SKILLS_PROVENANCE.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

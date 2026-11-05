@@ -1,6 +1,6 @@
-# Harness ⚡ — v0.10.4 (Beta)
+# Harness ⚡ — v0.11.0 (Beta)
 
-> **The Premier Agentic AI Engineering Harness & CLI** — now in **v0.10.4 Beta**
+> **The Premier Agentic AI Engineering Harness & CLI** — now in **v0.11.0 Beta**
 > Built for developers, autonomous AI workflows, and software engineers who demand speed, low memory (~24MB RAM), subagent orchestration, and multi-provider intelligence.
 
 ```
@@ -16,13 +16,13 @@
 
 ## ✨ Key Features
 
-- 🏎️ **Ultra-Fast & Low Memory**: Benchmarked **~60ms cold start**, **~24MB RSS** — no heavy framework bloat.
+- 🏎️ **Ultra-Fast & Low Memory**: Benchmarked **~105ms cold start**, **~25MB RSS** — no heavy framework bloat.
 - 🧠 **Dynamic Thinking Effort & Context Window Detection**:
   - Resolves context window limits and reasoning parameters for **any current or future model** via 5-level priority: explicit registry (200+ models) → provider `/models` endpoint → model name tokens (`-1m`, `-128k`) → model family heuristics → safe default (128k). Registry covers GPT-5, Claude 4.5, Gemini 2.5, Grok 4, DeepSeek V4, and Command-A generations.
   - Provider-aware **thinking dialects**: Claude budget tokens, Gemini thinking budget (incl. `includeThoughts`), OpenAI/xAI/Mistral/Groq/Perplexity/DeepSeek reasoning effort, OpenRouter `reasoning` object, Together hybrid reasoning toggle, NVIDIA NIM DeepSeek-V4 `chat_template_kwargs`, and Cohere `thinking.token_budget`.
-- 🌐 **16+ First-Class Providers**:
-  - Anthropic, OpenAI, Google Gemini, OpenRouter, NVIDIA NIM, OpenCode Zen, Groq, DeepSeek, Mistral AI, xAI (Grok), Ollama (Local), Together AI, Fireworks AI, Cohere, Perplexity Sonar, and an Offline Mock Engine.
-  - **Resilient streaming**: httpx-based SSE with per-line delivery (no buffering stalls), a generous 300s read timeout so long reasoning pauses don't surface as `read operation timed out` (tunable via `provider_stream_timeout` or `HARNESS_STREAM_TIMEOUT`), and retries for transient failures (resets, 5xx, rate limits) with exponential backoff — 5s/10s/20s by default, configurable via `provider_max_retries` and `provider_retry_base_delay`. If a stream dies mid-way (e.g. a long-thinking stall), the agent re-issues the whole model call after discarding the partial output; fatal errors (auth, bad request, context overflow) are never retried. Every retry is surfaced as a `🔁` notice.
+- 🌐 **18 First-Class Providers**:
+  - Anthropic, OpenAI, Google Gemini, OpenRouter, NVIDIA NIM, OpenCode Zen, Groq, DeepSeek, Mistral AI, xAI (Grok), Ollama (Local), Together AI, Fireworks AI, Cohere, Perplexity Sonar, ChatGPT web session (`openaiauth`), Claude.ai web session (`claudeauth`), and an Offline Mock Engine.
+  - **Resilient streaming**: httpx-based SSE with per-line delivery (no buffering stalls), a generous 300s read timeout so long reasoning pauses don't surface as `read operation timed out` (tunable via `provider_stream_timeout` or `HARNESS_STREAM_TIMEOUT`), and retries for transient failures (resets, 5xx, rate limits) with exponential backoff — 5s/10s/20s by default, configurable via `provider_max_retries` and `provider_retry_base_delay`. Every provider event maps to exactly one `LLMChunk` that also carries the decoded native payload (`LLMChunk.native`), so consumers never have to reconstruct or invent chunks; piped/headless output writes those deltas verbatim. Interactive terminals stream completed markdown blocks as they arrive and keep newline-less deltas on one line, committing that line when the provider sends a real newline (fragments are held while prompt_toolkit owns the screen, so its repaint cannot overwrite them) — no chunk ever gets an auto-newline of its own. If a stream dies mid-way (e.g. a long-thinking stall), the agent re-issues the whole model call after discarding the partial output; fatal errors (auth, bad request, context overflow) are never retried. Every retry is surfaced as a `🔁` notice.
 - 🔔 **Desktop Notifications**:
   - When the agent finishes its task — or stops because of an error — you get a native OS notification, so you can switch to another window and come back the moment the run is over. Works on **macOS** (`osascript`), **Linux** (`notify-send`), and **Windows** (PowerShell balloon tip + sound), with a terminal-bell fallback when no desktop backend exists. Zero dependencies.
   - Success notifications carry the agent's final summary (or `finish` summary); error notifications carry the first line of the provider error with an urgent sound/icon.
@@ -108,26 +108,33 @@ When a delegation finishes, the report you receive already includes each agent's
 - 📋 **Integrated To-Do Tracking (`todo_create`, `todo_update`, `todo_list`)**:
   - Real-time task planning and HUD progress reporting (`3/5 completed`).
   - **Persistent across sessions**: task state is saved into the session file on every save and restored on resume, so long-running projects survive restarts.
-- 🧩 **Extensible Skills & 11 Built-in Skills**:
-  - Discovers skills from `~/.harness/skills/` and `.harness/skills/` on top of the 11 built-ins.
-  - Includes specialized **`skill_creator`** (generates and installs new skills on user request), **`mcp_integrator`** (connects and configures MCP servers), and **`motion_graphics`** (professional motion graphics with anti-slop QA).
+- ⌨️ **Polished TUI**:
+  - **Persistent command history** (`~/.harness/history`) with Up/Down + Ctrl+R search across runs, `@`-mention file completion (capped, hidden-aware), and slash-command + argument completion.
+  - **Ctrl+L** clears the screen anywhere; turn capsules show elapsed time plus tokens/context; sessions auto-title from the first prompt; `/copy` grabs the last answer, `/undo`/`/redo` shortcut checkpoints.
+- 🧠 **Self-Correcting Agent Loop**:
+  - Repeat-loop watchdog ends identical mutating-call spins (nudge, then graceful stop; read-only spins stay with the exploration watchdog), a 120-step turn budget bounds runaway spend, and tool schemas build once per turn instead of every step.
+- 🧩 **Extensible Skills & 67 Built-in Skills**:
+  - Discovers skills from `~/.harness/skills/` and `.harness/skills/` on top of the built-ins.
+  - Includes specialized **`skill_creator`** (generates and installs new skills on user request) and **`mcp_integrator`** (connects and configures MCP servers).
+  - **55 built-in motion skills** vendored from the [iart-ai motion-skills](https://github.com/iart-ai/motion-skills) collection (MIT © iart.ai): motion design & craft (`animation_principles`, `beat_sync_editing`, `color_motion`, `shot_composition`, `after_effects`, `remotion_video`, `logo_animation`, …), web motion (`gsap_web`, `svg_animation`, `lottie_animation`, `micro_interaction`, `glassmorphism`, `page_transition_animation`, `accessible_animation`, `fps_60_animation`, `ascii_animation`), 3D/WebGL (`threejs_animation`, `shader_glsl`, `particle_system`), data & explainers (`chart_animation`, `animated_infographic`, `presentation_video`, `explainer_video`, `diagram_animation`, `isometric_animation`, `whiteboard_animation`, `manim`), platform video (`short_form_video`, `caption_animation`, `countdown_video`, `audiogram`, `youtube_intro_outro`, `photo_slideshow`, `product_demo_video`, `promo_video`, `launch_video`, `ad_creative_video`, `testimonial_video`, `text_message_animation`), and freelance business (`creative_brief`, `motion_pricing`, `client_revisions`, `video_delivery_specs`, `brand_motion_guidelines`) — plus the shared **`motion_verify`** toolkit for the deliver-and-verify loop.
 - 🧠 **Continuous Learning & Self-Improvement**:
   - The agent transparently learns across sessions: `learn_record` / `learn_recall` / `learn_promote` let it (and you, via `/learn`) persist reusable lessons, inject top matches into every system prompt, and promote matured lessons into real skills.
   - **Global skill promotion**: When the agent finds a lesson broadly useful across projects (coding patterns, debugging techniques, tool tricks), it promotes it as a **global skill** (`~/.harness/skills/`) so it's available everywhere. Workspace-specific lessons stay scoped to `.harness/skills/`.
 - 🔌 **Model Context Protocol (MCP) Client**:
   - Supports `stdio` and `sse` JSON-RPC 2.0 servers configured in `mcp.json`.
-- 🎨 **14 Handcrafted Visual Themes + Custom Theme Creation**:
-  - Built-ins: `cyberpunk` (default neon), `dracula`, `nord`, `monokai`, `catppuccin`, `matrix`, `minimal`, `amber_crt`, `gruvbox`, `one_dark`, `rose_pine`, `solarized_dark`, `synthwave`, `tokyo_night`.
+- 🎨 **15 Handcrafted Visual Themes + Custom Theme Creation**:
+  - Built-ins: `cyberpunk` (default neon), `dracula`, `nord`, `monokai`, `catppuccin`, `matrix`, `minimal`, `amber_crt`, `gruvbox`, `ocean`, `one_dark`, `rose_pine`, `solarized_dark`, `synthwave`, `tokyo_night`.
   - **Custom themes**: ask the agent to *"create a custom theme"* (it has the `theme_creator` skill), use `/theme create` for the interactive wizard, or write `~/.harness/themes.json` (global) / `.harness/themes.json` (workspace) directly. Each theme defines 10 semantic colors (primary, secondary, accent, success, warning, error, muted, text, border, thinking) plus a Pygments `code_theme`. Built-in names are protected; custom themes persist across sessions and are marked `(custom)` in `/theme list`. Delete with `/theme delete <name>`.
 - 🧠 **Proactive Context-Budget Management**:
   - Beyond reactive compaction, Harness now guards the window **proactively** so it is much harder for the agent to fill its own context log:
     - **Per-tool output caps** clamp runaway results at the source (`view_file` ~8k chars, `run_command` ~16k, `grep_search` ~8k, `execute_python` ~16k, …) with a transparent truncation marker. The agent can still request the full payload by passing an explicit `max_chars`.
     - **Pre-send pressure check** runs before every provider call. When usage approaches the threshold it compacts *before* the model is asked to respond (and emergency-trims at the hard cap) — not only at turn boundaries.
-    - **Reasoning-stripping**: verbose `reasoning_content` from old turns being summarized is stripped, recovering large amounts of tokens; the recent working set keeps its reasoning verbatim.
+    - **Reasoning-stripping**: verbose `reasoning_content` is stripped from the whole old block during compaction (recent turns keep theirs verbatim) — at high thinking effort this is the single biggest saver. Attached images count ~1.5k tokens each so vision turns compact on time instead of overflowing.
     - **Context-aware system prompt**: verbose MCP tool summaries are elided when the window is tight, and `git status` lookups are cached (2s TTL) so prompt assembly stays fast.
+    - **Fast, accurate model detection**: single-lookup catalog index (~10µs vs ~300µs per model) and memoized discovery caches — no more repeated network stalls resolving context windows mid-turn.
 - 📦 **Smart Auto-Compaction**:
-  - Budget-driven, graduated context compaction. When usage crosses the warning threshold (default 75%), the sampler dials back pressure in three sweeps: oversized verbatim tool payloads are collapsed to head/tail digests, the oldest turn-groups are condensed into structured memory checkpoints down to the target budget (default 60%), and a single global checkpoint is emitted if the window is still hot. Recently-used turns stay verbatim, and undo/redo (`/checkpoint`) can restore the pre-compaction history.
-  - Uses the LLM itself to summarize when a provider is live (`compact_summary`), falling back to a heuristic extractor otherwise. A peak-hold hysteresis guard prevents re-firing every turn, and the proactive pre-send gauge plus a mid-turn emergency trim collapse old blobs (never current-turn text) if usage races past the hard cap (~95%). Inspect everything with `/compact` and `/tokens`.
+  - Budget-driven, graduated context compaction. When usage crosses the warning threshold (default 75%), the sampler dials back pressure in four sweeps: oversized verbatim tool payloads are collapsed to head/tail digests, chain-of-thought is stripped from old turns, the oldest turn-groups are condensed into structured memory checkpoints down to the target budget (default 60%), and a single global checkpoint is emitted if the window is still hot. Recently-used turns stay verbatim, and undo/redo (`/checkpoint`) can restore the pre-compaction history.
+  - **The model writes every summary**: per-group digests and the global checkpoint are all produced by the active model (`compact_summary: auto`), so nothing important is lost to dumb extraction — heuristics are strictly the fallback when the model is unavailable, disabled (`compact_summary: heuristic`), or over budget. Switching models rebinds the budget to the new window (hysteresis reset, message cap recomputed). Even a giant keep-block is collapsed/stripped so compaction always lands near target. Inspect everything with `/compact`, `/compact preview` (dry-run), and `/tokens`.
 
 ---
 
@@ -176,13 +183,13 @@ cat logs/error.log | harness "Diagnose this stack trace"
 | `/goal <objective>` | Launch Super Mode autonomous loop toward an explicit goal |
 | `/mode [plan\|build\|super]` | Switch operational mode |
 | `/perm [secure\|default\|full]` | Switch permission security profile |
-| `/provider <name>` | Switch active LLM provider (16+ supported) |
+| `/provider <name>` | Switch active LLM provider (18 supported) |
 | `/model <name>` | Change model name for active provider |
 | `/models [provider]` | Browse model catalog for current or specific provider |
 | `/config [list\|get\|set]` | View, get, or set configuration settings |
 | `/keys [list\|set\|remove]` | Manage, mask, and test provider API keys |
 | `/setup` | Launch interactive onboarding setup wizard |
-| `/effort <level>` | Set thinking effort (`off`, `low`, `medium`, `high`, or tokens) |
+| `/effort <level>` | Set thinking effort (`off`, `low`, `medium`, `high`, `max`, or token budget; validated per-dialect, ignored with a warning on non-thinking models) |
 | `/temperature [0.0-1.0]` | Show or set model sampling temperature — `0.0` most focused/deterministic, `1.0` most creative (also `50%` and `default`). Synced with the Discord bot |
 | `/theme` | Theme gallery, preview, switching, and custom creation: `/theme`, `/theme list`, `/theme <name>`, `/theme preview <name>`, `/theme create`, `/theme delete <name>` |
 | `/todo [list\|add\|clear]` | Manage active task items |
@@ -190,9 +197,12 @@ cat logs/error.log | harness "Diagnose this stack trace"
 | `/learn [list\|record\|forget\|promote\|on\|off]` | Manage persistent learned memories; promote proven lessons into skills |
 | `/mcp [list\|add]` | Manage Model Context Protocol (MCP) servers |
 | `/subagent <type> <prompt>` | Dispatch an isolated subagent worker |
-| `/compact` | Trigger manual context compaction; shows tactics used (payload truncations, groups summarized, checkpoint) plus ledger history |
+| `/compact` | Trigger manual context compaction; shows tactics used (reasoning stripped, payload truncations, groups summarized, checkpoint) plus ledger history (`/compact preview` for a dry-run) |
 | `/session [list\|create\|delete\|rename\|fork\|resume]` | Full session lifecycle management |
 | `/checkpoint [list\|create\|undo\|redo]` | Manage checkpoints for undo/redo of file changes, messages, and state |
+| `/undo` | Shortcut for `/checkpoint undo` |
+| `/redo` | Shortcut for `/checkpoint redo` |
+| `/copy` | Copy the last assistant response to the clipboard |
 | `/tokens` | Display token counts broken down by role (system/user/assistant/reasoning/tool), context percentage versus the target/cap budget, and RAM usage |
 | `/diff` | View uncommitted git diffs |
 | `/clear` | Clear terminal screen |
@@ -200,7 +210,9 @@ cat logs/error.log | harness "Diagnose this stack trace"
 
 ---
 
-## 🛠️ Built-in Skills (13 Total)
+## 🛠️ Built-in Skills (67 Total)
+
+### Core & Engineering (12)
 
 1. **`skill_creator`**: Autonomous skill generator — writes and registers new skills on user request.
 2. **`mcp_integrator`**: Autonomous MCP configurator — connects and verifies external MCP servers.
@@ -212,13 +224,52 @@ cat logs/error.log | harness "Diagnose this stack trace"
 8. **`docker_deploy`**: Multi-stage Dockerfiles and container orchestration.
 9. **`performance_profiler`**: Latency, memory leak diagnosis, and caching strategies.
 10. **`documentation_writer`**: Architecture RFCs, user guides, and API references.
-11. **`motion_graphics`**: Professional motion graphics creation — animation principles, timing/easing, kinetic typography, composition, Remotion/GSAP/Lottie/Manim pipelines, and rigorous anti-slop QA.
-12. **`browser_automation`**: Chrome DevTools Protocol browser control — launching, navigation, clicking, screenshots, and console-driven web testing workflows.
-13. **`theme_creator`**: Custom visual theme creation — guides the agent through defining a 10-color palette + syntax theme, saving it to global/workspace scope, previewing, and switching.
+11. **`browser_automation`**: Chrome DevTools Protocol browser control — launching, navigation, clicking, screenshots, and console-driven web testing workflows.
+12. **`theme_creator`**: Custom visual theme creation — guides the agent through defining a 10-color palette + syntax theme, saving it to global/workspace scope, previewing, and switching.
+
+### Motion, Animation & Video (55)
+
+Vendored from the [iart-ai motion-skills](https://github.com/iart-ai/motion-skills) collection
+(17 packs, MIT © iart.ai) with upstream instructions preserved. Each skill ships its own
+`references/`, and some ship `scripts/`, `templates/`, or `examples/`.
+
+**Motion design & craft (9)** — `animation_principles`, `beat_sync_editing`, `color_motion`,
+`shot_composition`, `motion_art_direction`, `motion_background`, `after_effects`,
+`remotion_video`, `logo_animation`
+
+**Web motion (9)** — `gsap_web`, `svg_animation`, `lottie_animation`, `micro_interaction`,
+`glassmorphism`, `page_transition_animation`, `accessible_animation`, `fps_60_animation`,
+`ascii_animation`
+
+**3D & WebGL (3)** — `threejs_animation`, `shader_glsl`, `particle_system`
+
+**Type, code-drawn & generative (4)** — `kinetic_typography`, `javascript_animation`,
+`generative_illustration`, `soundtrack`
+
+**Data & explainers (8)** — `chart_animation`, `animated_infographic`,
+`presentation_video`, `explainer_video`, `diagram_animation`, `isometric_animation`,
+`whiteboard_animation`, `manim`
+
+**Platform & social video (12)** — `short_form_video`, `caption_animation`,
+`countdown_video`, `audiogram`, `youtube_intro_outro`, `text_message_animation`,
+`photo_slideshow`, `product_demo_video`, `promo_video`, `launch_video`,
+`ad_creative_video`, `testimonial_video`
+
+**Lower thirds (2)** — `lower_thirds` (branded name/role straps, broadcast conventions) and
+`lower_thirds_overlay` (transparent-alpha WebM/ProRes 4444 overlays for OBS, Premiere, Resolve).
+
+**Maps (1)** — `map_animation`: Vox-style map motion, GeoJSON/SVG routes, Earth Studio → AE.
+
+**Freelance & studio business (5)** — `creative_brief`, `motion_pricing`,
+`client_revisions`, `video_delivery_specs`, `brand_motion_guidelines`
+
+**Verify toolkit (1)** — `motion_verify`: the shared deliver-and-verify loop
+(`seek-shot.sh`, `contact-sheet.sh`, `probe-mp4.sh`) that the motion skills reference as
+`scripts/…`. Upstream each pack carried its own copy; vendored, they all resolve here.
 
 > Note: the catalog also auto-discovers **workspace** (`~/.harness/skills/`, `.harness/skills/`)
-> and **promoted global** skills on top of these 13 built-ins — on this machine it currently
-> resolves to **17 total** skills (see `/skills`).
+> and **promoted global** skills on top of these 67 built-ins — so the total you see in
+> `/skills` will be higher (promoted lessons appear there too).
 
 ---
 
@@ -271,7 +322,7 @@ message model.
 - **Slash commands**: `/ask <prompt>`, `/status`, `/clear`, `/tokens`, `/compact`, `/agents`, `/agent <id>`, `/help discord` for the full setup guide.
 - **`/discord` admin command**: manage all Discord settings directly from Discord — channel/user access modes, blacklists, whitelists, permission level, auto-start, guild ID.
 - **File mentions**: reference host files inline with `@path/to/file`, pass `file:/path` to `/ask`, or upload an attachment with the command.
-- **Discord-native output**: model **thinking** is posted as `> ` quote blocks as the agent iterates; **tool usage** is announced live (`🔧 Using tool: …`); the **final response is sent in full** when the turn completes (no streaming).
+- **Discord-native output**: model **thinking** is posted as `> ` quote blocks as the agent iterates; **tool usage** is announced live (`🔧 Using tool: …`); the **answer streams live** — provider text deltas edit one Discord message in place, rolling into a new message only at Discord's 2000-character limit (no end-of-turn chunk dump).
 - **Per-channel conversations**: every channel keeps its own agent session.
 - **Approval buttons**: with `discord_permission` set to `default`/`secure`, risky actions post an **Approve / Deny** button message instead of a terminal prompt.
 
@@ -340,7 +391,7 @@ details, so you can configure everything without leaving Discord.
 
 ## 🧪 Testing
 
-Harness ships with a comprehensive automated test suite (**331 tests across 23 files**):
+Harness ships with a comprehensive automated test suite (**694 tests across 39 files**):
 ```bash
 python3 -m unittest discover -s tests -v      # primary runner (recommended)
 # or, equivalently:
@@ -352,11 +403,11 @@ The suite verifies tools, tool output caps / proactive context budgeting, sandbo
 ### Benchmarks
 
 Run `python3 benchmarks/bench_startup.py` to reproduce. Recent results:
-- Cold start: **~60ms**
-- RSS (after imports): **~24.1 MB**
-- Tool registration: **~0.7ms** (26 tools)
-- Skill loading: **~0.5ms** (15 skills)
-- Model detection: **~0.5ms** (8 models)
+- Cold start: **~105ms**
+- RSS (after imports): **~25 MB**
+- Tool registration: **~36ms** (46 tools)
+- Skill loading: **~11ms** (69 skills, incl. workspace-discovered)
+- Model detection: **~5ms** (18 providers)
 
 ---
 

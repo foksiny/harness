@@ -40,6 +40,23 @@ class TestModelDetection(unittest.TestCase):
         self.assertTrue(th)
         self.assertEqual(ttype, "reasoning_effort")
 
+    def test_minimax_flash_thinking_on_nvidia(self):
+        # Regression: minimax-m3.1-flash DOES support thinking on NIM
+        # (reasoning_effort) — must not be blanket-disabled as "toggle".
+        for m in ("minimaxai/minimax-m3", "minimaxai/minimax-m3.1-flash",
+                  "minimaxai/minimax-m3.1", "minimaxai/minimax-m2.7"):
+            spec = inspect_model(m, "nvidia")
+            self.assertTrue(spec.supports_thinking, m)
+            self.assertEqual(spec.thinking_type, "reasoning_effort", m)
+            self.assertEqual(spec.source, "catalog", m)
+        # Together uses the toggle dialect for this family, OpenRouter the object.
+        spec_t = inspect_model("minimaxai/minimax-m3.1-flash", "together")
+        self.assertTrue(spec_t.supports_thinking)
+        self.assertEqual(spec_t.thinking_type, "reasoning_toggle")
+        spec_o = inspect_model("minimaxai/minimax-m3.1-flash", "openrouter")
+        self.assertTrue(spec_o.supports_thinking)
+        self.assertEqual(spec_o.thinking_type, "reasoning_object")
+
         # Text-only models are not vision-capable.
         self.assertFalse(detect_vision_support("deepseek-chat", "deepseek"))
         self.assertFalse(detect_vision_support("llama-3.3-70b-instruct", "groq"))

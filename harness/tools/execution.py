@@ -31,9 +31,28 @@ class RunCommandTool(Tool):
     def __init__(self, permission_manager: Optional[PermissionManager] = None):
         self.permission_manager = permission_manager
 
-    def execute(self, command: str, timeout: int = 60, cwd: Optional[str] = None, max_chars: Optional[int] = None, **kwargs) -> str:
+    def execute(self, command: str, timeout: int = 60, cwd: Optional[str] = None, max_chars: Optional[int] = None, mode=None, **kwargs) -> str:
         cmd = command.strip()
         work_dir = cwd or os.getcwd()
+
+        # H1/H3: PLAN mode + workspace confinement (validate cwd inside workspace).
+        if mode is not None:
+            try:
+                from harness.core.modes import Mode as _Mode, is_command_allowed_in_mode
+                m = mode if isinstance(mode, _Mode) else _Mode.from_string(str(mode))
+                if m == _Mode.PLAN and not is_command_allowed_in_mode(cmd, m):
+                    return f"Error: Command blocked in PLAN mode: `{cmd}`"
+            except Exception:
+                pass
+        try:
+            from harness.core.security import enforce_workspace_boundary
+            root = os.path.abspath(os.environ.get("HARNESS_WORKSPACE", os.getcwd()))
+            work_abs = os.path.abspath(work_dir)
+            if os.path.commonpath([work_abs, root]) != root and work_abs != root:
+                # cwd explicitly outside workspace: confine to workspace root.
+                work_dir = root
+        except Exception:
+            work_dir = os.path.abspath(work_dir)
 
         # Check permissions
         if self.permission_manager:

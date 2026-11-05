@@ -4,11 +4,16 @@ Maintains token hygiene and prevents context overflow.
 
 Compaction is budget-driven and graduated:
   1. Oversized verbatim tool payloads are collapsed to head/tail digests.
-  2. The oldest semantic turn-groups are condensed into structured digests
+  2. Chain-of-thought (``reasoning_content``) is stripped from the old block —
+     at high thinking effort it is the fastest-growing consumer and has
+     near-zero retrieval value once summarized. Preserved recent turns keep
+     their reasoning verbatim.
+  3. The oldest semantic turn-groups are condensed into structured digests
      (LLM-assisted when a summarizer is available, heuristic otherwise) until
      usage falls back to the target ratio.
-  3. If the window is still too hot, the summarized block is consolidated into a
-     single global checkpoint.
+  4. If the window is still too hot, the model consolidates the digests into a
+     single global checkpoint (heuristic extraction is strictly the fallback
+     when the model is unavailable, disabled, or over budget).
 
 A peak-hold hysteresis guard prevents re-firing on every turn, and
 ``emergency_trim()`` protects the window mid-turn without ever touching the
@@ -29,6 +34,11 @@ MESSAGE_OVERHEAD = 4          # role / name / tool_call_id wrappers
 TOOL_CALL_WEIGHT = 1.25       # JSON arguments inflate real token counts
 CODE_BLOCK_WEIGHT = 1.15      # code fences / indentation are more token-dense
 REASONING_WEIGHT = 1.10       # reasoning_content is verbose for its value
+# Attached media have no countable characters, but a real vision model spends
+# ~1-2k tokens per image (tiles + encoder). Counting 0 (the old str() of the
+# block dict) silently under-budgeted vision turns until overflow. This is a
+# deliberately conservative heuristic, not a model-specific truth.
+IMAGE_BLOCK_TOKENS = 1500
 
 
 def estimate_tokens(text_or_obj: Any) -> int:
@@ -57,6 +67,34 @@ def _weighted_content_tokens(content: str) -> int:
     return est
 
 
+def _content_tokens(content: Any) -> int:
+    """Token estimate for a message ``content`` in any provider shape.
+
+    Plain strings use the weighted estimator; content-block lists (vision
+    turns: ``[{"type": "text", ...}, {"type": "image", ...}]``) sum their
+    text parts and charge a flat heuristic per attached media block.
+    """
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return _weighted_content_tokens(content)
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if isinstance(part, str):
+                total += _weighted_content_tokens(part)
+            elif isinstance(part, dict):
+                ptype = str(part.get("type", "")).lower()
+                if ptype in ("image", "image_url", "video", "input_image", "input_video"):
+                    total += IMAGE_BLOCK_TOKENS
+                else:
+                    total += _weighted_content_tokens(str(part.get("text", "")))
+            else:
+                total += estimate_tokens(part)
+        return total
+    return _weighted_content_tokens(str(content))
+
+
 def calculate_history_tokens(messages: List[Dict[str, Any]], system_prompt: str = "") -> int:
     """Calculate aggregate tokens for an active message thread, including the
     per-message structural overhead and JSON/reasoning weighting."""
@@ -66,16 +104,12 @@ def calculate_history_tokens(messages: List[Dict[str, Any]], system_prompt: str 
         total += estimate_tokens(msg.get("role", ""))
         content = msg.get("content")
         if content:
-            total += _weighted_content_tokens(str(content))
+            total += _content_tokens(content)
         if "tool_calls" in msg and msg.get("tool_calls"):
             total += int(estimate_tokens(msg["tool_calls"]) * TOOL_CALL_WEIGHT)
         if msg.get("reasoning_content"):
             total += int(estimate_tokens(msg["reasoning_content"]) * REASONING_WEIGHT)
     return total
-
-
-def _content_tokens(messages: List[Dict[str, Any]], system_prompt: str = "") -> int:
-    return calculate_history_tokens(messages, system_prompt)
 
 
 @dataclass
@@ -143,6 +177,29 @@ class Compactor:
         self.ledger: List[Dict[str, Any]] = []
         self._last_target_ratio: Optional[float] = None
 
+    def rebind(self, context_window: int,
+               threshold_ratio: Optional[float] = None,
+               target_ratio: Optional[float] = None,
+               cap_ratio: Optional[float] = None,
+               max_message_tokens: Optional[int] = None) -> None:
+        """Re-target the compactor at a newly selected model.
+
+        Updates the window (and optionally the ratios / message cap) and
+        resets the peak-hold hysteresis so the new window starts with a
+        clean gauge instead of the old model's memory. Pass
+        ``max_message_tokens=0`` to recompute the 15%-of-window auto cap.
+        """
+        self.context_window = max(1, context_window)
+        if threshold_ratio is not None:
+            self.threshold_ratio = threshold_ratio
+        if target_ratio is not None:
+            self.target_ratio = target_ratio
+        if cap_ratio is not None:
+            self.cap_ratio = cap_ratio
+        if max_message_tokens is not None:
+            self.max_message_tokens = max_message_tokens or int(self.context_window * 0.15)
+        self._last_target_ratio = None
+
     # ---- budget inspection -------------------------------------------------
 
     def check_status(self, messages: List[Dict[str, Any]], system_prompt: str = "") -> TokenStats:
@@ -169,11 +226,11 @@ class Compactor:
             overhead = MESSAGE_OVERHEAD + estimate_tokens(role or "")
             content = msg.get("content")
             if role == "user":
-                user += overhead + (_weighted_content_tokens(str(content)) if content else 0)
+                user += overhead + (_content_tokens(content) if content else 0)
             elif role == "assistant":
-                assistant += overhead + (_weighted_content_tokens(str(content)) if content else 0)
+                assistant += overhead + (_content_tokens(content) if content else 0)
             elif role == "tool":
-                tool += overhead + (_weighted_content_tokens(str(content)) if content else 0)
+                tool += overhead + (_content_tokens(content) if content else 0)
             if msg.get("reasoning_content"):
                 reasoning += int(estimate_tokens(msg["reasoning_content"]) * REASONING_WEIGHT)
             if msg.get("tool_calls"):
@@ -227,40 +284,97 @@ class Compactor:
             keep_msgs.extend(g)
         old_raw: List[Dict[str, Any]] = [m for g in old_groups for m in g]
 
-        tactics = {"payloads_truncated": 0, "groups_summarized": 0, "checkpointed": False}
+        tactics = {"payloads_truncated": 0, "groups_summarized": 0, "checkpointed": False,
+                   "checkpoint_llm": False, "reasoning_stripped": 0}
 
+        # Context bug fix: the preserved recent block is never summarized, so
+        # when it ALONE exceeds the target (one giant tool result, or megabytes
+        # of high-effort reasoning) every sweep below is futile — the old code
+        # returned after_ratios like 6x target. Collapse oversized payloads and
+        # strip reasoning in the keep block too; it stays verbatim otherwise.
+        if calculate_history_tokens(keep_msgs, system_prompt) > target_tokens:
+            keep_msgs = self._collapse_payloads(keep_msgs, tactics)
+            stripped_keep: List[Dict[str, Any]] = []
+            for m in keep_msgs:
+                if m.get("reasoning_content"):
+                    nm = dict(m)
+                    nm["reasoning_content"] = None
+                    stripped_keep.append(nm)
+                    tactics["reasoning_stripped"] += 1
+                else:
+                    stripped_keep.append(m)
+            keep_msgs = stripped_keep
+
+        # Sweep 2: strip chain-of-thought from the old block. Reasoning is the
+        # fastest-growing context consumer at high thinking effort, and it has
+        # near-zero retrieval value once a turn is over — the digests below
+        # preserve goals, tool decisions and outcomes, never raw thought.
+        # Only the preserved recent turns keep their reasoning verbatim.
         # Sweep 1: collapse oversized verbatim tool payloads in the old block.
         chunks = [self._collapse_payloads(g, tactics) for g in old_groups]
+        # Sweep 2: strip chain-of-thought from the old block.
+        stripped_chunks: List[List[Dict[str, Any]]] = []
+        for g in chunks:
+            ng = []
+            for m in g:
+                if m.get("reasoning_content"):
+                    nm = dict(m)
+                    nm["reasoning_content"] = None
+                    ng.append(nm)
+                    tactics["reasoning_stripped"] += 1
+                else:
+                    ng.append(m)
+            stripped_chunks.append(ng)
+        chunks = stripped_chunks
 
-        # Sweep 2: summarize the oldest turn-groups until the whole thread fits
-        # under the target budget.
+        # Sweep 3: summarize the oldest turn-groups until the whole thread fits
+        # under the target budget. Token math is incremental (per-group totals
+        # computed once) instead of re-dumping the whole thread per pop.
+        sys_toks = estimate_tokens(system_prompt) if system_prompt else 0
+        keep_toks = sum(calculate_history_tokens([m]) for m in keep_msgs)
+        chunk_toks = [calculate_history_tokens(g) for g in chunks]
+        remaining = sum(chunk_toks)
         head_msgs: List[Dict[str, Any]] = []
+        head_toks = 0
         while chunks:
-            cur = head_msgs + [m for g in chunks for m in g] + keep_msgs
-            if calculate_history_tokens(cur, system_prompt) <= target_tokens:
+            if sys_toks + head_toks + remaining + keep_toks <= target_tokens:
                 break
             chunk = chunks.pop(0)
-            head_msgs.append(self._digest_group(chunk))
+            remaining -= chunk_toks.pop(0)
+            digest = self._digest_group(chunk)
+            head_msgs.append(digest)
+            head_toks += calculate_history_tokens([digest])
             tactics["groups_summarized"] += 1
 
         remaining_msgs: List[Dict[str, Any]] = [m for g in chunks for m in g]
 
-        # Sweep 3: if still over budget, consolidate everything old into a single
-        # global checkpoint. Extraction happens against the raw old block so the
-        # checkpoint is genuinely smaller than the verbatim history.
+        # Sweep 4: if still over budget, consolidate everything old into a single
+        # global checkpoint. The model writes it: the per-group digests above
+        # are already small, so consolidating them costs one bounded provider
+        # call instead of re-sending the raw history. Heuristic extraction is
+        # strictly the fallback (model unavailable, disabled, or over budget).
         if calculate_history_tokens(head_msgs + remaining_msgs + keep_msgs, system_prompt) > target_tokens:
             digest_texts = [str(m.get("content") or "") for m in head_msgs]
-            base_cp = self._build_checkpoint(old_raw, digest_texts=None)
-            full_cp = self._build_checkpoint(old_raw, digest_texts=digest_texts)
-            base_total = calculate_history_tokens([base_cp] + keep_msgs, system_prompt)
-            full_total = calculate_history_tokens([full_cp] + keep_msgs, system_prompt)
-            if full_total <= target_tokens or (base_total > target_tokens and full_total < base_total):
-                checkpoint_msg = full_cp
+            llm_cp = self._digest_checkpoint_llm(digest_texts)
+            if llm_cp is not None and (
+                calculate_history_tokens([llm_cp] + keep_msgs, system_prompt) <= target_tokens
+            ):
+                head_msgs = [llm_cp]
+                remaining_msgs = []
+                tactics["checkpointed"] = True
+                tactics["checkpoint_llm"] = True
             else:
-                checkpoint_msg = base_cp
-            head_msgs = [checkpoint_msg]
-            remaining_msgs = []
-            tactics["checkpointed"] = True
+                base_cp = self._build_checkpoint(old_raw, digest_texts=None)
+                full_cp = self._build_checkpoint(old_raw, digest_texts=digest_texts)
+                base_total = calculate_history_tokens([base_cp] + keep_msgs, system_prompt)
+                full_total = calculate_history_tokens([full_cp] + keep_msgs, system_prompt)
+                if full_total <= target_tokens or (base_total > target_tokens and full_total < base_total):
+                    checkpoint_msg = full_cp
+                else:
+                    checkpoint_msg = base_cp
+                head_msgs = [checkpoint_msg]
+                remaining_msgs = []
+                tactics["checkpointed"] = True
 
         new_messages = head_msgs + remaining_msgs + keep_msgs
         if new_messages == messages:
@@ -356,7 +470,8 @@ class Compactor:
             "after_tokens": 0,
             "saved_tokens": 0,
             "reduction_pct": 0.0,
-            "tactics": {"payloads_truncated": 0, "groups_summarized": 0, "checkpointed": False},
+            "tactics": {"payloads_truncated": 0, "groups_summarized": 0, "checkpointed": False,
+                        "checkpoint_llm": False, "reasoning_stripped": 0},
         }
 
     def _split_groups(self, messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
@@ -436,6 +551,33 @@ class Compactor:
         out["reasoning_content"] = None
         return out
 
+    def _digest_checkpoint_llm(self, digest_texts: List[str]) -> Optional[Dict[str, Any]]:
+        """Ask the model to consolidate per-group digests into ONE global checkpoint.
+
+        The input is already-small digests (never the raw history), so this
+        costs one bounded provider call. Returns None when the model is
+        unavailable, disabled (``summary_mode="heuristic"``), fails, or comes
+        back empty — the caller then falls back to the heuristic checkpoint.
+        """
+        if not self._use_llm_summary():
+            return None
+        joined = [t for t in (digest_texts or []) if t and t.strip()]
+        if not joined:
+            return None
+        try:
+            text = self.summarize_fn(  # type: ignore[misc]
+                [{"role": "assistant", "content": t} for t in joined]
+            )
+        except Exception:
+            return None
+        if not text or not text.strip():
+            return None
+        header = (
+            "### [AUTOMATED CONTEXT MEMORY CHECKPOINT]\n"
+            "Earlier conversation history was compacted to optimize the context window.\n\n"
+        )
+        return {"role": "assistant", "content": header + text.strip()}
+
     def _digest_group_heuristic(self, group: List[Dict[str, Any]]) -> str:
         info = self._extract(group)
         lines = []
@@ -456,15 +598,25 @@ class Compactor:
         return "\n".join(lines)
 
     def _build_checkpoint(self, messages: List[Dict[str, Any]], digest_texts: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Consolidate an entire block into a single global checkpoint message.
-        ``digest_texts`` are appended only when they carry extra detail the raw
-        extraction did not capture; the caller bounds them against the budget."""
+        """Consolidate an entire block into a single global checkpoint message (I3 schema).
+
+        Required sections: goals → decisions → files → open → next. Post-
+        compaction fidelity is measured against this schema (J2).
+        """
         info = self._extract(messages)
         cp = [
             "### [AUTOMATED CONTEXT MEMORY CHECKPOINT]",
             "Earlier conversation history was compacted to optimize the context window.",
             "",
+            "#### Decisions (with rationale):",
         ]
+        if info.get("conclusions"):
+            for c in info["conclusions"][-5:]:
+                cp.append(f"- {c}")
+        else:
+            cp.append("- (none recorded)")
+        cp.append("\n#### Open questions / next steps:")
+        cp.append("- (see work log below; follow up unfinished goals above)")
         if info["user_goals"]:
             cp.append("#### Prior User Directives & Goals:")
             for g in info["user_goals"][-5:]:

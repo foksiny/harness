@@ -61,6 +61,40 @@ def bench_model_detection():
     t1 = time.perf_counter()
     return t1 - t0, len(models)
 
+
+def bench_hot_paths():
+    """Time the 2Hz TUI hot paths: token calc, git branch, tool schemas."""
+    from harness.core.compaction import calculate_history_tokens
+    # Synthetic 200-message history (~typical long session)
+    messages = [
+        {"role": "user" if i % 2 == 0 else "assistant",
+         "content": "lorem ipsum dolor sit amet " * 40}
+        for i in range(200)
+    ]
+    t0 = time.perf_counter()
+    calculate_history_tokens(messages)
+    t_toks = time.perf_counter() - t0
+
+    try:
+        from harness.tui.terminal import TerminalRenderer
+        r = TerminalRenderer.__new__(TerminalRenderer)
+        t0 = time.perf_counter()
+        r._get_git_branch()
+        t_git_cold = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        r._get_git_branch()
+        t_git_cached = time.perf_counter() - t0
+    except Exception:
+        t_git_cold = t_git_cached = -1.0
+
+    from harness.tools import ToolRegistry
+    from harness.core.modes import Mode
+    reg = ToolRegistry()
+    t0 = time.perf_counter()
+    reg.get_openai_schemas(Mode.BUILD)
+    t_schemas = time.perf_counter() - t0
+    return t_toks, t_git_cold, t_git_cached, t_schemas
+
 def main():
     print("=" * 60)
     print("  Harness Benchmark Suite")
@@ -109,9 +143,38 @@ def main():
     print(f"    Time:                 {(t1 - t0) * 1000:.1f} ms")
     print(f"    RSS delta:            {rss_after_full - rss_before_full:.1f} MB")
 
+    # TUI hot paths (2Hz toolbar repaint budget)
+    t_toks, t_git_cold, t_git_cached, t_schemas = bench_hot_paths()
+    print(f"\n  Hot paths (200-msg history):")
+    print(f"    Token calc:           {t_toks * 1000:.2f} ms (toolbar caches this, 1.5s TTL)")
+    if t_git_cold >= 0:
+        print(f"    Git branch (cold):    {t_git_cold * 1000:.2f} ms")
+        print(f"    Git branch (cached):  {t_git_cached * 1000:.3f} ms (5s TTL)")
+    print(f"    Tool schemas build:   {t_schemas * 1000:.2f} ms (built once per turn)")
+
     print(f"\n{'=' * 60}")
     print(f"  FINAL RSS:              {measure_rss_mb():.1f} MB")
     print(f"{'=' * 60}")
 
+def assert_budgets(metrics: dict) -> list:
+    """J1: return list of budget violations (empty = green)."""
+    violations = []
+    if metrics.get("cold_start_ms", 0) > 500:
+        violations.append(f"cold_start {metrics['cold_start_ms']:.1f}ms > 500ms")
+    if metrics.get("tool_registration_ms", 0) > 200:
+        violations.append(f"tool_registration {metrics['tool_registration_ms']:.1f}ms > 200ms")
+    if metrics.get("rss_mb", 0) > 150:
+        violations.append(f"rss {metrics['rss_mb']:.1f}MB > 150MB")
+    return violations
+
 if __name__ == "__main__":
+    import json as _json
     main()
+    # Machine-readable output for CI
+    try:
+        from harness.sysinfo import get_ram_usage_mb
+        rss = get_ram_usage_mb() or 0
+    except Exception:
+        rss = 0
+    metrics = {"rss_mb": round(float(rss), 1)}
+    print("BENCH_JSON=" + _json.dumps(metrics))

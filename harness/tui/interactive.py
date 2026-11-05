@@ -18,6 +18,7 @@ from harness.tui.input_handler import (
     InputHandler,
     SENTINEL_OPEN_AGENTS,
     SENTINEL_BACK,
+    SENTINEL_CLEAR,
     VIEW_AGENTS,
     VIEW_PARENT,
     is_command_input,
@@ -25,6 +26,31 @@ from harness.tui.input_handler import (
 )
 from harness.tui.queue import ExecutionQueue, QueuedItem
 from harness.core.compaction import calculate_history_tokens
+
+
+# Toolbar token cache: calculate_history_tokens() json-dumps the whole history,
+# and the bottom toolbar repaints at 2Hz — without a TTL every keystroke-adjacent
+# repaint pays full cost on large sessions.
+_TOKENS_CACHE_TTL = 1.5
+_tokens_cache: dict = {"ts": 0.0, "key": None, "value": 0}
+
+
+def cached_history_tokens(messages, system_prompt: str = "") -> int:
+    """TTL-cached wrapper around calculate_history_tokens for hot UI paths."""
+    import time as _time
+    now = _time.monotonic()
+    try:
+        key = (len(messages), system_prompt[:64] if system_prompt else "")
+    except Exception:
+        key = None
+    if key is not None and key == _tokens_cache["key"] and now - _tokens_cache["ts"] < _TOKENS_CACHE_TTL:
+        return _tokens_cache["value"]
+    try:
+        val = calculate_history_tokens(messages, system_prompt)
+    except Exception:
+        return _tokens_cache["value"]
+    _tokens_cache.update({"ts": now, "key": key, "value": val})
+    return val
 
 
 def _notify(sink, text: str) -> None:
@@ -115,6 +141,17 @@ def _mirror_prompt(agent: HarnessAgent, text: str) -> None:
         get_relay().relay_from_cli(text)
     except Exception:
         pass
+
+
+def _prompt_already_echoed(item: QueuedItem) -> bool:
+    """True when the terminal input prompt already left this text on screen.
+
+    Prompt-toolkit (and the raw ``input()`` fallback) keeps the submitted line
+    visible in scrollback. Rendering it again from the worker produces a
+    second, differently indented copy. Remote/command-originated queue items
+    are not echoed by any input prompt, so they still need the explicit card.
+    """
+    return bool(item.metadata.get("echoed"))
 
 
 def _drain_discord_activity(agent: HarnessAgent, renderer: TerminalRenderer, queue: "list") -> None:
@@ -569,7 +606,8 @@ def run_interactive(agent: HarnessAgent):
                 continue
 
             t_start = time.time()
-            renderer.render_user_prompt(item.prompt)
+            if not _prompt_already_echoed(item):
+                renderer.render_user_prompt(item.prompt)
             _mirror_prompt(agent, item.prompt)
 
             if item.mode:
@@ -621,19 +659,20 @@ def run_interactive(agent: HarnessAgent):
                 renderer.finish_markdown()
                 renderer.finish_thinking()
                 turn_dur = time.time() - t_start
+                # Estimate tokens and context pct for enriched capsule
+                try:
+                    tokens_est = cached_history_tokens(agent.session.messages) if agent.session else 0
+                    c_win = agent.compactor.context_window
+                    pct = round((tokens_est / max(1, c_win)) * 100, 1)
+                except Exception:
+                    tokens_est, pct = 0, 0
                 renderer.render_turn_capsule(
                     agent.mode.value,
                     agent.session.model if agent.session is not None else agent.config.model,
                     turn_dur,
+                    tokens=tokens_est,
+                    context_pct=pct,
                 )
-                # Estimate tokens and context pct for enriched capsule
-                try:
-                    from harness.core.compaction import calculate_history_tokens
-                    tokens_est = calculate_history_tokens(agent.session.messages) if agent.session else 0
-                    c_win = agent.compactor.context_window
-                    pct = round((tokens_est / max(1, c_win)) * 100, 1)
-                except Exception:
-                    pct = 0
                 # Relay final response back to Discord (mirrored output)
                 try:
                     from harness.discord.renderer import format_capsule_card
@@ -801,7 +840,7 @@ def run_interactive(agent: HarnessAgent):
         def get_bottom_toolbar():
             try:
                 import html
-                toks = calculate_history_tokens(agent.session.messages) if agent.session is not None else 0
+                toks = cached_history_tokens(agent.session.messages) if agent.session is not None else 0
                 c_win = agent.compactor.context_window
                 pct = round((toks / max(1, c_win)) * 100, 1)
                 toks_k = f"{toks / 1000:.1f}k" if toks >= 1000 else str(toks)
@@ -908,6 +947,9 @@ def run_interactive(agent: HarnessAgent):
             view = VIEW_AGENTS
             renderer.print_subagent_board(agent.subagent_orchestrator.list_records())
             continue
+        if user_input == SENTINEL_CLEAR:
+            renderer.clear_screen()
+            continue
         if user_input == SENTINEL_BACK:
             view = VIEW_PARENT
             renderer.print_info("Returned to parent agent view.")
@@ -965,12 +1007,13 @@ def run_interactive(agent: HarnessAgent):
         _mirror_prompt(agent, user_input)
 
         if agent.is_running:
-            # Enqueue prompt while agent is busy
-            item = queue.enqueue(user_input)
+            # Enqueue prompt while agent is busy. The text is already visible
+            # in the submitted input line, so the worker must not echo it twice.
+            item = queue.enqueue(user_input, metadata={"echoed": True})
             renderer.print_queue_event(item, "enqueued")
         else:
             # Enqueue and wake worker thread to begin processing
-            item = queue.enqueue(user_input)
+            item = queue.enqueue(user_input, metadata={"echoed": True})
             worker_wake.set()
 
     sync_poller_stop.set()

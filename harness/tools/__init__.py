@@ -3,16 +3,16 @@ Tool Registry and Execution Dispatcher for Harness.
 """
 from typing import Dict, Any, List, Optional
 from harness.tools.base import Tool
-from harness.tools.filesystem import ViewFileTool, EditFileTool, WriteFileTool, ListDirTool, FindFilesTool, DeleteFileTool
+from harness.tools.filesystem import ViewFileTool, EditFileTool, WriteFileTool, ListDirTool, FindFilesTool, DeleteFileTool, MoveFileTool, CopyFileTool, MkDirTool, AppendFileTool
 from harness.tools.search import GrepSearchTool
 from harness.tools.execution import RunCommandTool
 from harness.tools.python_exec import ExecutePythonTool
-from harness.tools.web_search import ExaSearchTool
+from harness.tools.web_search import ExaSearchTool, WebFetchTool
 from harness.tools.questions import AskUserTool
 from harness.tools.todo_tools import TodoCreateTool, TodoUpdateTool, TodoListTool
-from harness.tools.subagent_tools import SpawnSubagentTool
-from harness.tools.swarm_tools import SpawnSwarmTool, SwarmSendMessageTool, SwarmReadMessagesTool
-from harness.tools.git_tools import GitStatusTool, GitDiffTool
+from harness.tools.subagent_tools import SpawnSubagentTool, SubagentListTool, SubagentStatusTool, SubagentWaitTool, SubagentCancelTool
+from harness.tools.swarm_tools import SpawnSwarmTool, SwarmSendMessageTool, SwarmReadMessagesTool, SwarmAckTool
+from harness.tools.git_tools import GitStatusTool, GitDiffTool, GitLogTool
 from harness.tools.skill_tools import ListSkillsTool, ReadSkillTool
 from harness.tools.finish import FinishTool
 from harness.tools.learning_tools import LearnRecordTool, LearnRecallTool, LearnPromoteTool
@@ -87,6 +87,10 @@ class ToolRegistry:
         self.register(ListDirTool())
         self.register(FindFilesTool())
         self.register(DeleteFileTool())
+        self.register(MoveFileTool())
+        self.register(CopyFileTool())
+        self.register(MkDirTool())
+        self.register(AppendFileTool())
 
         # Search
         self.register(GrepSearchTool())
@@ -97,6 +101,7 @@ class ToolRegistry:
 
         # Web & Asking
         self.register(ExaSearchTool())
+        self.register(WebFetchTool())
         self.register(AskUserTool(ask_user_handler))
 
         # Tasks
@@ -106,15 +111,21 @@ class ToolRegistry:
 
         # Subagents
         self.register(SpawnSubagentTool(self.subagent_orchestrator))
+        self.register(SubagentListTool(self.subagent_orchestrator))
+        self.register(SubagentStatusTool(self.subagent_orchestrator))
+        self.register(SubagentWaitTool(self.subagent_orchestrator))
+        self.register(SubagentCancelTool(self.subagent_orchestrator))
 
         # Agent swarms (concurrent coordinated subagents)
         self.register(SpawnSwarmTool(self.subagent_orchestrator))
         self.register(SwarmSendMessageTool(self.subagent_orchestrator))
         self.register(SwarmReadMessagesTool(self.subagent_orchestrator))
+        self.register(SwarmAckTool(self.subagent_orchestrator))
 
         # Git
         self.register(GitStatusTool())
         self.register(GitDiffTool())
+        self.register(GitLogTool())
 
         # Skills
         self.register(ListSkillsTool(self.skills_manager))
@@ -129,15 +140,9 @@ class ToolRegistry:
             self.register(LearnRecallTool(self.learning_manager))
             self.register(LearnPromoteTool(self.learning_manager))
 
-        # API server (no inter-instance mesh) — keep stubs for backward compat
-        try:
-            self.register(MeshStatusTool())
-            self.register(MeshListPeersTool())
-            self.register(MeshSendMessageTool())
-            self.register(MeshBroadcastTool())
-            self.register(MeshReadMessagesTool())
-        except Exception:
-            pass
+        # API server (no inter-instance mesh) — H9: dead stubs hidden from
+        # schemas (not registered) to save tokens and avoid confusion.
+        # Classes remain importable in mesh_tools.py for backward compat.
 
         # Web control (Chrome via CDP). All browser_* tools share one
         # BrowserManager so the launched session persists across tool calls.
@@ -153,6 +158,20 @@ class ToolRegistry:
                 )
             except Exception:
                 self.browser_manager = None
+
+        # Computer use (desktop via ComputerController). Off in hermetic tests
+        # that pass browser_enabled=False equivalents? Keep on by default when
+        # a display backend exists; tools degrade gracefully when it doesn't.
+        try:
+            from harness.tools.computer import ComputerManager, register_computer_tools
+            self.computer_manager = ComputerManager()
+            register_computer_tools(
+                self,
+                controller_factory=self.computer_manager.controller_factory,
+                permission_manager=self.permission_manager,
+            )
+        except Exception:
+            self.computer_manager = None
 
     def register(self, tool: Tool) -> None:
         self.tools[tool.name] = tool
@@ -188,6 +207,31 @@ class ToolRegistry:
         """Execute a tool by name with arguments and mode check."""
         if not is_tool_allowed_in_mode(name, mode):
             return f"Error: Tool '{name}' is forbidden in {mode.value.upper()} mode to prevent unintended state mutations."
+        # H1: PLAN mode also constrains shell commands inside run_command.
+        if name == "run_command" and mode == Mode.PLAN:
+            from harness.core.modes import is_command_allowed_in_mode
+            cmd = str((arguments or {}).get("command", ""))
+            if not is_command_allowed_in_mode(cmd, mode):
+                return f"Error: Command blocked in PLAN mode: `{cmd}`"
+        # H2: route every tool through PermissionManager. Read-only tools
+        # auto-pass in all levels; self-gating tools (browser, run_command,
+        # execute_python, computer) keep their finer checks inside execute().
+        # For the rest, SECURE prompts (DEFAULT auto-allows writes as before).
+        tool_obj = self.get(name)
+        if tool_obj is not None and self.permission_manager is not None:
+            try:
+                from harness.core.permissions import PermissionLevel as _PL
+                at = getattr(tool_obj, "action_type", "unknown")
+                if (not getattr(tool_obj, "is_read_only", True)
+                        and at not in ("command", "browser", "execute_python", "computer_input", "computer", "browser_evaluate")
+                        and self.permission_manager.level == _PL.SECURE):
+                    ok = self.permission_manager.check_permission(
+                        at, {"tool": name, "summary": f"Execute {name}"}
+                    )
+                    if not ok:
+                        return f"Error: {name} rejected by security policy or user."
+            except Exception:
+                pass
 
         tool = self.get(name)
         if not tool:

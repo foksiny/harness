@@ -1,12 +1,9 @@
-from setuptools import setup, find_packages
+"""Legacy setup shim — all metadata lives in pyproject.toml.
 
-setup(
-    name="harness-cli",
-    version="0.10.4",
-    packages=find_packages(include=["harness*"]),
-    entry_points={
-        "console_scripts": [
-            "harness=harness.cli:main",
-        ],
-    },
-)
+Keeping this file as a minimal stub (no duplicated version/deps) so
+`pip install -e .` and old `python setup.py` flows keep working without
+drifting out of sync. Do NOT re-add install_requires/version here.
+"""
+from setuptools import setup
+
+setup()

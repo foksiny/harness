@@ -34,7 +34,11 @@ class Session:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Session":
-        return cls(**data)
+        # Ignore unknown/renamed keys so old session files never crash load().
+        import dataclasses
+        valid = {f.name for f in dataclasses.fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in valid}
+        return cls(**filtered)
 
 class SessionManager:
     """Manages active and historical sessions.
@@ -52,8 +56,12 @@ class SessionManager:
         self.workspace: str = str(Path(workspace).resolve()) if workspace else str(Path.cwd().resolve())
 
     def _file_path(self, session_id: str) -> Path:
-        clean_id = session_id.replace("/", "_").replace("\\", "_")
-        return self.storage_dir / f"{clean_id}.json"
+        # Sanitize: strip path separators, NUL bytes, and parent-dir tricks.
+        clean_id = session_id.replace("/", "_").replace("\\", "_").replace("\x00", "_")
+        clean_id = clean_id.replace("..", "_")
+        # Keep filenames sane; session ids are sess_* but accept fuzzy prefixes.
+        clean_id = "".join(c for c in clean_id if c.isalnum() or c in ("_", "-", "."))
+        return self.storage_dir / f"{clean_id or 'session'}.json"
 
     @staticmethod
     def _norm_workspace(workspace: Optional[str]) -> str:
@@ -93,8 +101,11 @@ class SessionManager:
     def save(self, session: Session) -> None:
         session.updated_at = time.time()
         file_path = self._file_path(session.id)
-        with open(file_path, "w", encoding="utf-8") as f:
+        # Atomic write: crash mid-save must never leave a truncated session.
+        tmp_path = file_path.with_suffix(".json.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(session.to_dict(), f, indent=2)
+        os.replace(tmp_path, file_path)
 
     def load(self, session_id: str) -> Optional[Session]:
         file_path = self._file_path(session_id)

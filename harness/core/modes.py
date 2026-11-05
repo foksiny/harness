@@ -29,8 +29,12 @@ MODE_DESCRIPTIONS = {
 PLAN_MODE_BLOCKED_TOOLS: Set[str] = {
     "write_file",
     "edit_file",
+    "delete_file",
     "replace_file_content",
     "execute_python",   # Unless explicitly marked read-only
+    "computer_click", "computer_move", "computer_drag", "computer_scroll",
+    "computer_type", "computer_key", "computer_combo", "computer_act",
+    "computer_clipboard_write", "computer_windows",
     # Browser mutations: PLAN may observe the web (navigate/read/screenshot)
     # but not interact with it.
     "browser_launch",
@@ -53,4 +57,21 @@ def is_tool_allowed_in_mode(tool_name: str, mode: Mode) -> bool:
     """Check if tool can be executed in current mode."""
     if mode == Mode.PLAN:
         return tool_name not in PLAN_MODE_BLOCKED_TOOLS
+    return True
+
+
+def is_command_allowed_in_mode(command: str, mode: Mode) -> bool:
+    """Check if a shell command may run in the given mode (PLAN blocks mutations)."""
+    if mode != Mode.PLAN:
+        return True
+    cmd = str(command or "").strip().lower()
+    if not cmd:
+        return True
+    for blocked in PLAN_MODE_BLOCKED_COMMANDS:
+        if cmd == blocked or cmd.startswith(blocked + " ") or cmd.startswith(blocked + "\n"):
+            return False
+    # Common mutating shell words anywhere at word boundary
+    for word in ("rm ", "mv ", "cp ", "touch ", "mkdir ", "chmod ", "chown ", "pip install", "npm install", "git commit", "git push", "git checkout -b"):
+        if word in cmd:
+            return False
     return True

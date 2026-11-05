@@ -25,6 +25,9 @@ WORKSPACE_THEMES_FILE = WORKSPACE_CONFIG_DIR / "themes.json"
 ENV_KEY_MAPPINGS: Dict[str, List[str]] = {
     "openai": ["OPENAI_API_KEY"],
     "anthropic": ["ANTHROPIC_API_KEY"],
+    # Web-session providers (browser session credentials, not API keys)
+    "openaiauth": ["OPENAI_SESSION_TOKEN", "CHATGPT_SESSION_TOKEN"],
+    "claudeauth": ["CLAUDE_SESSION_KEY", "CLAUDE_AI_SESSION_KEY"],
     "gemini": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
     "openrouter": ["OPENROUTER_API_KEY", "OPENROUTER_KEY"],
     "nvidia": ["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY", "NV_API_KEY", "NIM_API_KEY"],
@@ -67,7 +70,17 @@ class HarnessConfig:
     mode: str = "build"              # plan, build, super
     permission: str = "default"      # secure, default, full
     thinking_effort: str = "high"    # off, low, medium, high, or token count
-    temperature: float = 1.0        # Sampling temperature sent with every request (0.0 - 1.0); 1.0 = provider default
+    temperature: float = 0.3        # Sampling temperature; 1.0 = provider default. Low default for coding reliability.
+    max_turn_steps: int = 120       # Per-turn step budget
+    max_output_chars: int = 64000   # Hard ceiling for any single tool result
+    max_swarm_size: int = 8         # Max concurrent swarm workers
+    sandbox_backend: str = "auto"   # auto | nsjail | docker | restricted
+    mcp_timeout: float = 10.0       # Per-server MCP connect/tool timeout (seconds)
+    mcp_enabled: bool = True        # Lazy-connect MCP servers; False skips at startup
+    max_cost_usd: float = 0.0       # 0 = unlimited; per-turn cost ceiling
+    tool_timeout: float = 120.0     # Per-tool-call timeout (seconds)
+    workspace_root: str = ""        # Empty = cwd; run_command confinement root
+    creative_mode: bool = False     # Opt-in divergent/convergent sessions (higher temp + best-of-n)
     terminal_show_thinking: bool = False  # Stream raw reasoning text in the terminal; when off, show a compact Thinking indicator + token count instead
     theme: str = "cyberpunk"
     auto_compact: bool = True
@@ -193,6 +206,7 @@ class HarnessConfig:
             if prov_id == "mock":
                 continue
             cfg_key = self.api_keys.get(prov_id)
+            stored_key = secure_store.get_key(prov_id)
             env_vars = ENV_KEY_MAPPINGS.get(prov_id, [f"{prov_id.upper()}_API_KEY"])
             env_val = None
             active_env_var = env_vars[0] if env_vars else f"{prov_id.upper()}_API_KEY"
@@ -202,8 +216,15 @@ class HarnessConfig:
                     active_env_var = ev
                     break
 
-            effective_key = cfg_key or env_val
-            source = "config" if cfg_key else ("env" if env_val else "none")
+            effective_key = cfg_key or stored_key or env_val
+            if cfg_key:
+                source = "config"
+            elif stored_key:
+                source = "secure_store"
+            elif env_val:
+                source = "env"
+            else:
+                source = "none"
 
             res.append({
                 "provider": prov_id,
@@ -258,9 +279,15 @@ class HarnessConfig:
         if isinstance(current_val, bool):
             setattr(self, k, value.lower() in ("true", "1", "yes", "on"))
         elif isinstance(current_val, int):
-            setattr(self, k, int(value))
+            try:
+                setattr(self, k, int(value))
+            except (ValueError, TypeError):
+                return False
         elif isinstance(current_val, float):
-            setattr(self, k, float(value))
+            try:
+                setattr(self, k, float(value))
+            except (ValueError, TypeError):
+                return False
         elif isinstance(current_val, str):
             setattr(self, k, value)
         else:
@@ -289,17 +316,27 @@ def load_config() -> HarnessConfig:
             with open(USER_CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 config = HarnessConfig.from_dict(data)
-        except Exception:
-            pass
+        except Exception as e:
+            # J6: log + backup instead of silently swallowing config corruption.
+            try:
+                import shutil as _sh
+                _sh.copy(str(USER_CONFIG_PATH), str(USER_CONFIG_PATH.with_suffix(".json.bak")))
+            except Exception:
+                pass
+            print(f"Warning: ignoring corrupt config {USER_CONFIG_PATH} ({e}); backup saved as .json.bak")
 
     if WORKSPACE_CONFIG_PATH.exists():
         try:
             with open(WORKSPACE_CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                workspace_config = HarnessConfig.from_dict(data)
-                for k, v in asdict(workspace_config).items():
-                    if v is not None:
+                # Only override keys explicitly present in the workspace file.
+                # from_dict() fills every missing field with a default, so
+                # copying asdict(workspace_config) would clobber global values.
+                valid_keys = {f.name for f in HarnessConfig.__dataclass_fields__.values()}
+                for k, v in data.items():
+                    if k in valid_keys and v is not None and k not in ("api_keys",):
                         setattr(config, k, v)
+                # api_keys intentionally never cascade from workspace files.
         except Exception:
             pass
 
@@ -317,13 +354,11 @@ def load_config() -> HarnessConfig:
             secure_store.set_key("discord", config.discord_bot_token)
         config.discord_bot_token = stored or config.discord_bot_token
 
-    # Backward compat: sync old mesh_* to new server_* if server_* not explicitly set
-    # (If user set mesh_enabled=false in config, respect it)
+    # Backward compat: sync old mesh_host to new server_host when the user
+    # customized it. server_enabled/mesh_enabled are OR-ed by
+    # is_server_enabled(), so never force server_enabled off here — an
+    # explicit server_enabled=true must survive a default mesh_enabled=false.
     try:
-        # If config file had mesh_enabled=false, ensure server_enabled reflects it
-        # We can't know if it was explicitly set, so if mesh_enabled is False, force server_enabled False
-        if not config.mesh_enabled:
-            config.server_enabled = False
         if config.mesh_host != "127.0.0.1" and config.server_host == "127.0.0.1":
             config.server_host = config.mesh_host
     except Exception:

@@ -196,30 +196,38 @@ class GeminiProvider(BaseProvider):
                                     content_part = cand.get("content", {})
                                     parts = content_part.get("parts", [])
 
+                                    # Preserve the provider's native SSE event
+                                    # boundary: one LLMChunk per event, merging
+                                    # every part (reasoning, text, tool calls)
+                                    # instead of inventing one chunk per part.
+                                    text_delta = ""
+                                    reasoning_delta = ""
+                                    calls: List[ToolCallDelta] = []
                                     for p in parts:
                                         if p.get("thought"):
-                                            saw_payload = True
-                                            yield LLMChunk(delta_reasoning=p.get("text", ""))
+                                            reasoning_delta += p.get("text", "")
                                         elif "text" in p:
-                                            saw_payload = True
-                                            yield LLMChunk(delta_text=p["text"])
+                                            text_delta += p["text"]
                                         elif "functionCall" in p:
-                                            saw_payload = True
                                             fc = p["functionCall"]
-                                            yield LLMChunk(
-                                                tool_calls=[ToolCallDelta(
-                                                    index=tool_call_idx,
-                                                    id=f"gemini_call_{fc.get('name')}_{tool_call_idx}",
-                                                    name=fc.get("name"),
-                                                    arguments_delta=json.dumps(fc.get("args", {})),
-                                                )]
-                                            )
+                                            calls.append(ToolCallDelta(
+                                                index=tool_call_idx,
+                                                id=f"gemini_call_{fc.get('name')}_{tool_call_idx}",
+                                                name=fc.get("name"),
+                                                arguments_delta=json.dumps(fc.get("args", {})),
+                                            ))
                                             tool_call_idx += 1
 
                                     finish = cand.get("finishReason")
-                                    if finish:
+                                    if text_delta or reasoning_delta or calls or finish:
                                         saw_payload = True
-                                        yield LLMChunk(finish_reason=finish)
+                                        yield LLMChunk(
+                                            delta_text=text_delta,
+                                            delta_reasoning=reasoning_delta,
+                                            tool_calls=calls,
+                                            finish_reason=finish,
+                                            native=chunk,
+                                        )
 
                                 except Exception:
                                     continue

@@ -101,19 +101,33 @@ def execute_sandboxed(
     cpu_time_limit: int = 30,
     network_allowed: bool = False,
     working_dir: Optional[str] = None,
+    backend_override: Optional[str] = None,
 ) -> SandboxResult:
     """Execute Python code in a sandbox.
-    
+
     Tries backends in order: nsjail -> docker -> restricted subprocess.
+    H4: restricted uses temp HOME + temp cwd; callers must explicitly opt in
+    via backend_override='restricted' to accept its reduced isolation.
     """
-    backend = detect_sandbox_backend()
-    
+    backend = backend_override or detect_sandbox_backend()
     if backend == "nsjail":
         return _execute_nsjail(code, timeout, memory_limit_mb, cpu_time_limit, network_allowed)
     elif backend == "docker":
         return _execute_docker(code, timeout, memory_limit_mb, cpu_time_limit, network_allowed)
-    else:
+    elif backend == "restricted":
+        if (backend_override is None) and detect_sandbox_backend() == "restricted":
+            # Fail-closed by default when no strong backend exists, unless the
+            # caller explicitly opted in. python_exec does so with a warning.
+            return SandboxResult(
+                ok=False,
+                error=("No strong sandbox (nsjail/docker) available. Refusing to run untrusted "
+                       "code in the restricted fallback without explicit opt-in "
+                       "(config sandbox_backend='restricted'). Install docker or nsjail, or set "
+                       "sandbox_backend='restricted' to accept rlimits-only isolation."),
+                backend="restricted",
+            )
         return _execute_restricted(code, timeout, memory_limit_mb, cpu_time_limit, network_allowed, working_dir)
+    return SandboxResult(ok=False, error=f"Unknown sandbox backend '{backend}'.", backend=backend)
 
 
 def _execute_nsjail(
@@ -130,7 +144,9 @@ def _execute_nsjail(
     code_file.write_text(code, encoding="utf-8")
     
     try:
-        # Build nsjail command
+        # Build nsjail command. Network isolation is the default (no flag);
+        # pass --disable_clone_newnet only when network access is allowed.
+        # rlimit_nproc always applies (64 procs); never 0 (that would forbid fork).
         cmd = [
             "nsjail",
             "--mode", "o",
@@ -139,9 +155,11 @@ def _execute_nsjail(
             "--rlimit_as", str(memory_limit_mb),
             "--rlimit_cpu", str(cpu_time_limit),
             "--time_limit", str(timeout),
-            "--disable_clone_newnet" if network_allowed else "--rlimit_nproc", "0",
-            "--", sys.executable, str(code_file),
+            "--rlimit_nproc", "64",
         ]
+        if network_allowed:
+            cmd += ["--disable_clone_newnet"]
+        cmd += ["--", sys.executable, str(code_file)]
         
         result = subprocess.run(
             cmd,
@@ -205,7 +223,9 @@ def _execute_docker(
             "-v", f"{workspace}:/workspace:ro",
             "--network", "none" if not network_allowed else "bridge",
             "python:3.12-slim",
-            sys.executable, "/workspace/script.py",
+            # NOTE: sys.executable is a host path (e.g. /usr/bin/python) that
+            # does not exist inside the container — use the image's interpreter.
+            "python3", "/workspace/script.py",
         ]
         
         result = subprocess.run(
@@ -271,19 +291,19 @@ def _execute_restricted(
         tmp.write(code)
     
     try:
-        # Create restricted environment (platform-aware temp dir for HOME)
-        home_dir = os.path.expanduser("~")
+        # H4: temp HOME + temp cwd (never real HOME / workspace cwd).
+        _ws = _create_temp_workspace()
+        home_dir = str(_ws / "home")
+        os.makedirs(home_dir, exist_ok=True)
         env = {
             "HOME": home_dir,
             "PATH": os.environ.get("PATH", ""),
             "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1",
-            # Remove potentially dangerous env vars
-            "LD_PRELOAD": "",
-            "PYTHONSTARTUP": "",
-            "PYTHONCASEOK": "",
-            "PYTHONINSPECT": "",
+            "TMPDIR": str(_ws / "tmp"),
+            # Scrub potentially dangerous env vars by omitting them entirely.
+            # (Setting LD_PRELOAD="" still leaves the key present; del is safer,
+            # but the child env dict simply never includes these keys.)
         }
         
         # Set resource limits in a wrapper script
@@ -339,7 +359,7 @@ exec(compile(open("{safe_tmp}").read(), "{safe_tmp}", "exec"))
             "stderr": subprocess.PIPE,
             "text": True,
             "timeout": timeout,
-            "cwd": working_dir or os.getcwd(),
+            "cwd": str(_ws),
             "env": env,
         }
         if HAS_RESOURCE:
@@ -383,3 +403,8 @@ exec(compile(open("{safe_tmp}").read(), "{safe_tmp}", "exec"))
                     os.unlink(path)
             except Exception:
                 pass
+        try:
+            import shutil as _sh
+            _sh.rmtree(str(_ws), ignore_errors=True)
+        except Exception:
+            pass

@@ -22,6 +22,17 @@ CACHE_FILE = Path.home() / ".harness" / "models_cache.json"
 UNIVERSAL_CACHE_FILE = Path.home() / ".harness" / "universal_models.json"
 CACHE_TTL = 86400  # 24 hours
 
+# In-memory memoization so hot paths (every agent turn calls get_model_spec,
+# which reads both files) pay for disk/network at most once per process.
+# File-backed caches are re-read only when the file mtime changes; the
+# universal catalog (which may require a network fetch on first miss) is
+# fetched at most once per process unless force-refreshed.
+import threading as _threading
+
+_cache_lock = _threading.Lock()
+_models_file_cache: Dict[str, Any] = {"mtime": None, "data": {}}
+_universal_mem: Dict[str, Any] = {"state": "cold", "data": {}, "mtime": None}
+
 # Keys scanned for ``input_modalities`` across provider /models schemas
 # (OpenRouter ``architecture``, OpenAI ``lm``/``llm``, OpenAI-compatible ``item``).
 SERVER_MODALITY_KEYS = "architecture", "llm", "lm"
@@ -50,14 +61,71 @@ def _extract_media_capabilities(item: Dict[str, Any]) -> tuple[Optional[bool], O
     return None, None
 
 
+def _extract_thinking_capabilities(item: Dict[str, Any], provider: str = "") -> tuple[bool, Optional[str]]:
+    """Server-reported thinking capabilities — the provider-driven half.
+
+    Checks (in order): the structured ``reasoning`` block OpenRouter exposes
+    (``{mandatory, default_enabled, supported_efforts}``), ``supported_parameters``
+    containing reasoning/thinking keys, the description, then static heuristics
+    via :func:`detect_thinking_support`. Returns ``(supports, dialect)`` where
+    the dialect is the provider's native request dialect for the model.
+    """
+    from harness.providers.detector import PROVIDER_DIALECTS
+
+    def _dialect_for() -> Optional[str]:
+        prov = (provider or "").lower().strip()
+        return PROVIDER_DIALECTS.get(prov, "reasoning_effort")
+
+    if isinstance(item, dict):
+        # Structured reasoning block (OpenRouter / OpenAI-compatible gateways).
+        r = item.get("reasoning")
+        if isinstance(r, dict):
+            if r.get("mandatory") is True or r.get("default_enabled") is True:
+                return True, _dialect_for()
+            if r.get("supported_efforts"):
+                return True, _dialect_for()
+        elif r is True:
+            return True, _dialect_for()
+        # supported_parameters advertises the reasoning channel.
+        supported = item.get("supported_parameters")
+        if isinstance(supported, list) and any(
+            str(s) in ("reasoning", "reasoning_effort", "thinking", "include_reasoning")
+            for s in supported
+        ):
+            return True, _dialect_for()
+        desc = str(item.get("description", "") or "").lower()
+        if any(x in desc for x in ("reasoning", "thinking", "thought", "reasoner")):
+            # Description alone is weak — require a parameter or block to confirm?
+            # For gateways that omit the block but ship reasoning models, treat
+            # the description as sufficient when the id also looks reasoning-y.
+            mid = str(item.get("id") or item.get("name") or "").lower()
+            if any(x in mid for x in ("reason", "thinking", "r1", "o1", "o3", "kimi", "glm", "minimax", "nemotron", "muse", "qwq", "magistral")):
+                return True, _dialect_for()
+    # Fall back to static detection (catalog/markers/provider fallback).
+    return detect_thinking_support(str(item.get("id") or item.get("name") or "") if isinstance(item, dict) else "", provider)
+
+
 def load_cached_models() -> Dict[str, Any]:
+    # Serve from memory unless the file changed on disk (mtime guard keeps
+    # this to one stat() per call instead of a full read + json parse).
+    try:
+        mtime = CACHE_FILE.stat().st_mtime if CACHE_FILE.exists() else None
+    except Exception:
+        mtime = None
+    with _cache_lock:
+        if mtime == _models_file_cache["mtime"]:
+            return _models_file_cache["data"]
     if CACHE_FILE.exists():
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
+                with _cache_lock:
+                    _models_file_cache.update({"mtime": mtime, "data": data})
                 return data
         except Exception:
             pass
+    with _cache_lock:
+        _models_file_cache.update({"mtime": mtime, "data": {}})
     return {}
 
 def save_cached_models(cache_data: Dict[str, Any]) -> None:
@@ -68,16 +136,36 @@ def save_cached_models(cache_data: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-def load_universal_models() -> Dict[str, int]:
-    """Load universal catalog of model basenames -> context window length."""
-    if UNIVERSAL_CACHE_FILE.exists():
+def load_universal_models(force: bool = False) -> Dict[str, int]:
+    """Load universal catalog of model basenames -> context window length.
+
+    Memoized per process: the first call may hit disk (or, on a cold cache,
+    the network once with a 3s timeout); later calls return memory unless the
+    file changed on disk. Pass ``force=True`` to re-fetch explicitly.
+    """
+    with _cache_lock:
+        mem = _universal_mem
+        if mem["state"] == "ready" and not force:
+            try:
+                mtime = UNIVERSAL_CACHE_FILE.stat().st_mtime if UNIVERSAL_CACHE_FILE.exists() else None
+            except Exception:
+                mtime = None
+            if mtime == mem["mtime"]:
+                return mem["data"]
+    if UNIVERSAL_CACHE_FILE.exists() and not force:
         try:
             with open(UNIVERSAL_CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                with _cache_lock:
+                    _universal_mem.update({"state": "ready", "data": data,
+                                           "mtime": UNIVERSAL_CACHE_FILE.stat().st_mtime})
+                return data
         except Exception:
             pass
 
-    # Try fetching once if cache is missing
+    # Try fetching once if cache is missing (at most once per process —
+    # previously EVERY get_model_spec call re-hit the network on a cold
+    # cache, stalling agent turns for seconds on slow networks).
     try:
         req = urllib.request.Request("https://openrouter.ai/api/v1/models", headers={"User-Agent": "Harness/1.0"})
         with urllib.request.urlopen(req, timeout=3) as resp:
@@ -92,9 +180,20 @@ def load_universal_models() -> Dict[str, int]:
             UNIVERSAL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(UNIVERSAL_CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(catalog, f)
+            with _cache_lock:
+                try:
+                    mtime = UNIVERSAL_CACHE_FILE.stat().st_mtime
+                except Exception:
+                    mtime = None
+                _universal_mem.update({"state": "ready", "data": catalog, "mtime": mtime})
             return catalog
     except Exception:
-        return {}
+        with _cache_lock:
+            # Negative-cache the miss for this process so a dead network
+            # doesn't cost 3s on every subsequent turn.
+            if _universal_mem["state"] != "ready":
+                _universal_mem.update({"state": "ready", "data": {}, "mtime": None})
+            return _universal_mem["data"]
 
 def fetch_remote_models(
     provider_name: str,
@@ -154,18 +253,9 @@ def fetch_remote_models(
                 if not c_len:
                     c_len = inspect_model(mid, prov).context_window
 
-                # Thinking / reasoning capability detection
-                th_support, th_type = detect_thinking_support(mid, prov)
-                desc = str(item.get("description", "")).lower()
-                supported = item.get("supported_parameters") or []
-                if not th_support and any(x in desc for x in ("reasoning", "thinking", "thought")):
-                    th_support = True
-                    th_type = "reasoning_effort"
-                if not th_support and supported and any(
-                    s in (supported if isinstance(supported, list) else []) for s in ("reasoning", "reasoning_effort", "thinking")
-                ):
-                    th_support = True
-                    th_type = "reasoning_effort"
+                # Thinking / reasoning: provider-driven (structured block +
+                # supported_parameters), falling back to static heuristics only.
+                th_support, th_type = _extract_thinking_capabilities(item, prov)
 
                 # Vision / video: prefer server-reported modalities, else heuristics.
                 sv, svd = _extract_media_capabilities(item)
@@ -208,35 +298,71 @@ def resolve_model_spec_dynamic(
     clean_name = (model_name or "").strip()
     spec = inspect_model(clean_name, provider_name)
 
-    # Check cached or remote provider metadata
+    # Check cached or remote provider metadata. Live provider data ALWAYS wins
+    # over the bundled catalog for unknown models (stealth/*, brand-new ids):
+    # the registry only pins what the provider has already advertised.
     cache = load_cached_models()
     prov = provider_name.lower().strip()
     prov_cache = cache.get(prov, {})
-    models_list = prov_cache.get("models", [])
+    models_list = prov_cache.get("models", []) or []
+    cache_ts = prov_cache.get("timestamp", 0) if isinstance(prov_cache, dict) else 0
+    cache_stale = (not cache_ts) or (time.time() - cache_ts > CACHE_TTL)
 
-    # If cache miss and credentials exist, attempt live fetch
-    if not models_list and base_url and api_key:
+    clean_lower = clean_name.lower()
+    clean_base = clean_lower.split(":")[0]
+
+    def _model_in_list(lst: List[Dict[str, Any]]) -> bool:
+        for m in (lst or []):
+            m_id = str(m.get("id", "") or "").strip()
+            m_lower = m_id.lower()
+            m_base = m_lower.split(":")[0]
+            if (
+                m_lower == clean_lower
+                or m_base == clean_base
+                or clean_lower.endswith(f"/{m_lower}")
+                or clean_base.endswith(f"/{m_base}")
+                or m_lower.endswith(f"/{clean_lower}")
+                or m_base.endswith(f"/{clean_base}")
+            ):
+                return True
+        return False
+
+    # Live-fetch whenever the model isn't found in cache, the cache is stale,
+    # or the model is unknown to the bundled catalog (so new releases like
+    # stealth/crouton-alpha resolve without manual registry edits).
+    static_unknown = spec.source != "catalog"
+    need_fetch = base_url is not None and (
+        cache_stale or static_unknown or not _model_in_list(models_list)
+    )
+    if need_fetch:
         try:
-            models_list = fetch_remote_models(prov, api_key, base_url)
+            fetched = fetch_remote_models(prov, api_key, base_url, force=True)
+            if fetched:
+                models_list = fetched
         except Exception:
-            models_list = []
+            pass
 
     clean_lower = clean_name.lower()
     clean_base = clean_lower.split(":")[0]
     base_name = clean_base.split("/")[-1]
 
-    # 1. Check universal dynamic catalog
+    # 1. Check universal dynamic catalog (context only; thinking/vision come
+    # from the provider record below).
     univ_cache = load_universal_models()
     if base_name in univ_cache:
         c_len = univ_cache[base_name]
         if isinstance(c_len, int) and c_len > 0:
             spec.context_window = c_len
+            if static_unknown:
+                spec.source = "universal"
     elif clean_base in univ_cache:
         c_len = univ_cache[clean_base]
         if isinstance(c_len, int) and c_len > 0:
             spec.context_window = c_len
+            if static_unknown:
+                spec.source = "universal"
 
-    # 2. Check provider-specific /models list
+    # 2. Check provider-specific /models list (authoritative when found).
     for m in models_list:
         m_id = str(m.get("id", "")).strip()
         m_lower = m_id.lower()
@@ -254,25 +380,30 @@ def resolve_model_spec_dynamic(
             c_len = m.get("context_length")
             if c_len and isinstance(c_len, int) and c_len > 0:
                 spec.context_window = c_len
+                spec.source = "server"
             if m.get("supports_thinking"):
                 spec.supports_thinking = True
-                if not spec.thinking_type:
-                    spec.thinking_type = m.get("thinking_type") or "reasoning_effort"
+                # Live dialect wins for unknown models; never clobber a
+                # catalog pin (e.g. chat_template_kwargs) for known models.
+                if static_unknown or not spec.thinking_type:
+                    spec.thinking_type = m.get("thinking_type") or spec.thinking_type or "reasoning_effort"
             # Server-reported media capabilities override name heuristics.
             if "supports_vision" in m:
                 spec.supports_vision = bool(m["supports_vision"])
             if "supports_video" in m:
                 spec.supports_video = bool(m["supports_video"])
             _set_provider_output(spec, m)
+            # Preserve reasoning options advertised by the server.
+            raw = m.get("raw") or {}
+            if isinstance(raw, dict) and raw.get("reasoning", {}).get("supported_efforts"):
+                spec.reasoning_options = list(raw["reasoning"]["supported_efforts"])
             break
 
-    # Post-correction: stale cache may have marked NVIDIA hybrid models as
-    # reasoning_toggle (previously stored before the nvidia guard). Normalize now
-    # so the spec never claims toggle for NVIDIA where the API rejects it.
+    # Post-correction: stale cache may have marked NVIDIA models with the
+    # Together-style reasoning_toggle dialect, which NIM rejects. Convert to
+    # NIM's native reasoning_effort instead of disabling thinking entirely.
     if prov in ("nvidia", "nim") and spec.supports_thinking and spec.thinking_type == "reasoning_toggle":
-        if any(x in clean_lower for x in ("kimi-k3", "kimi_k3", "glm-5.2", "glm_5.2", "minimax-m2", "minimax-m3", "minimax_m2", "minimax_m3")) and "glm-5.3" not in clean_lower:
-            spec.supports_thinking = False
-            spec.thinking_type = None
+        spec.thinking_type = "reasoning_effort"
 
     return spec
 

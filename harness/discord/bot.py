@@ -43,7 +43,7 @@ from typing import Dict, List, Optional, Tuple
 
 from harness.config import HarnessConfig
 from harness.core.agent import HarnessAgent
-from harness.discord.renderer import DiscordRenderState, DiscordOutgoing, chunk_message, chunk_quote
+from harness.discord.renderer import DiscordRenderState, DiscordOutgoing, DiscordStreamBuffer, chunk_message, chunk_quote
 from harness.discord.help_text import DISCORD_HELP_TEXT, GENERAL_HELP_TEXT
 from harness.discord.sync import get_relay, STREAM, is_self_echo
 
@@ -1913,6 +1913,78 @@ if HAS_DISCORD:
                 agent = rt.ensure_agent()
                 log.info("Agent ready: provider=%s model=%s", agent.config.provider, agent.session.model if agent.session else "none")
 
+                # ── Live answer streaming ────────────────────────────────
+                # Feed the provider's real text deltas into one Discord message
+                # and edit it in place. ``chunk_message`` is no longer the
+                # response path; a new part is opened only when Discord's hard
+                # 2000-character limit is reached.
+                live = DiscordStreamBuffer(max_len=self.max_message_len)
+                live_messages: list = []
+                live_shown: list = []
+                live_last_edit = 0.0
+                live_delivered = 0
+                live_editable = True
+                LIVE_EDIT_INTERVAL = 0.9  # stay well under Discord's edit rate limit
+
+                async def _live_publish(force: bool = False) -> bool:
+                    """Paint the current stream; return True if anything reached Discord."""
+                    nonlocal live_last_edit, live_delivered, live_editable
+                    if not live:
+                        return False
+                    now = loop.time()
+                    if not live_editable:
+                        # Surface without editable message objects (mocks or
+                        # restricted webhooks): send only the undelivered tail.
+                        full = live.full_text
+                        tail = full[live_delivered:]
+                        if tail and (force or len(tail) >= 80):
+                            await self._send_fallback(interaction, tail, mirror=False)
+                            live_delivered = len(full)
+                            return True
+                        return False
+                    if (
+                        not force
+                        and now - live_last_edit < LIVE_EDIT_INTERVAL
+                        and len(live_messages) >= len(live.parts)
+                    ):
+                        return False
+                    delivered = False
+                    for i, part in enumerate(live.parts):
+                        content = part or "…"
+                        if i >= len(live_messages):
+                            try:
+                                msg = await interaction.followup.send(content)
+                            except Exception as exc:
+                                log.warning("Live Discord send failed (falling back): %s", exc)
+                                live_editable = False
+                                full = live.full_text
+                                tail = full[live_delivered:]
+                                if tail:
+                                    await self._send_fallback(interaction, tail, mirror=False)
+                                    live_delivered = len(full)
+                                return True
+                            live_messages.append(msg)
+                            live_shown.append(content)
+                            live_last_edit = now
+                            delivered = True
+                            if not hasattr(msg, "edit"):
+                                # No Message object to edit (tests/webhook).
+                                live_editable = False
+                                live_delivered = len(live.full_text)
+                                return True
+                        elif content != live_shown[i] and (
+                            force or now - live_last_edit >= LIVE_EDIT_INTERVAL
+                        ):
+                            try:
+                                await live_messages[i].edit(content=content)
+                            except Exception as exc:
+                                log.debug("Live Discord edit failed: %s", exc)
+                                continue
+                            live_shown[i] = content
+                            live_last_edit = now
+                            delivered = True
+                    return delivered
+
                 # ── Worker: runs on thread pool ──────────────────────────
                 # Temporarily swaps the agent's event callback, permission
                 # approver, and ask_user handler.  Restores them in a finally
@@ -1986,8 +2058,7 @@ if HAS_DISCORD:
                 event_count = 0
                 # Stream the answer back to the CLI as one growing text instead
                 # of relaying every rendered chunk as a separate OUTPUT event.
-                # Discord itself still posts the full answer at the end, so the
-                # CLI receives the same text progressively.
+                # Discord itself now edits the answer in place as deltas arrive.
                 relay_stream_id = f"discord-{interaction.channel_id}-{id(interaction)}"
                 streamed: list[str] = []
                 last_published = 0.0
@@ -2008,11 +2079,20 @@ if HAS_DISCORD:
                                          channel_id=interaction.channel_id)
                         sent_any = True
                         break
-                    for out in state.add_event(item):
-                        await self._send_out(interaction, out)
-                        sent_any = True
-                    if getattr(item, "type", "") == "text_delta":
-                        streamed.append(str(item.data or ""))
+                    etype = getattr(item, "type", "")
+                    # turn_complete is finalized after the live answer flush;
+                    # consuming it here would re-send the whole response.
+                    if etype != "turn_complete":
+                        for out in state.add_event(item):
+                            await self._send_out(interaction, out)
+                            sent_any = True
+                    if etype == "text_delta":
+                        delta = str(item.data or "")
+                        streamed.append(delta)
+                        rolled = live.append(delta)
+                        if await _live_publish(force=rolled):
+                            state.mark_response_streamed()
+                            sent_any = True
                         # Throttled publish: one bus write per ~0.4s of typing
                         # instead of one per token.
                         now = asyncio.get_running_loop().time()
@@ -2029,7 +2109,11 @@ if HAS_DISCORD:
                 await typing_task
                 log.info("Agent worker finished after %d events", event_count)
 
-                # Flush any remaining buffered output.
+                # Final in-place paint (bypasses the edit throttle), then flush
+                # thinking/notices. The response itself is already on screen.
+                if await _live_publish(force=True):
+                    state.mark_response_streamed()
+                    sent_any = True
                 for out in state.finish():
                     await self._send_out(interaction, out)
                     sent_any = True

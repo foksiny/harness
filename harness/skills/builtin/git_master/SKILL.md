@@ -1,7 +1,7 @@
 ---
 name: git_master
 description: Advanced Git workflows, branch strategies, conflict resolution, rebase operations, and conventional commit generation.
-triggers: [git, branch, commit, rebase, merge conflict, pr, pull request, cherry-pick]
+triggers: [git, branch, commit, rebase, merge conflict, pull request, cherry-pick]
 ---
 # Git Master for Harness
 

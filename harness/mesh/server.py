@@ -100,12 +100,17 @@ class MeshHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _read_body(self) -> Dict[str, Any]:
+        # Cap request bodies at 10MB to avoid memory exhaustion from a
+        # single unbounded rfile.read().
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length:
-                raw = self.rfile.read(length)
-                if raw:
-                    return json.loads(raw.decode("utf-8", errors="ignore"))
+            if length <= 0:
+                return {}
+            if length > 10 * 1024 * 1024:
+                return {"_body_too_large": True}
+            raw = self.rfile.read(length)
+            if raw:
+                return json.loads(raw.decode("utf-8", errors="ignore"))
         except Exception:
             pass
         return {}
@@ -156,6 +161,8 @@ class MeshHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         server: "MeshServer" = self.server.mesh_server  # type: ignore
         body = self._read_body()
+        if body.get("_body_too_large"):
+            return self._json({"error": "Request body too large (max 10MB)"}, 413)
 
         if not self._check_auth():
             return self._json({"error": "unauthorized"}, 401)
@@ -452,6 +459,14 @@ class MeshServer:
             register_instance(self.port, self.workspace, self.username)
         except Exception:
             pass
+
+        if self.host == "0.0.0.0" and not (self.server_token or _get_server_token(self._config)):
+            try:
+                print("[api] WARNING: bound to 0.0.0.0 without a server token — "
+                      "any host on the network can drive the agent. "
+                      "Set server_token or HARNESS_API_TOKEN.", flush=True)
+            except Exception:
+                pass
 
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True, name=f"harness-api-{self.port}")
         self.thread.start()

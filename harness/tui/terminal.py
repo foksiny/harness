@@ -3,6 +3,7 @@ Terminal Renderer & TUI Engine for Harness.
 Renders header HUDs, markdown streams, collapsible thinking, syntax diffs,
 theme galleries, and hotkey footers using Rich and active theme styling.
 """
+import io
 import os
 import re
 import time
@@ -22,12 +23,11 @@ from harness.sysinfo import get_ram_usage_mb
 
 # Streaming flush tuning: completed markdown blocks print instantly, but a
 # partial block is never held back longer than _MD_FLUSH_MAX_AGE seconds or
-# past _MD_FLUSH_MAX_SIZE chars — it is printed up to the last safe newline
-# instead. Without this, a long paragraph with no blank line stalls the UI
-# and then dumps everything at once. Kept at half a second so prose/code
-# remain visibly real-time even when a model streams a block without blank
-# line separators.
-_MD_FLUSH_MAX_AGE = 0.5
+# past _MD_FLUSH_MAX_SIZE chars — it is printed up to the last safe newline /
+# word boundary instead. Without this, a long paragraph with no blank line
+# stalls the UI and then dumps everything at once. 0.15s keeps prose visibly
+# real-time without repainting faster than the eye can read.
+_MD_FLUSH_MAX_AGE = 0.15
 _MD_FLUSH_MAX_SIZE = 2000
 
 # Live thinking indicator: the running token estimate is rewritten IN PLACE on
@@ -59,9 +59,13 @@ class DynamicStdout:
 class TerminalRenderer:
     """Renders rich UI elements with custom themes."""
 
-    def __init__(self, theme_name: str = "cyberpunk", show_thinking: Optional[bool] = None):
+    def __init__(self, theme_name: str = "cyberpunk", show_thinking: Optional[bool] = None, raw_stream: bool = False):
         self.console = Console(file=DynamicStdout())
         self.theme: Theme = get_theme(theme_name)
+        # Headless/piped output: write provider deltas straight through with no
+        # markdown buffering or ANSI styling. Interactive terminals keep the
+        # block-aware markdown streamer below.
+        self.raw_stream = raw_stream
         # When False (default) only a compact "Thinking…" indicator and the
         # final token count are shown; the raw reasoning text is never printed.
         self._show_thinking = False if show_thinking is None else show_thinking
@@ -73,6 +77,9 @@ class TerminalRenderer:
         # Hold window for a newline-less thinking line (mirrors
         # _md_hold_start): 0.0 = nothing held.
         self._thinking_hold_start: float = 0.0
+        # True while a newline-less thinking line was painted inline (no
+        # trailing newline). Only a real provider \n may end the line.
+        self._thinking_inline_open: bool = False
         # Live indicator state: True while the streaming count line is still the
         # last printed line (safe to rewrite in place), plus throttling bookkeeping
         # for the real-time token counter.
@@ -89,6 +96,18 @@ class TerminalRenderer:
         self._md_buffer: str = ""
         self._md_stream_started: bool = False
         self._md_last_blank: bool = False
+        # A newline-less partial line was painted inline (no trailing newline).
+        # Its remainder must continue on the same terminal line; only a real
+        # provider newline may end it.
+        self._md_inline_open: bool = False
+        # True while the next markdown block is a continuation of a line that
+        # was already painted: suppress the whole-block blank-line separator.
+        self._md_continuation: bool = False
+        # A real blank line arrived while an inline line was open. Emit exactly
+        # one blank separator before the next block/content instead of writing
+        # it immediately, so blocks that self-supply a leading blank line
+        # (lists/quotes/tables) do not get a double gap.
+        self._md_pending_blank: bool = False
         # When the current unflushed remainder started accumulating (0.0 =
         # nothing held). The fallback flush measures hold time from here, so
         # fast streams stay byte-identical while stalled ones still paint.
@@ -121,7 +140,13 @@ class TerminalRenderer:
         return get_ram_usage_mb()
 
     def _get_git_branch(self) -> Optional[str]:
-        """Best-effort git branch detection."""
+        """Best-effort git branch detection (cached 5s — the toolbar repaints 2Hz)."""
+        now = time.monotonic()
+        cached = getattr(self, "_git_branch_cache", None)
+        if cached is not None:
+            ts, val = cached
+            if now - ts < 5.0:
+                return val
         try:
             import subprocess
             res = subprocess.check_output(
@@ -129,9 +154,11 @@ class TerminalRenderer:
                 stderr=subprocess.DEVNULL,
                 timeout=1,
             ).decode("utf-8").strip()
-            return res if res and res != "HEAD" else None
+            val = res if res and res != "HEAD" else None
         except Exception:
-            return None
+            val = None
+        self._git_branch_cache = (now, val)
+        return val
 
     def _render_context_bar(self, tokens: int, max_tokens: int, width: int = 8) -> str:
         """Render a mini visual context gauge."""
@@ -455,16 +482,23 @@ class TerminalRenderer:
             self.console.print(highlighted)
         self.console.print()
 
-    def render_turn_capsule(self, mode: str, model: str, duration: float):
-        """Render OpenCode completion capsule: ▣ Build · model · 2.4s"""
+    def render_turn_capsule(self, mode: str, model: str, duration: float,
+                            tokens: int = 0, context_pct: float = 0.0):
+        """Render OpenCode completion capsule: ▣ Build · model · 2.4s [· 12.3k toks · 8.1% ctx]"""
         self._finish_markdown()
         self._finish_thinking()
         self._generating_announced.clear()
         dur_str = f"{duration:.1f}s" if duration >= 1.0 else f"{int(duration * 1000)}ms"
         mode_label = mode.capitalize() if mode else "Build"
+        extra = ""
+        if tokens:
+            toks_k = f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
+            extra = f" [dim]· {toks_k} toks[/dim]"
+            if context_pct:
+                extra += f" [dim]· {context_pct:.1f}% ctx[/dim]"
         self.console.print(
             f"\n  [bold cyan]▣ {mode_label}[/bold cyan] [dim]·[/dim] "
-            f"[dim white]{model}[/dim white] [dim]· {dur_str}[/dim]\n"
+            f"[dim white]{model}[/dim white] [dim]· {dur_str}[/dim]{extra}\n"
         )
 
     def print_welcome_splash(self, agent=None, queue=None):
@@ -1259,9 +1293,24 @@ class TerminalRenderer:
             self._thinking_refresh_header(force=True)
             self.console.print()
             self._thinking_header_open = False
-        # Flush any buffered thinking blocks (append-only, like markdown).
+        # Flush any buffered thinking (append-only). If a line was painted
+        # inline, finish it with a newline before the stats line.
+        if self._thinking_inline_open:
+            self.console.print()
+            self._thinking_inline_open = False
         if self._thinking_buffer:
-            self._thinking_print_block(self._thinking_buffer)
+            # Buffered tail may contain real newlines — print as completed lines.
+            if "\n" in self._thinking_buffer:
+                # Ensure trailing newline so splitlines keeps last line.
+                tail = self._thinking_buffer
+                if not tail.endswith("\n"):
+                    tail += "\n"
+                self._thinking_print_block(tail)
+            else:
+                # Newline-less tail: inline (no auto-break mid-text).
+                self._thinking_write_inline(self._thinking_buffer)
+                self.console.print()
+                self._thinking_inline_open = False
             self._thinking_buffer = ""
         elapsed = time.time() - self._thinking_start_time
         if elapsed < 1.0:
@@ -1285,11 +1334,10 @@ class TerminalRenderer:
         self._live_thinking_active = False
 
     def _thinking_print_block(self, chunk: str):
-        """Print one thinking block with prefix - mirrors _md_print_block structure.
+        """Print completed thinking lines (only lines terminated by a real \n).
 
-        Uses same append-only, no-Live approach as markdown streaming but renders
-        with thinking style (yellow prefix) instead of Markdown. Blank lines are
-        preserved as empty console prints for proper paragraph spacing.
+        No automatic newlines: newline-less deltas concatenate on one terminal
+        line via _thinking_write_inline. Blank lines are preserved.
         """
         if not chunk:
             return
@@ -1298,30 +1346,76 @@ class TerminalRenderer:
         if self._thinking_header_open:
             self.console.print()
             self._thinking_header_open = False
-        # Strip only trailing blank handling handled by caller; print each line
-        # with the thinking sidebar prefix. Preserve empty lines.
         lines = chunk.splitlines()
-        for line in lines:
+        for i, line in enumerate(lines):
+            is_first = (i == 0)
             if not line.strip():
+                # Real blank line from provider — ends any inline line first.
+                if self._thinking_inline_open:
+                    self.console.print()
+                    self._thinking_inline_open = False
                 self.console.print()
             else:
-                # Use Text to avoid markup injection, with thinking color
-                self.console.print(
-                    f"  [dim yellow]│[/dim yellow] [{self.theme.thinking}]{line}[/{self.theme.thinking}]",
-                    highlight=False,
-                )
+                if is_first and self._thinking_inline_open:
+                    # Continuation of an inline-painted line: no prefix, and
+                    # no leading newline (we're mid-line).
+                    self.console.print(
+                        f"[{self.theme.thinking}]{line}[/{self.theme.thinking}]",
+                        end="", highlight=False,
+                    )
+                    # The completing \n (or lack thereof) is handled by caller:
+                    # _thinking_flush_completed consumed the \n, so end line now.
+                    self.console.print()
+                    self._thinking_inline_open = False
+                else:
+                    self.console.print(
+                        f"  [dim yellow]│[/dim yellow] [{self.theme.thinking}]{line}[/{self.theme.thinking}]",
+                        highlight=False,
+                    )
+                    self._thinking_inline_open = False
         # If original chunk ended with newline, ensure trailing blank preserved
         if chunk.endswith("\n") and (not lines or lines[-1].strip()):
-            self.console.print()
+            pass  # newline already emitted per line above
+
+    def _thinking_write_inline(self, text: str):
+        """Paint ``text`` without ending the line (no automatic newline).
+
+        Mirrors _md_write_inline: only a real provider \\\\n ends the line.
+        The first paint of a line gets the ``│`` prefix; continuations don't.
+        """
+        if not text:
+            return
+        trailing = re.search(r"[ \t\r\n]*\Z", text).group(0) if re.search(r"[ \t\r\n]*\Z", text) else ""
+        body = text[: len(text) - len(trailing)] if trailing else text
+        if body:
+            if self._thinking_inline_open:
+                self.console.print(f"[{self.theme.thinking}]{body}[/{self.theme.thinking}]", end="", highlight=False)
+            else:
+                # Close header before first content on this line.
+                if self._thinking_header_open:
+                    self.console.print()
+                    self._thinking_header_open = False
+                self.console.print(
+                    f"  [dim yellow]│[/dim yellow] [{self.theme.thinking}]{body}[/{self.theme.thinking}]",
+                    end="", highlight=False,
+                )
+                self._thinking_inline_open = True
+        if trailing:
+            # Only a real \n from the provider ends the line; spaces/tabs are
+            # word separators and must stay inline.
+            if "\n" in trailing:
+                self.console.print()
+                self._thinking_inline_open = False
+            else:
+                self.console.file.write(trailing)
+                self.console.file.flush()
 
     def _thinking_flush_completed(self):
         """Append-only thinking stream: print every completed line immediately.
 
-        Thinking is rendered as plain prefixed lines (not markdown), so there
-        is no block structure to preserve — waiting for a blank-line boundary
-        here only delayed visible output by seconds/minutes and then dumped
-        everything at once. The trailing partial line stays buffered;
-        _finish_thinking flushes it at turn end.
+        Only lines terminated by a real \\\\n are printed. The trailing partial
+        line stays buffered (or painted inline without a newline); _finish_thinking
+        flushes it at turn end.
         """
         buf = self._thinking_buffer
         idx = buf.rfind("\n")
@@ -1336,14 +1430,13 @@ class TerminalRenderer:
             self._thinking_hold_start = 0.0
 
     def _thinking_flush_with_fallback(self):
-        """Flush completed thinking lines instantly; never hold partial text.
+        """Flush completed thinking lines; never insert an automatic newline.
 
-        Fast path is the per-line flush above. Fallback: when a single line
-        runs longer than _MD_FLUSH_MAX_AGE or _MD_FLUSH_MAX_SIZE without a
-        newline — a minutes-long stall that then dumps one huge chunk — print
-        it up to the last word boundary so tokens stay visible. The
-        continuation paints on the next prefixed line; _finish_thinking
-        flushes the tail. Still append-only: no cursor repositioning.
+        Fast path is the per-line flush above (real \\\\n only). Fallback paints
+        a safe prefix of a newline-less line INLINE (no trailing newline) so
+        tokens stay visible without breaking the line. In interactive mode
+        (prompt_toolkit owns the bottom rows) the partial is held instead —
+        a mid-line paint would be overwritten by the prompt repaint.
         """
         self._thinking_flush_completed()
         if not self._thinking_buffer:
@@ -1351,39 +1444,51 @@ class TerminalRenderer:
             return
         now = time.time()
         if self._thinking_hold_start == 0.0:
-            # First sight of this line — stamp it and give the line fast
-            # path a chance on the next delta before falling back.
             self._thinking_hold_start = now
             return
         if now - self._thinking_hold_start < _MD_FLUSH_MAX_AGE and len(self._thinking_buffer) < _MD_FLUSH_MAX_SIZE:
             return
+        if self.interactive_prompt:
+            # Hold: prompt repaint would clobber a mid-line fragment.
+            return
+        if "\n" in self._thinking_buffer:
+            # A real newline arrived but the completed-flush didn't consume
+            # it (only mid-line text follows) — handle via completed path.
+            return
         buf = self._thinking_buffer
         cut = buf.rfind(" ")
         if cut <= 0:
-            cut = len(buf)  # single huge word: hard-cut rather than stall
+            cut = len(buf)
         else:
-            cut += 1  # keep the trailing space so the next line starts clean
+            cut += 1
         chunk, self._thinking_buffer = buf[:cut], buf[cut:]
-        self._thinking_print_block(chunk)
-        # Remainder (if any) starts a fresh hold window from this paint.
+        self._thinking_write_inline(chunk)
         self._thinking_hold_start = now if self._thinking_buffer else 0.0
 
-    def _md_print_block(self, chunk: str):
+    def _md_print_block(self, chunk: str, continuation: bool = False):
         """Print one markdown block with whole-document spacing semantics.
 
         Rich renders lists / quotes / tables with their own leading blank line
         and a horizontal rule with its own trailing blank line; other blocks
         need the caller to supply the separator. This emits exactly one blank
         line between adjacent blocks — byte-identical to rendering the whole
-        document at once.
+        document at once. ``continuation`` suppresses the separator when the
+        chunk is the tail of a partial line painted by the fallback path;
+        ``_md_pending_blank`` supplies a real blank line that arrived during
+        inline streaming (lists/quotes/tables already supply that gap).
         """
         kind = self._md_block_kind(chunk)
         last_line = next(
             (ln for ln in reversed(chunk.splitlines()) if ln.strip()), ""
         ).lstrip()
         trailing_blank = bool(re.fullmatch(r"(-{3,}|\*{3,}|_{3,})", last_line))
-        if (
+        if self._md_pending_blank:
+            if self._md_stream_started and kind not in ("list", "quote", "table"):
+                self.console.print()
+            self._md_pending_blank = False
+        elif (
             self._md_stream_started
+            and not continuation
             and kind not in ("list", "quote", "table")
             and not self._md_last_blank
         ):
@@ -1392,13 +1497,112 @@ class TerminalRenderer:
         self._md_stream_started = True
         self._md_last_blank = trailing_blank
 
+    def _md_write_inline(self, text: str):
+        """Append ``text`` without ever inserting a line break of our own.
+
+        Partial markdown is rendered through a throwaway Console so inline
+        styles (bold, code spans, links) survive, then the renderer's trailing
+        padding/newline is stripped. Trailing whitespace from the provider is
+        re-appended verbatim — it is what separates streamed words, and an
+        actual ``\\n`` is the only thing allowed to end the line.
+        """
+        if not text:
+            return
+        trailing_match = re.search(r"[ \t\r\n]*\Z", text)
+        trailing = trailing_match.group(0) if trailing_match else ""
+        body = text[: len(text) - len(trailing)] if trailing else text
+        if body:
+            try:
+                inline_buf = io.StringIO()
+                inline_console = Console(
+                    file=inline_buf,
+                    force_terminal=self.console.is_terminal,
+                    color_system=self.console.color_system,
+                    width=self.console.width,
+                    legacy_windows=self.console.legacy_windows,
+                )
+                inline_console.print(
+                    Markdown(body, code_theme=self.theme.code_theme),
+                    end="",
+                    soft_wrap=True,
+                )
+                raw_rendered = inline_buf.getvalue()
+                rendered = "\n".join(
+                    line.rstrip(" \t") for line in raw_rendered.splitlines()
+                ).lstrip("\r\n").rstrip("\r\n")
+            except Exception:
+                # Rendering a partial marker must never lose the text.
+                rendered = body
+            self.console.file.write(rendered)
+        if trailing:
+            self.console.file.write(trailing)
+        self.console.file.flush()
+
+    def _md_emit_line_wise(self, chunk: str):
+        """Append line-oriented markdown (lists/quotes) without a fresh-list gap.
+
+        Rich starts every Markdown list/quote render with a blank line. That is
+        correct once per block, but a streamed list arrives in several chunks;
+        rendering each chunk as a new block would put an empty line between
+        consecutive bullets. This keeps the caller's real blank lines while
+        writing the chunk's lines back-to-back.
+        """
+        if self._md_pending_blank:
+            if self._md_stream_started:
+                self.console.print()
+            self._md_pending_blank = False
+        elif not self._md_continuation and self._md_stream_started:
+            self.console.print()
+        # Defer trailing blank lines to the next block: writing them here and
+        # then letting _md_print_block add its separator produced two blanks
+        # between a streamed list and the paragraph after it.
+        content = chunk.rstrip(" \t\r\n")
+        blank_after = chunk[len(content):].count("\n") > 1
+        if not content:
+            if self._md_stream_started:
+                self._md_pending_blank = True
+            return
+        self._md_write_inline(content + "\n")
+        self._md_stream_started = True
+        self._md_last_blank = False
+        self._md_continuation = True
+        self._md_pending_blank = blank_after
+
+    def _finish_inline_markdown(self):
+        """Finish an inline-painted line without adding an artificial newline."""
+        if not self._md_inline_open:
+            return
+        newline_at = self._md_buffer.find("\n")
+        if newline_at >= 0:
+            # Defensive: finish the open line first, then render any later
+            # lines as a normal block.
+            self._md_write_inline(self._md_buffer[: newline_at + 1])
+            remainder = self._md_buffer[newline_at + 1:]
+            self._md_buffer = ""
+            self._md_inline_open = False
+            if remainder:
+                self._md_print_block(remainder, continuation=True)
+        else:
+            self._md_write_inline(self._md_buffer)
+            self._md_buffer = ""
+            self._md_inline_open = False
+
     def _finish_markdown(self):
         """Flush the trailing (not yet printed) markdown segment and reset the buffer."""
+        if self._md_inline_open:
+            self._finish_inline_markdown()
         if self._md_buffer:
-            self._md_print_block(self._md_buffer)
+            kind = self._md_block_kind(self._md_buffer)
+            if self._md_continuation and kind in ("list", "quote"):
+                self._md_emit_line_wise(self._md_buffer)
+            else:
+                self._md_print_block(self._md_buffer, continuation=self._md_continuation)
             self._md_buffer = ""
         self._md_stream_started = False
         self._md_last_blank = False
+        self._md_inline_open = False
+        self._md_continuation = False
+        self._md_pending_blank = False
         # Reset the hold window so fresh text after a tool call or a new
         # turn is measured from its own arrival, not the previous segment.
         self._md_hold_start = 0.0
@@ -1479,10 +1683,14 @@ class TerminalRenderer:
                 self._md_buffer[:completed],
                 self._md_buffer[completed:],
             )
-            self._md_print_block(chunk)
+            if self._md_continuation and self._md_block_kind(chunk) in ("list", "quote"):
+                self._md_emit_line_wise(chunk)
+            else:
+                self._md_print_block(chunk, continuation=self._md_continuation and not printed)
             self._md_stream_started = True
             printed = True
         if printed:
+            self._md_continuation = False
             # Remainder (if any) starts a fresh hold window from this paint.
             self._md_hold_start = time.time() if self._md_buffer else 0.0
 
@@ -1506,37 +1714,174 @@ class TerminalRenderer:
                 cut = pos
         return cut
 
+    @staticmethod
+    def _md_open_fence(buffer: str) -> bool:
+        """True while ``buffer`` ends inside an unclosed fenced code block."""
+        in_fence = False
+        marker = ""
+        for line in buffer.splitlines():
+            stripped = line.strip()
+            if not in_fence and (stripped.startswith("```") or stripped.startswith("~~~")):
+                in_fence = True
+                marker = stripped[:3]
+            elif in_fence and stripped.startswith(marker):
+                in_fence = False
+        return in_fence
+
+    @staticmethod
+    def _md_inline_marker_start(text: str) -> int:
+        """Index of the earliest unterminated inline markdown span, or -1.
+
+        Used before painting a newline-less partial line: splitting a ``**``,
+        backtick code span, strikethrough, or link label would show raw markers
+        until the rest arrives.
+        """
+        earliest = len(text)
+        if text.count("`") % 2:
+            idx = text.rfind("`")
+            while idx > 0 and text[idx - 1] == "`":
+                idx -= 1
+            earliest = min(earliest, idx)
+        for marker in ("**", "__", "~~"):
+            if text.count(marker) % 2:
+                idx = text.rfind(marker)
+                while idx > 0 and text[idx - 1] == marker[0]:
+                    idx -= 1
+                earliest = min(earliest, idx)
+        if text.count("[") > text.count("]"):
+            earliest = min(earliest, text.rfind("["))
+        elif text.count("](") > text.count(")"):
+            # Inline link/image target still open — cut before its label.
+            idx = text.rfind("](")
+            start = text.rfind("[", 0, idx)
+            earliest = min(earliest, start if start >= 0 else idx)
+        return earliest if earliest < len(text) else -1
+
     def _md_flush_with_fallback(self):
         """Flush completed blocks instantly; never hold partial text too long.
 
         Fast path is the blank-line block boundary (byte-identical spacing).
         Fallback: when the remainder has been held longer than
-        _MD_FLUSH_MAX_AGE or grown past _MD_FLUSH_MAX_SIZE, print it up to
-        the last newline outside a fence so tokens stay visible instead of
-        stalling for minutes and dumping at once.
+        _MD_FLUSH_MAX_AGE or grown past _MD_FLUSH_MAX_SIZE, paint it without
+        inserting a line break. Only a real ``\\n`` from the provider ends a
+        line: newline-less deltas concatenate on one terminal line instead of
+        each becoming its own markdown block.
         """
+        now = time.time()
+
+        # An open inline line must be closed before the block streamer can
+        # inspect the buffer, because _md_completed_end() may cut through the
+        # middle of that line.
+        if self._md_inline_open:
+            newline_at = self._md_buffer.find("\n")
+            if newline_at >= 0:
+                # Consume the rest of this physical line plus any complete
+                # blank lines. Write the line's newline now, but defer blank
+                # lines to the block separator so lists/quotes/tables (which
+                # render their own leading blank) do not get a doubled gap.
+                end = newline_at + 1
+                while end < len(self._md_buffer):
+                    line_end = self._md_buffer.find("\n", end)
+                    if line_end < 0 or self._md_buffer[end:line_end].strip():
+                        break
+                    end = line_end + 1
+                chunk, self._md_buffer = (
+                    self._md_buffer[: newline_at + 1],
+                    self._md_buffer[end:],
+                )
+                self._md_pending_blank = self._md_pending_blank or end > newline_at + 1
+                self._md_write_inline(chunk)
+                self._md_inline_open = False
+                self._md_stream_started = True
+                self._md_continuation = True
+                self._md_hold_start = now if self._md_buffer else 0.0
+            else:
+                self._md_paint_inline_fallback(now)
+                return
+
         self._md_flush_completed()
         if not self._md_buffer:
             self._md_hold_start = 0.0
             return
-        now = time.time()
         if self._md_hold_start == 0.0:
             # First sight of this remainder — stamp it and give the block
             # fast path a chance on the next chunk before falling back.
             self._md_hold_start = now
             return
+        held = now - self._md_hold_start
+        if held < _MD_FLUSH_MAX_AGE and len(self._md_buffer) < _MD_FLUSH_MAX_SIZE:
+            return
+
         if "\n" not in self._md_buffer:
+            self._md_paint_inline_fallback(now)
+            return
+
+        cut = self._md_line_cut(self._md_buffer)
+        if cut <= 0:
+            return
+        in_fence = self._md_open_fence(self._md_buffer)
+        chunk, self._md_buffer = self._md_buffer[:cut], self._md_buffer[cut:]
+        if not in_fence and self._md_block_kind(chunk) in ("list", "quote"):
+            self._md_emit_line_wise(chunk)
+        else:
+            self._md_print_block(chunk, continuation=self._md_continuation)
+            self._md_stream_started = True
+            self._md_continuation = True
+        # Remainder (if any) starts a fresh hold window from this paint.
+        self._md_hold_start = now if self._md_buffer else 0.0
+
+    def _md_paint_inline_fallback(self, now: float):
+        """Paint a safe prefix of a newline-less line without ending the line.
+
+        Lists, quotes, tables, fences and horizontal rules are held until a
+        real newline: Rich gives those blocks their own leading/trailing
+        newlines, which would reintroduce the auto-newline behaviour. Ordinary
+        prose and headings can be appended inline safely.
+        """
+        if not self._md_buffer:
+            self._md_hold_start = 0.0
+            return
+        if self.interactive_prompt:
+            # prompt_toolkit's patch_stdout writes output with run_in_terminal
+            # and then repaints the prompt. A flushed fragment without a
+            # trailing newline leaves the cursor mid-line, so the repaint can
+            # overwrite the fragment from the left (observed as responses
+            # starting mid-sentence). Hold instead; the real newline or the
+            # turn-end flush will emit the complete line.
+            return
+        if self._md_hold_start == 0.0:
+            self._md_hold_start = now
             return
         held = now - self._md_hold_start
         if held < _MD_FLUSH_MAX_AGE and len(self._md_buffer) < _MD_FLUSH_MAX_SIZE:
             return
-        cut = self._md_line_cut(self._md_buffer)
+        if self._md_open_fence(self._md_buffer):
+            return
+        if self._md_block_kind(self._md_buffer) not in ("paragraph", "heading"):
+            return
+
+        buf = self._md_buffer
+        cut = buf.rfind(" ")
+        if cut <= 0:
+            cut = len(buf)  # single huge word: hard-cut rather than stall
+        else:
+            cut += 1  # keep the trailing space so the next piece starts clean
+        bad = self._md_inline_marker_start(buf[:cut])
+        if bad >= 0:
+            cut = buf.rfind(" ", 0, bad) + 1
+            if cut <= 0:
+                cut = bad
         if cut <= 0:
             return
-        chunk, self._md_buffer = self._md_buffer[:cut], self._md_buffer[cut:]
-        self._md_print_block(chunk)
+        chunk, self._md_buffer = buf[:cut], buf[cut:]
+        if self._md_pending_blank:
+            if self._md_stream_started:
+                self.console.print()
+            self._md_pending_blank = False
+        self._md_write_inline(chunk)
         self._md_stream_started = True
-        # Remainder (if any) starts a fresh hold window from this paint.
+        self._md_continuation = True
+        self._md_inline_open = True
         self._md_hold_start = now if self._md_buffer else 0.0
 
     def _sub_id(self, agent_id: str) -> str:
@@ -1702,6 +2047,12 @@ class TerminalRenderer:
         if etype == "reasoning_delta":
             # Mirror text_delta/tool_call updating: finish markdown first, then
             # buffer thinking and flush completed blocks append-only (no Live).
+            if self.raw_stream:
+                if self._show_thinking:
+                    text = str(data)
+                    self._current_thinking += text
+                    self._raw_write(text)
+                return
             self._finish_markdown()
             text = str(data)
             self._current_thinking += text
@@ -1724,6 +2075,11 @@ class TerminalRenderer:
             self._thinking_flush_with_fallback()
 
         elif etype == "text_delta":
+            if self.raw_stream:
+                # Piped/headless output: the provider's deltas ARE the output.
+                # No markdown buffering, no re-chunking, no artificial delay.
+                self._raw_write(str(data))
+                return
             self._finish_thinking()
             self._md_buffer += str(data)
             # Append-only streaming: print each completed markdown block once,
@@ -1907,6 +2263,21 @@ class TerminalRenderer:
 
         self.console.print(table)
         self.console.print(f"[dim]Switch: /model <name> | Effort: /effort <level>[/dim]\n")
+
+    def _raw_write(self, text: str):
+        """Write provider text verbatim, bypassing Rich markup/wrapping.
+
+        Used for piped/headless output where the consumer (a log file, pipe,
+        test harness) wants the model's actual stream bytes, not a terminal
+        re-render.
+        """
+        if not text:
+            return
+        try:
+            self.console.file.write(text)
+            self.console.file.flush()
+        except Exception:
+            self.console.print(text, end="", markup=False, highlight=False, soft_wrap=True)
 
     def print_markdown(self, md_text: str):
         self.console.print(Markdown(md_text, code_theme=self.theme.code_theme))

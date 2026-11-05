@@ -95,9 +95,9 @@ class TestTools(unittest.TestCase):
             "for i in $(seq 1 5000); do printf 'L%05d_abcdefghij\\n' $i; done"
         )
         self.assertIn("L00001_abcdefghij", res)
-        # Default cap kicked in — head preserved, tail elided with a marker.
+        # Default cap kicked in — head+tail preserved, middle elided with a marker.
         self.assertIn("output truncated by context budget", res)
-        self.assertNotIn("L05000_abcdefghij", res)
+        self.assertIn("L05000_abcdefghij", res)
 
         # Explicit max_chars recovers the full output (agent opt-in).
         full = cmd_tool.execute(

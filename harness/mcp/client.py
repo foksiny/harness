@@ -11,7 +11,9 @@ from typing import Dict, Any, List, Optional
 from harness.tools.base import Tool
 
 class MCPTool(Tool):
-    """Dynamic tool wrapper for an MCP server-provided tool."""
+    """Dynamic tool wrapper for an MCP server-provided tool (H5: permission + cap)."""
+
+    permission_manager = None  # set by MCPManager
 
     def __init__(self, server_name: str, tool_def: Dict[str, Any], invoker):
         self.server_name = server_name
@@ -24,21 +26,38 @@ class MCPTool(Tool):
         self._invoker = invoker
 
     def execute(self, **kwargs) -> Any:
-        return self._invoker(self.raw_name, kwargs)
+        if self.permission_manager is not None:
+            try:
+                from harness.core.permissions import PermissionLevel as _PL
+                if self.permission_manager.level == _PL.SECURE:
+                    ok = self.permission_manager.check_permission(
+                        "mcp", {"tool": self.name, "summary": f"MCP {self.name}"}
+                    )
+                    if not ok:
+                        return f"Error: {self.name} rejected by security policy."
+            except Exception:
+                pass
+        res = self._invoker(self.raw_name, kwargs)
+        # H6: cap MCP output at the hard ceiling.
+        if isinstance(res, str) and len(res) > 64000:
+            res = res[:32000] + "\n...[middle elided]\n" + res[-31000:]
+        return res
 
 class StdioMCPClient:
-    """JSON-RPC 2.0 transport over subprocess stdio."""
+    """JSON-RPC 2.0 transport over subprocess stdio (H5: timeout + drained stderr)."""
 
-    def __init__(self, name: str, command: str, args: Optional[List[str]] = None, env: Optional[Dict[str, str]] = None):
+    def __init__(self, name: str, command: str, args: Optional[List[str]] = None, env: Optional[Dict[str, str]] = None, timeout: float = 10.0):
         self.name = name
         self.command = command
         self.args = args or []
         self.env = env or {}
+        self.timeout = timeout
         self.process: Optional[subprocess.Popen] = None
         self._req_id = 0
         self._pending_requests: Dict[int, Dict[str, Any]] = {}
         self._lock = threading.Lock()
         self.is_running = False
+        self._stderr_thread = None
 
     def start(self) -> bool:
         cmd = [self.command] + self.args
@@ -57,11 +76,23 @@ class StdioMCPClient:
             )
             self.is_running = True
             threading.Thread(target=self._read_loop, daemon=True).start()
+            self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+            self._stderr_thread.start()
             # Perform MCP initialization handshake
             return self._initialize()
         except Exception as e:
             self.is_running = False
             return False
+
+    def _drain_stderr(self) -> None:
+        """H5: drain stderr so a chatty server cannot deadlock on a full pipe."""
+        try:
+            while self.is_running and self.process and self.process.stderr:
+                line = self.process.stderr.readline()
+                if not line:
+                    break
+        except Exception:
+            pass
 
     def _read_loop(self):
         while self.is_running and self.process and self.process.stdout:
@@ -108,6 +139,9 @@ class StdioMCPClient:
                 if curr_id in self._pending_requests:
                     return self._pending_requests.pop(curr_id)
             time.sleep(0.02)
+        # Timeout: drop any late response so _pending_requests never leaks.
+        with self._lock:
+            self._pending_requests.pop(curr_id, None)
         return None
 
     def _initialize(self) -> bool:
@@ -157,5 +191,13 @@ class StdioMCPClient:
             try:
                 self.process.terminate()
                 self.process.wait(timeout=1.0)
+            except Exception:
+                pass
+            try:
+                # Kill fallback: terminate() alone leaves zombies when the
+                # child ignores SIGTERM; kill + wait reaps it.
+                if self.process.poll() is None:
+                    self.process.kill()
+                    self.process.wait(timeout=1.0)
             except Exception:
                 pass

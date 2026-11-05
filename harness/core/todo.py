@@ -23,6 +23,9 @@ class TaskItem:
     notes: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    deps: List[int] = field(default_factory=list)
+    owner: Optional[str] = None
+    evidence: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -34,7 +37,14 @@ class TaskItem:
         data = data.copy()
         if "status" in data and isinstance(data["status"], str):
             data["status"] = TaskStatus(data["status"])
-        return cls(**data)
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+    def is_blocked(self, all_tasks: Dict[int, "TaskItem"]) -> bool:
+        for d in self.deps or []:
+            dep = all_tasks.get(d)
+            if dep is not None and dep.status != TaskStatus.COMPLETED:
+                return True
+        return False
 
 class TodoManager:
     """Manages active task lists for agent planning and execution."""
@@ -44,14 +54,17 @@ class TodoManager:
         self._next_id: int = 1
         self._lock = threading.Lock()  # Guards mutations from concurrent swarm workers
 
-    def add_task(self, title: str, notes: Optional[str] = None) -> TaskItem:
+    def add_task(self, title: str, notes: Optional[str] = None, deps: Optional[List[int]] = None,
+                 owner: Optional[str] = None) -> TaskItem:
         with self._lock:
-            task = TaskItem(id=self._next_id, title=title.strip(), notes=notes)
+            task = TaskItem(id=self._next_id, title=title.strip(), notes=notes,
+                            deps=list(deps or []), owner=owner)
             self._next_id += 1
             self.tasks.append(task)
             return task
 
-    def update_task(self, task_id: int, status: TaskStatus, notes: Optional[str] = None) -> Optional[TaskItem]:
+    def update_task(self, task_id: int, status: TaskStatus, notes: Optional[str] = None,
+                    evidence: Optional[str] = None) -> Optional[TaskItem]:
         with self._lock:
             for task in self.tasks:
                 if task.id == task_id:
@@ -59,7 +72,21 @@ class TodoManager:
                     task.updated_at = time.time()
                     if notes:
                         task.notes = notes
+                    if evidence:
+                        task.evidence = evidence
                     return task
+            return None
+
+    def open_tasks(self) -> List["TaskItem"]:
+        with self._lock:
+            return [t for t in self.tasks if t.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS)]
+
+    def assign(self, task_id: int, owner: str) -> Optional["TaskItem"]:
+        with self._lock:
+            for t in self.tasks:
+                if t.id == task_id:
+                    t.owner = owner
+                    return t
             return None
 
     def get_task(self, task_id: int) -> Optional[TaskItem]:

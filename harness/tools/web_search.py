@@ -309,3 +309,61 @@ class ExaSearchTool(Tool):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = resp.read(max_bytes)
         return data.decode("utf-8", errors="replace")
+
+
+def extract_readable(html_text: str, max_chars: int = 12000) -> str:
+    """Strip script/style + tags to readable markdown-ish text (E5)."""
+    import re as _re
+    text = html_text or ""
+    text = _re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", text)
+    text = _re.sub(r"(?is)<!--.*?-->", " ", text)
+    # Headings/breaks
+    text = _re.sub(r"(?i)<h([1-6])[^>]*>", r"\n\n## ", text)
+    text = _re.sub(r"(?i)</h[1-6]>", "\n\n", text)
+    text = _re.sub(r"(?i)<(br|/p|/div|/li)[^>]*>", "\n", text)
+    text = _re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = _re.sub(r"[ \t]{2,}", " ", text)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    out = "\n".join(lines)
+    if len(out) > max_chars:
+        out = out[: max_chars // 2] + "\n...[middle elided; fetch again with max_chars]\n" + out[-max_chars // 2:]
+    return out
+
+
+class WebFetchTool(Tool):
+    name = "web_fetch"
+    description = (
+        "Fetch a URL as readable text (static pages). Use this BEFORE launching the browser for "
+        "static HTML/documentation. Only use the browser for interactive pages (clicks, forms, JS)."
+    )
+    action_type = "web_fetch"
+    is_read_only = True
+    parameters = {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "URL to fetch (http/https only)."},
+            "max_chars": {"type": "integer", "description": "Max chars to return (default 12000)."},
+        },
+        "required": ["url"],
+    }
+
+    def execute(self, url: str, max_chars: int = 12000, **kwargs) -> str:
+        url = (url or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            return "Error: web_fetch only supports http:// and https:// URLs."
+        try:
+            cap = min(max(500, int(max_chars)), 64000)
+        except Exception:
+            cap = 12000
+        try:
+            req = urllib.request.Request(url, headers=HTML_HEADERS)
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                raw = resp.read(500_000).decode("utf-8", errors="replace")
+                final_url = resp.geturl() or url
+        except Exception as e:
+            return f"Error: web_fetch failed for {url}: {e}"
+        body = extract_readable(raw, cap)
+        if not body.strip():
+            return f"No readable text at {final_url} (page may be JS-rendered; try browser_navigate)."
+        return f"Fetched {final_url}:\n\n{body}"

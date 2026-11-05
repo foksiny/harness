@@ -1,7 +1,7 @@
 """
 Unit tests for the Discord integration: config token lifecycle, event rendering
-(thinking as > quotes, full response at end, tool notices), message chunking,
-sync relay, and key store validation.
+(thinking as > quotes, in-place live response buffer, non-streaming fallback),
+message chunking, sync relay, and key store validation.
 """
 import unittest
 import tempfile

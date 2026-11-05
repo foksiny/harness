@@ -71,7 +71,7 @@ class ReadSkillTool(Tool):
             f"Triggers: {triggers}\n"
             f"Source: {source}\n"
             f"--- INSTRUCTIONS ---\n"
-            f"{skill.instructions}"
+            f"{skill.load_instructions()}"
         )
 
     def _lookup(self, name: str) -> Optional[Any]:

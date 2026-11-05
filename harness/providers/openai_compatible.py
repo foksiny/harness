@@ -312,6 +312,9 @@ class OpenAICompatibleProvider(BaseProvider):
             # before the first payload is transient-retryable; mid-stream deaths
             # are surfaced to the agent, which retries the whole call.
             saw_payload = False
+            # A native finish_reason already told the consumer the turn ended;
+            # ``[DONE]`` must not append a second synthetic "stop" chunk.
+            finish_emitted = False
             try:
                 # httpx streams each SSE line the moment its bytes arrive
                 # (no stdlib buffering delay) with a generous read timeout so
@@ -342,7 +345,8 @@ class OpenAICompatibleProvider(BaseProvider):
                                     if rem_text or rem_reasoning:
                                         saw_payload = True
                                         yield LLMChunk(delta_text=rem_text, delta_reasoning=rem_reasoning)
-                                    yield LLMChunk(finish_reason="stop")
+                                    if not finish_emitted:
+                                        yield LLMChunk(finish_reason="stop")
                                     return
 
                                 try:
@@ -387,6 +391,16 @@ class OpenAICompatibleProvider(BaseProvider):
 
                                 choices = chunk_json.get("choices", [])
                                 if not choices:
+                                    # OpenAI-compatible servers send a final
+                                    # usage-only event with ``choices: []``.
+                                    # Preserve it: it is a real stream event and
+                                    # carries token accounting.
+                                    usage = chunk_json.get("usage")
+                                    if usage:
+                                        yield LLMChunk(
+                                            usage=usage,
+                                            native=chunk_json,
+                                        )
                                     continue
                                 choice = choices[0]
                                 delta = choice.get("delta", {})
@@ -418,12 +432,15 @@ class OpenAICompatibleProvider(BaseProvider):
 
                                 if text_delta or reasoning_delta or tool_calls or finish:
                                     saw_payload = True
+                                    if finish:
+                                        finish_emitted = True
                                     yield LLMChunk(
                                         delta_text=text_delta,
                                         delta_reasoning=reasoning_delta,
                                         tool_calls=tool_calls,
                                         finish_reason=finish,
                                         usage=chunk_json.get("usage"),
+                                        native=chunk_json,
                                     )
                         if sse_error_msg is not None:
                             break

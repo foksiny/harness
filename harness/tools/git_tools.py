@@ -110,8 +110,30 @@ class GitDiffTool(Tool):
             out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=10).decode("utf-8")
             if not out.strip():
                 return "No diff changes detected."
-            # Full diff is delivered to the agent untouched; the TUI renderer
-            # truncates only for display.
+            # H6: cap diffs at the context-budget ceiling.
+            if len(out) > 8000:
+                out = out[:4000] + "\n...[middle elided]\n" + out[-3000:]
             return out
         except Exception as ex:
             return f"Git diff error: {str(ex)}"
+
+
+class GitLogTool(Tool):
+    name = "git_log"
+    description = "Recent commit history (git log --oneline)."
+    action_type = "git"
+    is_read_only = True
+    parameters = {"type": "object", "properties": {"limit": {"type": "integer", "default": 20}}}
+
+    def execute(self, limit: int = 20, **kwargs) -> str:
+        try:
+            n = max(1, min(int(limit), 100))
+        except Exception:
+            n = 20
+        try:
+            out = subprocess.check_output(["git", "log", "--oneline", f"-{n}"], stderr=subprocess.STDOUT, timeout=5).decode("utf-8", errors="ignore")
+            return out.strip() or "No commits yet."
+        except subprocess.CalledProcessError as e:
+            return f"Git log error: {e.output.decode('utf-8', errors='ignore')}"
+        except Exception as ex:
+            return f"Git log error: {ex}"

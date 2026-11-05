@@ -212,6 +212,12 @@ class TestThemeCommandIntegration(unittest.TestCase):
         self.assertIn("mine", text)
         self.assertIn("custom", text)
         self.assertIn("built-in", text)
+        # Regression: Rich tags inside Markdown are parsed as links and leak
+        # their closing tag (e.g. "dim[/dim]") into the rendered output.
+        self.assertNotIn("[/dim]", text)
+        self.assertNotIn("[/green]", text)
+        self.assertNotIn("](built-in)", text)
+        self.assertNotIn("](custom)", text)
         delete_custom_theme("mine")
 
     def test_theme_delete_command(self):

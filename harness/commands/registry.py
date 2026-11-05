@@ -100,10 +100,9 @@ def _model_belongs_to_provider(model_name: str, provider: str) -> bool:
     return False
 
 
-# Default sampling temperature: 1.0, the value virtually every provider uses when
-# the parameter is absent. Kept here so the CLI and Discord bot agree on what
-# "reset" means.
-DEFAULT_TEMPERATURE = 1.0
+# Default sampling temperature: 0.3 (focused) for coding reliability.
+# Kept here so the CLI and Discord bot agree on what "reset" means.
+DEFAULT_TEMPERATURE = 0.3
 TEMPERATURE_MIN = 0.0
 TEMPERATURE_MAX = 1.0
 
@@ -139,6 +138,51 @@ def _parse_temperature(raw: str) -> Optional[float]:
 
 
 parse_temperature_arg = _parse_temperature
+
+
+# Valid /effort values. Anything else is rejected with the options list
+# instead of being silently bucketed to "medium" by _level_effort/_level_tokens.
+_EFFORT_OFF = ("off", "none", "false", "disabled", "no", "disable", "stop", "cancel")
+_EFFORT_LEVELS = (
+    "low", "minimal", "light", "brief", "shallow",
+    "medium", "med", "moderate", "normal", "default", "standard",
+    "high", "max", "maximum", "full", "deep", "verbose", "detailed",
+    "extensive", "thorough",
+)
+_EFFORT_CANONICAL = {
+    "none": "off", "false": "off", "disabled": "off", "no": "off",
+    "disable": "off", "stop": "off", "cancel": "off",
+    "minimal": "low", "light": "low", "brief": "low", "shallow": "low",
+    "med": "medium", "moderate": "medium", "normal": "medium",
+    "default": "medium", "standard": "medium",
+    "maximum": "high", "full": "high", "deep": "high", "verbose": "high",
+    "detailed": "high", "extensive": "high", "thorough": "high",
+}
+
+
+def parse_effort_arg(raw: str) -> Optional[str]:
+    """Validate and canonicalize an /effort argument.
+
+    Returns the canonical setting (``off``/``low``/``medium``/``high``/``max``/
+    digits) or ``None`` when invalid. ``max`` is kept distinct from ``high``
+    (some dialects bucket it higher); level synonyms collapse to low/medium/high.
+    """
+    text = (raw or "").strip().lower()
+    if not text:
+        return None
+    if text in _EFFORT_OFF:
+        return "off"
+    if text in ("max",):
+        return "max"
+    if text in _EFFORT_LEVELS:
+        return _EFFORT_CANONICAL.get(text, text)
+    if text.isdigit():
+        return text
+    return None
+
+
+def effort_options_hint() -> str:
+    return "off, low, medium, high, max, or an integer token budget"
 
 
 class CommandContext:
@@ -218,11 +262,13 @@ class CommandRegistry:
         self.register("models", self._cmd_models, "Browse model catalog for current or specific provider.")
         self.register("config", self._cmd_config, "View, get, or set configuration settings.")
         self.register("keys", self._cmd_keys, "Manage, mask, and test provider API keys.")
+        self.register("login", self._cmd_login, "Log in to a provider: /login <openai|claude|openaiauth|claudeauth>. API-key flow for openai/claude; openaiauth/claudeauth open a browser window where you log in with your ChatGPT/claude.ai account (any plan, including free) and the session is captured automatically (manual paste fallback).")
         self.register("setup", self._cmd_setup, "Launch interactive onboarding setup wizard.")
-        self.register("provider", self._cmd_provider, "Switch active LLM provider (16+ supported).")
+        self.register("provider", self._cmd_provider, "Switch active LLM provider (18 supported).")
         self.register("model", self._cmd_model, "Change model name for the active provider.")
         self.register("effort", self._cmd_effort, "Set thinking effort: off, low, medium, high, or token count.")
         self.register("temperature", self._cmd_temperature, "Set model temperature: 0.0 (focused) - 1.0 (creative).")
+        self.register("creative", self._cmd_creative, "Toggle creative mode (divergent→convergent, higher temperature).")
         self.register("todo", self._cmd_todo, "Manage task list: /todo, /todo add <title>, /todo clear.")
         self.register("skills", self._cmd_skills, "List or reload available skills.")
         self.register("reload", self._cmd_reload, "Reload config, skills, and permissions from disk.")
@@ -232,10 +278,13 @@ class CommandRegistry:
         self.register("agents", self._cmd_agents, "Show subagent swarm board (F2).")
         self.register("agent", self._cmd_agent, "Inspect a subagent: /agent <id>.")
         self.register("back", self._cmd_back, "Return to the parent agent view (ESC).")
-        self.register("compact", self._cmd_compact, "Trigger manual conversation context compaction.")
+        self.register("compact", self._cmd_compact, "Trigger manual conversation context compaction (/compact preview for a dry-run).")
         self.register("session", self._cmd_session, "Manage sessions: /session list [all], create [title], delete <id>, rename <id> <title>, fork [title], resume <id>. Sessions are workspace-associated (list shows this folder's; 'all' shows every workspace).")
         self.register("mesh", self._cmd_mesh, "Mesh network: /mesh status, /mesh peers, /mesh send <port> <msg>, /mesh broadcast <msg>.")
         self.register("checkpoint", self._cmd_checkpoint, "Manage checkpoints: /checkpoint list, create [label], undo, redo.")
+        self.register("undo", self._cmd_undo, "Shortcut for /checkpoint undo.")
+        self.register("redo", self._cmd_redo, "Shortcut for /checkpoint redo.")
+        self.register("copy", self._cmd_copy, "Copy the last assistant response to the clipboard.")
         self.register("tokens", self._cmd_tokens, "Display live token metrics, context window ratio, and RAM.")
         self.register("diff", self._cmd_diff, "Show uncommitted git changes.")
         self.register("update", self._cmd_update, "Check for and apply latest updates from Git / PyPI.")
@@ -424,10 +473,14 @@ class CommandRegistry:
             return
 
         if sub == "list":
-            # List all themes with indicators for built-in vs custom
+            # List all themes with indicators for built-in vs custom.
+            # NOTE: this feeds print_markdown (Rich Markdown), so use Markdown
+            # emphasis — never Rich tags like ``[dim](built-in)[/dim]``.
+            # Markdown reads ``[dim](built-in)`` as a link and swallows the
+            # parenthesised text, leaving a literal ``[/dim]`` on screen.
             lines = ["### Available Themes:"]
             for name, theme in sorted(THEMES.items()):
-                marker = "[dim](built-in)[/dim]" if name in BUILTIN_THEME_NAMES else "[green](custom)[/green]"
+                marker = "*(built-in)*" if name in BUILTIN_THEME_NAMES else "**(custom)**"
                 active = " ▶" if name == ctx.agent.config.theme else ""
                 lines.append(f"- `{name}`: {theme.display_name} {marker}{active}")
             ctx.renderer.print_markdown("\n".join(lines))
@@ -598,6 +651,153 @@ class CommandRegistry:
         else:
             ctx.renderer.print_info("Usage: /keys, /keys set <provider> <key>, /keys remove <provider>")
 
+    def _cmd_login(self, ctx: CommandContext):
+        """/login <provider> — API-key flow for openai/claude, web-session flow for openaiauth/claudeauth.
+
+        For ``openai`` and ``claude`` this is the standard API-key login (same
+        storage as ``/keys set``). For ``openaiauth`` and ``claudeauth`` the
+        user pastes the browser session credential (cookie value) that their
+        chatgpt.com / claude.ai web session uses — that makes their existing
+        subscription (any plan, including free) drive Harness.
+        """
+        from getpass import getpass
+
+        prov = ctx.args.strip().lower()
+        if not prov:
+            md = [
+                "### 🔑 /login — provider login",
+                "",
+                "Usage: `/login <provider>`",
+                "",
+                "| Provider | Login type | What to paste |",
+                "|---|---|---|",
+                "| `openai` | API key | OpenAI developer API key (`sk-...`) |",
+                "| `claude` | API key | Anthropic developer API key (`sk-ant-...`) |",
+                "| `openaiauth` | ChatGPT web session | Opens a browser window — log in to chatgpt.com with any account (free tier included) and the session is captured automatically |",
+                "| `claudeauth` | claude.ai web session | Opens a browser window — log in to claude.ai with any account (free tier included) and the session is captured automatically |",
+                "",
+                "After logging in, switch with `/provider <provider>` and chat normally.",
+            ]
+            ctx.renderer.print_markdown("\n".join(md))
+            return
+
+        if prov in ("openai", "claude", "anthropic"):
+            # Standard API-key flow (claude == anthropic alias)
+            target = "anthropic" if prov == "claude" else prov
+            ctx.renderer.print_info(
+                f"Enter your {'Anthropic' if target == 'anthropic' else 'OpenAI'} developer API key "
+                "(input hidden, stored in the secure key store):"
+            )
+            try:
+                key = getpass("API key: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                ctx.renderer.print_warning("Login cancelled.")
+                return
+            if not key:
+                ctx.renderer.print_warning("No key entered — login cancelled.")
+                return
+            ctx.agent.config.set_api_key(target, key)
+            save_config(ctx.agent.config)
+            _publish_state({"key": target, "status": "configured"}, ctx)
+            ctx.renderer.print_success(f"API key saved for {target} ({mask_key(key)}). Switch with: /provider {target}")
+            return
+
+        if prov in ("openaiauth", "claudeauth"):
+            is_openai = prov == "openaiauth"
+            site = "ChatGPT (chatgpt.com)" if is_openai else "claude.ai"
+            ctx.renderer.print_info(
+                f"Logging in with your {site} web session — "
+                "this uses your existing plan (free tier included), NOT a developer API key.\n"
+            )
+            token = self._web_session_login(prov, ctx)
+            if token is None:
+                return  # user cancelled or flow already reported the failure
+            ctx.agent.config.set_api_key(prov, token)
+            save_config(ctx.agent.config)
+            _publish_state({"key": prov, "status": "configured"}, ctx)
+            ctx.renderer.print_success(
+                f"Logged in to {site} ({mask_key(token)}).\n"
+                f"Switch with: /provider {prov}  — then chat normally."
+            )
+            return
+
+        ctx.renderer.print_error(
+            f"Unknown provider '{prov}'. Options: /login openai, /login claude, /login openaiauth, /login claudeauth"
+        )
+
+    def _web_session_login(self, prov: str, ctx: CommandContext) -> Optional[str]:
+        """Run the browser-assisted web-session login, falling back to manual paste.
+
+        Returns the raw session credential, or None when the user cancelled /
+        the flow failed (in which case the user has already been told why).
+        """
+        from getpass import getpass
+        from harness.providers.web_login import capture_session_token, LoginCancelled
+
+        is_openai = prov == "openaiauth"
+
+        # 1. Preferred: pop a browser window on the site, let the user log in
+        #    there, capture the session cookie automatically via CDP.
+        try:
+            token = capture_session_token(
+                prov,
+                progress=lambda line: ctx.renderer.print_info(line.strip()),
+            )
+        except LoginCancelled:
+            ctx.renderer.print_warning("Login cancelled.")
+            return None
+        except Exception as ex:
+            # Browser flow broke (CDP hiccup, Chrome crash, ...): say so and
+            # drop through to the manual paste below instead of failing hard.
+            ctx.renderer.print_warning(f"Browser login unavailable ({ex}).")
+            token = None
+
+        if token:
+            # Cheap liveness check so we never store a dead cookie silently.
+            from harness.providers.web_login import verify_session_token
+            try:
+                if not verify_session_token(prov, token):
+                    ctx.renderer.print_warning(
+                        "Captured session did not verify against the site — it may still work; "
+                        "if you hit 401s later, re-run /login."
+                    )
+            except Exception:
+                pass
+            return token.strip()
+
+        # 2. Fallback: manual paste (no Chrome / no display / browser failed).
+        ctx.renderer.print_markdown(
+            "**Manual fallback — get your session credential:**\n"
+            "1. Open **chatgpt.com** (or **claude.ai**) in your browser and make sure you are logged in.\n"
+            "2. Open DevTools → **Application** tab → **Cookies**.\n"
+            + (
+                "3. Copy the value of the cookie named **`__Secure-next-auth.session-token`**.\n"
+                "4. Paste it below (input hidden; it is stored only in the local secure key store)."
+                if is_openai
+                else "3. Copy the value of the cookie named **`sessionKey`**.\n"
+                "4. Paste it below (input hidden; it is stored only in the local secure key store)."
+            )
+        )
+        try:
+            token = getpass("Session token: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            ctx.renderer.print_warning("Login cancelled.")
+            return None
+        if not token:
+            ctx.renderer.print_warning("No token entered — login cancelled.")
+            return None
+        # Accept either the bare cookie value or a full "name=value" pair
+        # someone copied wholesale; normalize to bare value.
+        if "=" in token and not token.startswith("__Secure"):
+            name, _, val = token.partition("=")
+            if name.strip().lower() in ("sessionkey", "session_key", "cookie"):
+                token = val.strip()
+        elif "=" in token:
+            name, _, val = token.partition("=")
+            if name.strip() == "__Secure-next-auth.session-token":
+                token = val.strip()
+        return token
+
     def _cmd_setup(self, ctx: CommandContext):
         run_setup_wizard(ctx.agent.config, ctx.renderer)
 
@@ -640,7 +840,8 @@ class CommandRegistry:
         ctx.agent.config.model = new_model
         save_config(ctx.agent.config)
         spec = ctx.agent.provider.get_model_spec(new_model)
-        ctx.agent.compactor.context_window = spec.context_window
+        ctx.agent.compactor.rebind(spec.context_window,
+                                   max_message_tokens=ctx.agent.config.compact_max_message_tokens)
         _publish_state({"provider": ctx.agent.provider.name, "model": new_model}, ctx)
         ctx.renderer.print_success(
             f"Switched model to: {new_model}\n"
@@ -648,24 +849,47 @@ class CommandRegistry:
         )
 
     def _cmd_effort(self, ctx: CommandContext):
-        if not ctx.args:
-            current = ctx.agent.config.thinking_effort
-            model = ctx.agent.session.model if ctx.agent.session else ctx.agent.config.model
-            spec = ctx.agent.provider.get_model_spec(model)
-            dialect = spec.thinking_type or "reasoning_effort"
-            budget = dialect in ("budget_tokens", "thinking_budget", "thinking_token_budget")
-            budget_note = " | Budget: set any integer token count" if budget else ""
-            ctx.renderer.print_info(
-                f"Current thinking effort: {current} (dialect: {dialect}{budget_note}). "
-                f"Options: off, low, medium, high, or integer tokens."
-            )
-            return
-        setting = ctx.args.strip()
-        ctx.agent.config.thinking_effort = setting
-        save_config(ctx.agent.config)
         model = ctx.agent.session.model if ctx.agent.session else ctx.agent.config.model
         spec = ctx.agent.provider.get_model_spec(model)
         dialect = spec.thinking_type or "reasoning_effort"
+        if not ctx.args:
+            current = ctx.agent.config.thinking_effort
+            if not spec.supports_thinking:
+                ctx.renderer.print_info(
+                    f"Thinking effort is set to '{current}', but model '{model}' does not "
+                    f"support thinking — the setting is ignored for this model. "
+                    f"Switch to a reasoning model to use it."
+                )
+                return
+            budget = dialect in ("budget_tokens", "thinking_budget", "thinking_token_budget")
+            budget_note = " | Budget: set any integer token count" if budget else ""
+            params = ctx.agent.provider.normalize_thinking_effort(spec, current)
+            ctx.renderer.print_info(
+                f"Current thinking effort: {current} (dialect: {dialect}{budget_note}). "
+                f"Options: {effort_options_hint()}."
+                + (f" Resolves to request params: {params}" if params else " (thinking off)")
+            )
+            return
+        setting = parse_effort_arg(ctx.args.strip().split()[0])
+        if setting is None:
+            ctx.renderer.print_error(
+                f"Invalid effort: '{ctx.args.strip()}'. Use {effort_options_hint()}."
+            )
+            return
+        if not spec.supports_thinking and setting != "off":
+            ctx.renderer.print_warning(
+                f"Saved '{setting}', but model '{model}' does not support thinking — "
+                f"the setting will be ignored until you switch to a reasoning model."
+            )
+        elif setting.isdigit() and dialect not in ("budget_tokens", "thinking_budget", "thinking_token_budget"):
+            from harness.providers.base import BaseProvider
+            level = BaseProvider._level_effort(setting)
+            ctx.renderer.print_warning(
+                f"Note: dialect '{dialect}' takes effort levels, not token counts — "
+                f"{setting} was bucketed to '{level}'. Use low/medium/high/max for precision."
+            )
+        ctx.agent.config.thinking_effort = setting
+        save_config(ctx.agent.config)
         params = ctx.agent.provider.normalize_thinking_effort(spec, setting)
         ctx.renderer.print_success(f"Thinking effort set to: {setting} (dialect: {dialect})")
         if params:
@@ -733,6 +957,17 @@ class CommandRegistry:
                 f"Saved, but not sent on this model: {note['reason']}. {note['hint'].capitalize()}."
             )
         _publish_state({"temperature": parsed}, ctx)
+
+    def _cmd_creative(self, ctx: CommandContext):
+        """Toggle creative (divergent/convergent) sessions (G9)."""
+        arg = (ctx.args or "").strip().lower()
+        cur = bool(getattr(ctx.agent.config, "creative_mode", False))
+        new = not cur if arg not in ("on", "off") else (arg == "on")
+        ctx.agent.config.creative_mode = new
+        save_config(ctx.agent.config)
+        msg = "Creative mode ON (temperature 0.85, diverge→converge + best-of-n)." if new else "Creative mode OFF (focused coding)."
+        ctx.renderer.print_success(msg)
+        _publish_state({"creative_mode": new}, ctx)
 
     def _cmd_todo(self, ctx: CommandContext):
         args = ctx.args.strip()
@@ -888,6 +1123,10 @@ class CommandRegistry:
         if ctx.agent.session is None:
             ctx.renderer.print_warning("No active session to compact. Send a message first.")
             return
+        arg = (ctx.args or "").strip().lower()
+        if arg in ("preview", "dry-run", "dryrun", "status"):
+            self._cmd_compact_preview(ctx)
+            return
         sys_prompt = ctx.agent._build_system_prompt("")
         compacted, stats = ctx.agent.compactor.compact(ctx.agent.session.messages, sys_prompt)
         if not stats.get("compacted"):
@@ -898,12 +1137,17 @@ class CommandRegistry:
 
         tactics = stats.get("tactics", {})
         tactic_desc = []
+        if tactics.get("reasoning_stripped"):
+            tactic_desc.append(f"{tactics['reasoning_stripped']} reasoning block(s) stripped")
         if tactics.get("payloads_truncated"):
             tactic_desc.append(f"{tactics['payloads_truncated']} oversized payload(s) collapsed")
         if tactics.get("groups_summarized"):
             tactic_desc.append(f"{tactics['groups_summarized']} old turn-group(s) summarized")
         if tactics.get("checkpointed"):
-            tactic_desc.append("global checkpoint consolidated")
+            if tactics.get("checkpoint_llm"):
+                tactic_desc.append("global checkpoint consolidated (model-written)")
+            else:
+                tactic_desc.append("global checkpoint consolidated (heuristic fallback)")
         tactic_str = "; ".join(tactic_desc) or "no compression needed"
 
         ctx.renderer.print_success(
@@ -919,6 +1163,52 @@ class CommandRegistry:
                     f"{e['trigger']} -{e['saved_tokens']:,}t" for e in list(reversed(ledger))[:5]
                 )
             )
+
+    def _cmd_compact_preview(self, ctx: CommandContext):
+        """Dry-run compaction on a copy: report projected savings, change nothing."""
+        import copy as _copy
+        sys_prompt = ctx.agent._build_system_prompt("")
+        try:
+            snapshot = _copy.deepcopy(ctx.agent.session.messages)
+        except Exception:
+            snapshot = [dict(m) for m in ctx.agent.session.messages]
+        # Run against an isolated compactor so ledger/hysteresis are untouched.
+        from harness.core.compaction import Compactor
+        live = ctx.agent.compactor
+        probe = Compactor(
+            context_window=live.context_window,
+            threshold_ratio=live.threshold_ratio,
+            target_ratio=live.target_ratio,
+            cap_ratio=live.cap_ratio,
+            preserve_min_turns=live.preserve_min_turns,
+            max_message_tokens=live.max_message_tokens,
+            summarize_fn=None,  # heuristic only: never spend a provider call
+            summary_mode="heuristic",
+        )
+        _, stats = probe.compact(snapshot, sys_prompt)
+        if not stats.get("compacted"):
+            ctx.renderer.print_info(
+                "Preview: nothing to compact — history is below threshold or too short. "
+                "No changes made."
+            )
+            return
+        tactics = stats.get("tactics", {})
+        parts = []
+        if tactics.get("reasoning_stripped"):
+            parts.append(f"{tactics['reasoning_stripped']} reasoning block(s) stripped")
+        if tactics.get("payloads_truncated"):
+            parts.append(f"{tactics['payloads_truncated']} oversized payload(s) collapsed")
+        if tactics.get("groups_summarized"):
+            parts.append(f"{tactics['groups_summarized']} turn-group(s) summarized")
+        if tactics.get("checkpointed"):
+            parts.append("global checkpoint consolidated")
+        ctx.renderer.print_info(
+            f"Preview (heuristic estimate, no changes made — the real run asks "
+            f"the model to write the summaries): {stats.get('before_tokens', 0):,} -> "
+            f"{stats.get('after_tokens', 0):,} tokens "
+            f"(would save {stats.get('saved_tokens', 0):,} / {stats.get('reduction_pct', 0)}%). "
+            f"Tactics: {'; '.join(parts) or 'none'}. Run /compact to apply."
+        )
 
     def _cmd_session(self, ctx: CommandContext):
         parts = ctx.args.split(" ", 1)
@@ -1053,6 +1343,7 @@ class CommandRegistry:
                 "",
                 f"**Budget:** arm @ `{status.threshold_ratio:.0%}`, compact to `{status.target_ratio:.0%}`, cap `{status.cap_ratio:.0%}`",
                 f"Max message before payload truncation: `{ctx.agent.compactor.max_message_tokens:,}` tokens",
+                f"Thinking effort: `{getattr(ctx.agent.config, 'thinking_effort', 'high')}`",
                 f"Compactions this session: `{len(ctx.agent.compactor.ledger)}`",
             ])
         )
@@ -1160,6 +1451,88 @@ class CommandRegistry:
                 ctx.renderer.print_error("Redo failed.")
         else:
             ctx.renderer.print_info("Usage: /checkpoint [list|create [label]|undo [id]|redo [id]]")
+
+    def _cmd_undo(self, ctx: CommandContext):
+        """Shortcut for `/checkpoint undo`."""
+        ctx.args = ctx.args.strip()
+        sub = CommandContext(ctx.agent, ctx.renderer, f"undo {ctx.args}".strip(), queue=ctx.queue)
+        return self._cmd_checkpoint(sub)
+
+    def _cmd_redo(self, ctx: CommandContext):
+        """Shortcut for `/checkpoint redo`."""
+        ctx.args = ctx.args.strip()
+        sub = CommandContext(ctx.agent, ctx.renderer, f"redo {ctx.args}".strip(), queue=ctx.queue)
+        return self._cmd_checkpoint(sub)
+
+    @staticmethod
+    def _copy_to_clipboard(text: str) -> tuple:
+        """Copy text via native clipboard tools, falling back to OSC52.
+
+        Returns (ok, method) where method names the mechanism used.
+        Never raises — returns (False, "") when nothing worked.
+        """
+        import subprocess
+        import shutil
+        import sys
+        # macOS
+        if sys.platform == "darwin" and shutil.which("pbcopy"):
+            try:
+                subprocess.run(["pbcopy"], input=text.encode("utf-8"), timeout=5, check=True)
+                return True, "pbcopy"
+            except Exception:
+                pass
+        # Windows
+        if os.name == "nt":
+            if shutil.which("clip"):
+                try:
+                    subprocess.run(["clip"], input=text.encode("utf-8"), timeout=5, check=True)
+                    return True, "clip"
+                except Exception:
+                    pass
+            try:
+                ps = ("powershell", "-NoProfile", "-Command", "Set-Clipboard")
+                subprocess.run(ps, input=text.encode("utf-8"), timeout=5, check=True)
+                return True, "powershell"
+            except Exception:
+                pass
+        # Linux / BSD: wl-copy (Wayland), xclip, xsel
+        for cmd, args in (("wl-copy", []), ("xclip", ["-selection", "clipboard"]), ("xsel", ["--clipboard", "--input"])):
+            if shutil.which(cmd):
+                try:
+                    subprocess.run([cmd] + args, input=text.encode("utf-8"), timeout=5, check=True)
+                    return True, cmd
+                except Exception:
+                    continue
+        # Last resort: OSC52 escape (works in many modern terminals).
+        try:
+            import base64
+            if sys.stdout.isatty():
+                b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+                sys.stdout.write(f"\033]52;c;{b64}\a")
+                sys.stdout.flush()
+                return True, "osc52"
+        except Exception:
+            pass
+        return False, ""
+
+    def _cmd_copy(self, ctx: CommandContext):
+        """Copy the last assistant response to the clipboard."""
+        session = getattr(ctx.agent, "session", None)
+        messages = getattr(session, "messages", None) or []
+        text = ""
+        for m in reversed(messages):
+            if m.get("role") == "assistant" and m.get("content"):
+                text = str(m["content"]).strip()
+                if text:
+                    break
+        if not text:
+            ctx.renderer.print_warning("Nothing to copy — no assistant response yet this session.")
+            return
+        ok, method = self._copy_to_clipboard(text)
+        if ok:
+            ctx.renderer.print_success(f"Copied last response ({len(text)} chars) via {method}.")
+        else:
+            ctx.renderer.print_error("Clipboard unavailable (no pbcopy/clip/wl-copy/xclip/xsel, non-TTY).")
 
     @staticmethod
     def _checkpoint_navigate(ctx: CommandContext, cp_manager, checkpoint_id: str):

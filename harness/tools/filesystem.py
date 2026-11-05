@@ -44,6 +44,23 @@ class ViewFileTool(Tool):
             return f"Error: File '{path}' does not exist."
         if p.is_dir():
             return f"Error: '{path}' is a directory, not a file. Use list_dir instead."
+        # Binary / image guard: never dump binary via view_file (confusing garbage).
+        if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".mp4", ".pdf", ".zip"):
+            return (
+                f"Error: '{path}' is a binary {p.suffix.lower()} file. view_file cannot read it — "
+                "do NOT use view_file on screenshots. Use computer_screenshot (vision models see the "
+                "image) or computer_ocr (non-vision models) instead."
+            )
+        try:
+            with open(p, "rb") as _f:
+                _head = _f.read(2048)
+            if b"\x00" in _head:
+                return (
+                    f"Error: '{path}' looks like a binary file (NUL bytes detected). "
+                    "view_file cannot read binary — use computer_ocr for screenshots, or a binary-aware tool."
+                )
+        except Exception:
+            pass
 
         try:
             with open(p, "r", encoding="utf-8", errors="replace") as f:
@@ -119,8 +136,11 @@ class EditFileTool(Tool):
                 )
 
             new_content = content.replace(target_content, replacement_content, 1)
-            with open(p, "w", encoding="utf-8") as f:
+            # Atomic write: tmp + replace so a crash never leaves an empty file.
+            tmp_path = p.with_suffix(p.suffix + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(new_content)
+            os.replace(tmp_path, p)
             
             # Record change for checkpoint (store absolute path for reliable undo/redo)
             cp_manager = get_checkpoint_manager()
@@ -160,8 +180,11 @@ class WriteFileTool(Tool):
                     old_content = f.read()
             
             p.parent.mkdir(parents=True, exist_ok=True)
-            with open(p, "w", encoding="utf-8") as f:
+            # Atomic write: tmp + replace so a crash never truncates the file.
+            tmp_path = p.with_name(p.name + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(content)
+            os.replace(tmp_path, p)
             
             # Record change for checkpoint (store absolute path for reliable undo/redo)
             cp_manager = get_checkpoint_manager()
@@ -279,9 +302,13 @@ class DeleteFileTool(Tool):
             return f"Error: '{path}' is a directory, not a file."
 
         try:
-            # Read content before deleting for checkpoint
-            with open(p, "r", encoding="utf-8") as f:
-                old_content = f.read()
+            # Read content before deleting for checkpoint (binary-safe: fall
+            # back to empty string when the file is not UTF-8 text).
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    old_content = f.read()
+            except (UnicodeDecodeError, ValueError):
+                old_content = ""
             
             p.unlink()
             
@@ -292,3 +319,91 @@ class DeleteFileTool(Tool):
             return f"Successfully deleted '{path}'."
         except Exception as ex:
             return f"Error deleting file '{path}': {str(ex)}"
+
+
+class MoveFileTool(Tool):
+    """H8: move/rename files without unconfined shell escape."""
+    name = "move_file"
+    description = "Move or rename a file (workspace-confined)."
+    action_type = "write_file"
+    is_read_only = False
+    parameters = {"type": "object", "properties": {"src": {"type": "string"}, "dst": {"type": "string"}}, "required": ["src", "dst"]}
+
+    def execute(self, src: str, dst: str, **kwargs) -> str:
+        for p, op in ((src, "move"), (dst, "move")):
+            err = _check_boundary(p, op)
+            if err:
+                return err
+        import shutil
+        s, d = Path(src).expanduser().resolve(), Path(dst).expanduser().resolve()
+        if not s.exists():
+            return f"Error: Source '{src}' does not exist."
+        try:
+            d.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(s), str(d))
+            return f"Moved '{src}' -> '{dst}'."
+        except Exception as ex:
+            return f"Error moving file: {ex}"
+
+
+class CopyFileTool(Tool):
+    name = "copy_file"
+    description = "Copy a file (workspace-confined)."
+    action_type = "write_file"
+    is_read_only = False
+    parameters = {"type": "object", "properties": {"src": {"type": "string"}, "dst": {"type": "string"}}, "required": ["src", "dst"]}
+
+    def execute(self, src: str, dst: str, **kwargs) -> str:
+        for p in (src, dst):
+            err = _check_boundary(p, "copy")
+            if err:
+                return err
+        import shutil
+        s, d = Path(src).expanduser().resolve(), Path(dst).expanduser().resolve()
+        if not s.exists():
+            return f"Error: Source '{src}' does not exist."
+        try:
+            d.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(s), str(d))
+            return f"Copied '{src}' -> '{dst}'."
+        except Exception as ex:
+            return f"Error copying file: {ex}"
+
+
+class MkDirTool(Tool):
+    name = "mkdir"
+    description = "Create a directory (workspace-confined)."
+    action_type = "write_file"
+    is_read_only = False
+    parameters = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+
+    def execute(self, path: str, **kwargs) -> str:
+        err = _check_boundary(path, "mkdir")
+        if err:
+            return err
+        try:
+            Path(path).expanduser().resolve().mkdir(parents=True, exist_ok=True)
+            return f"Directory '{path}' ready."
+        except Exception as ex:
+            return f"Error: {ex}"
+
+
+class AppendFileTool(Tool):
+    name = "append_file"
+    description = "Append text to a file, creating it if needed (workspace-confined)."
+    action_type = "write_file"
+    is_read_only = False
+    parameters = {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}
+
+    def execute(self, path: str, content: str, **kwargs) -> str:
+        err = _check_boundary(path, "append")
+        if err:
+            return err
+        try:
+            p = Path(path).expanduser().resolve()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(str(content or ""))
+            return f"Appended {len(str(content or ''))} chars to '{path}'."
+        except Exception as ex:
+            return f"Error: {ex}"

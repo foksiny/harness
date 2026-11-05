@@ -163,29 +163,36 @@ class LearningManager:
             elif lesson_id in self._workspace:
                 self._persist()
 
-    def match(self, query: str, k: int = 3) -> List[Lesson]:
-        """Return top-k lessons whose summary/tags match the query keywords."""
+    def match(self, query: str, k: int = 5) -> List[Lesson]:
+        """Return top-k lessons via tag + file-type + error-type matching (F5)."""
         self._ensure_loaded()
         q = (query or "").lower()
         tokens = [t for t in q.replace("_", " ").split() if len(t) > 2]
         scored = []
+        # Error kinds from F4b ([tool_error: kind]) boost matching lessons.
+        err_kinds = [m.strip() for m in q.split("[tool_error:")[-1].split("]")[0].split(",")] if "[tool_error:" in q else []
+        file_hints = [ext for ext in (".py", ".js", ".ts", ".rs", ".go", ".md", ".toml") if ext in q]
         for lesson in self._all_lessons():
             summary = lesson.summary.lower()
-            tags = " ".join(lesson.tags).lower()
+            tags = [t.lower() for t in (lesson.tags or [])]
             score = 0
             if lesson.summary and any(t in summary for t in tokens):
-                score += 2
-            if any(t in tags for t in tokens):
                 score += 1
-            if lesson.summary.lower() in q:
+            if any(t in " ".join(tags) for t in tokens):
+                score += 2
+            if any(k and k in tags for k in err_kinds):
+                score += 4
+            if any(ext in tags or any(ext in t for t in tags) for ext in file_hints):
+                score += 2
+            if lesson.summary.lower() in q and q:
                 score += 3
             if score > 0:
                 scored.append((score, lesson))
         scored.sort(key=lambda x: (x[0], x[1].hits), reverse=True)
         return [lesson for _, lesson in scored[:k]]
 
-    def format_top(self, query: str = "", max_chars: int = 600) -> str:
-        lessons = self.match(query, k=3)
+    def format_top(self, query: str = "", max_chars: int = 1200) -> str:
+        lessons = self.match(query, k=5)
         if not lessons:
             return ""
         lines = ["Here is a distilled memory of prior lessons relevant to your current task (from this workspace and your global history):"]

@@ -2,10 +2,10 @@
 Harness - The Ultimate Agentic AI Coding & Task Orchestration CLI.
 """
 
-__version__ = "0.10.4"
+__version__ = "0.11.0"
 __author__ = "Harness AI Team"
-__version_info__ = (0, 10, 4)
-__status__ = "beta"  # 0.10.4 (beta)
+__version_info__ = (0, 11, 0)
+__status__ = "beta"  # 0.11.0 (beta)
 
 import os as _os
 import sys as _sys

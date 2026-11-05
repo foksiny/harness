@@ -510,10 +510,11 @@ class BrowserController:
         Network failures are buffered controller-side, so browser_console
         and browser_network see page activity (including initial-load
         errors) without any in-page listeners. Best-effort — never raises.
+        E1: Accessibility + DOM enable the snapshot tree.
         """
         if not self._connected:
             return
-        for method in ("Log.enable", "Network.enable"):
+        for method in ("Log.enable", "Network.enable", "Accessibility.enable", "DOM.enable"):
             try:
                 self._run(self._send(method, {}, timeout=5))
             except Exception:
@@ -1061,3 +1062,51 @@ class BrowserController:
             setTimeout(function() {{ obs.disconnect(); resolve(false); }}, {timeout_ms});
         }})"""
         return bool(self._run(self._eval(js, timeout=timeout_ms / 1000 + 2)))
+
+    # ── E1: snapshot + E4: verification ────────────────────────────────────
+    def snapshot(self, max_elements: int = 80) -> str:
+        """DOM/AX-lite snapshot: interactive elements with refs + selector hints.
+
+        The model references these instead of guessing CSS selectors.
+        Best-effort via Runtime.evaluate (no AX tree dependency).
+        """
+        self._require_connected()
+        js = f"""(function() {{
+          var els = document.querySelectorAll('a,button,input,select,textarea,[role=button],[role=link],[tabindex]');
+          var out = [];
+          for (var i = 0; i < els.length && out.length < {int(max_elements)}; i++) {{
+            var el = els[i];
+            if (el.offsetParent === null && el.type !== 'hidden') continue;
+            var r = el.getBoundingClientRect();
+            if (!r.width || !r.height) continue;
+            var s = null;
+            if (el.id) s = '#' + el.id;
+            else if (el.getAttribute('data-testid')) s = '[data-testid="' + el.getAttribute('data-testid') + '"]';
+            else if (el.getAttribute('aria-label')) s = '[aria-label="' + el.getAttribute('aria-label') + '"]';
+            else s = el.tagName.toLowerCase();
+            out.push({{ref: 'e' + i, role: (el.getAttribute('role') || el.tagName.toLowerCase()),
+                       name: ((el.innerText || el.value || el.getAttribute('aria-label') || el.textContent || '').trim().substring(0, 80)),
+                       x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2),
+                       selector_hint: s}});
+          }}
+          var links = Array.from(document.querySelectorAll('a[href]')).slice(0, 30).map(function(a) {{
+            return {{ref: 'link:' + a.href, role: 'link', name: (a.innerText || '').trim().substring(0, 60), x: 0, y: 0, selector_hint: 'a[href="' + a.getAttribute('href') + '"]'}};
+          }});
+          return JSON.stringify({{title: document.title, url: location.href, elements: out, links: links}});
+        }})()"""
+        try:
+            return str(self._run(self._eval(js)) or "")
+        except Exception as e:
+            return json.dumps({"error": str(e), "elements": [], "links": []})
+
+    def page_state_hash(self) -> str:
+        try:
+            self._require_connected()
+            return str(self._run(self._eval("window.location.href + '|' + document.title + '|' + (document.body ? document.body.innerText.slice(0, 4000) : '')")) or "")
+        except Exception:
+            return ""
+
+    def verify_changed(self, before: str) -> Dict[str, Any]:
+        after = self.page_state_hash()
+        return {"changed": before != after, "url_after": after.split("|")[0] if after else "",
+                "title_after": after.split("|")[1] if "|" in after else ""}

@@ -102,13 +102,13 @@ class PermissionManager:
 
         if self.level == PermissionLevel.SECURE:
             # In Secure mode, read tools are auto-approved; writes/execs always require prompt
-            if action_type in ("read_file", "list_dir", "search", "web_search", "todo", "ask_user", "browser_read"):
+            if action_type in ("read_file", "list_dir", "search", "web_search", "todo", "ask_user", "browser_read", "computer_read"):
                 return True
             prompt_msg = f"Secure Mode requires approval for [{action_type}]: {details.get('summary', str(details))}"
             return self._request_user_approval(prompt_msg, details)
 
         # DEFAULT mode: Balanced
-        if action_type in ("read_file", "list_dir", "search", "web_search", "todo", "ask_user", "browser_read"):
+        if action_type in ("read_file", "list_dir", "search", "web_search", "todo", "ask_user", "browser_read", "computer_read"):
             return True
 
         if action_type == "browser":
@@ -138,13 +138,40 @@ class PermissionManager:
                 return self._request_user_approval(f"Python script contains {risk.value.upper()} risk operations", details)
             return True
 
-        if action_type == "computer_input":
+        if action_type in ("computer_input", "computer"):
             # Desktop input (mouse/keyboard/clipboard) requires approval in DEFAULT
             return self._request_user_approval(
                 f"Computer input requires approval: {details.get('summary', str(details))}", details
             )
 
-        return True
+        if action_type == "browser_evaluate":
+            # E10: arbitrary JS needs its own gate (not blanket browser allow).
+            return self._request_user_approval(
+                f"browser_evaluate (arbitrary JS) requires approval: {details.get('summary', str(details))}", details
+            )
+
+        if action_type == "web_fetch":
+            # Static page reads: allow in DEFAULT, prompt in SECURE already handled.
+            return True
+
+        if action_type == "delete_file":
+            # Destructive and only checkpoint-recoverable — always confirm.
+            target = details.get("path", str(details)[:120])
+            return self._request_user_approval(f"Delete file requires approval: {target}", details)
+
+        # Orchestration / read-only meta tools: no direct filesystem or
+        # shell side effects, safe to auto-allow in DEFAULT (SECURE above
+        # still prompts for all of these).
+        if action_type in ("git", "subagent", "swarm", "skill", "learning",
+                           "control", "mcp", "server", "todo"):
+            return True
+
+        # Unknown future tool: fail closed with a prompt rather than silently
+        # allowing. Non-interactive sessions auto-deny via _request_user_approval.
+        return self._request_user_approval(
+            f"Unknown action [{action_type}] requires approval: {details.get('summary', str(details))[:200]}",
+            details,
+        )
 
     @staticmethod
     def _input_with_echo(prompt: str) -> str:

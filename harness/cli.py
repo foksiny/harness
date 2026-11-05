@@ -507,8 +507,14 @@ def main():
     _maybe_start_server(config, agent=agent, renderer=TerminalRenderer(config.theme, show_thinking=config.terminal_show_thinking) if not full_prompt else None)
 
     if full_prompt:
-        # Non-interactive / Headless single-shot execution
-        renderer = TerminalRenderer(config.theme, show_thinking=config.terminal_show_thinking)
+        # Non-interactive / Headless single-shot execution. When stdout is not
+        # a TTY (piped to a file/another process) skip markdown buffering and
+        # pass provider deltas straight through.
+        renderer = TerminalRenderer(
+            config.theme,
+            show_thinking=config.terminal_show_thinking,
+            raw_stream=not sys.stdout.isatty(),
+        )
         if agent.mode == Mode.SUPER:
             renderer.print_super_banner(full_prompt)
 

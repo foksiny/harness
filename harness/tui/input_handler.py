@@ -12,10 +12,10 @@ from typing import List, Optional, Iterator
 
 SLASH_COMMANDS = [
     "/help", "/goal", "/ultra-goal", "/ultragoal", "/stop", "/queue", "/info", "/sidebar", "/status", "/mode", "/perm", "/theme",
-    "/provider", "/model", "/models", "/config", "/keys", "/setup",
+    "/provider", "/model", "/models", "/config", "/keys", "/login", "/setup",
     "/effort", "/temperature", "/todo", "/skills", "/reload", "/mcp", "/update", "/discord",
     "/subagent", "/agents", "/agent", "/back",
-    "/compact", "/session", "/checkpoint", "/tokens", "/diff", "/clear",
+    "/compact", "/session", "/checkpoint", "/undo", "/redo", "/copy", "/tokens", "/diff", "/clear",
     "/mesh", "/learn", "/exit", "/quit"
 ]
 
@@ -39,6 +39,7 @@ COMMAND_DESCRIPTIONS = {
     "/models": "Browse models catalog with token & thinking specs",
     "/config": "Inspect or modify persistent configuration",
     "/keys": "Manage provider API keys securely",
+    "/login": "Log in: /login <openai|claude|openaiauth|claudeauth> — web-session logins open a browser window (any plan, free included)",
     "/setup": "Run interactive configuration setup wizard",
     "/effort": "Adjust thinking / reasoning effort level",
     "/temperature": "Set model sampling temperature (0.0 - 1.0)",
@@ -53,6 +54,9 @@ COMMAND_DESCRIPTIONS = {
     "/compact": "Trigger proactive context window compaction",
     "/session": "Save, resume, fork, or export session",
     "/checkpoint": "Manage undo/redo checkpoints",
+    "/undo": "Shortcut for /checkpoint undo",
+    "/redo": "Shortcut for /checkpoint redo",
+    "/copy": "Copy last assistant response to clipboard",
     "/tokens": "Inspect token consumption & context budget",
     "/diff": "View git diff of workspace changes",
     "/clear": "Clear terminal screen and redraw HUD",
@@ -68,6 +72,7 @@ VIEW_AGENTS = "agents"
 # Sentinel values returned by get_input() when a keybind is pressed.
 SENTINEL_OPEN_AGENTS = "\x00__OPEN_AGENTS__"
 SENTINEL_BACK = "\x00__BACK__"
+SENTINEL_CLEAR = "\x00__CLEAR__"
 
 
 @contextmanager
@@ -209,7 +214,7 @@ class InputHandler:
         try:
             from prompt_toolkit import PromptSession
             from prompt_toolkit.completion import WordCompleter, Completer, Completion
-            from prompt_toolkit.history import InMemoryHistory
+            from prompt_toolkit.history import FileHistory, InMemoryHistory
             import os
             from pathlib import Path
 
@@ -241,8 +246,14 @@ class InputHandler:
                                 base_dir = Path.cwd() / base_dir
                             try:
                                 if base_dir.is_dir():
+                                    shown = 0
                                     for entry in sorted(base_dir.iterdir(), key=lambda e: e.name):
+                                        if shown >= 100:
+                                            break
                                         entry_name = entry.name
+                                        # Skip hidden files unless explicitly typed
+                                        if entry_name.startswith(".") and not name_part.startswith("."):
+                                            continue
                                         if entry_name.startswith(name_part):
                                             if dir_part:
                                                 display = '@' + dir_part + '/' + entry_name
@@ -251,6 +262,7 @@ class InputHandler:
                                             if entry.is_dir():
                                                 display += '/'
                                             yield Completion(display, start_position=-len(mention))
+                                            shown += 1
                             except Exception:
                                 pass
                             return
@@ -293,6 +305,7 @@ class InputHandler:
                                     ("low", "Low reasoning effort"),
                                     ("medium", "Medium reasoning effort"),
                                     ("high", "High reasoning effort"),
+                                    ("max", "Maximum reasoning effort"),
                                 ],
                                 "/temperature": [
                                     ("0.0", "Lowest randomness — most focused & deterministic"),
@@ -371,6 +384,9 @@ class InputHandler:
                                     ("add", "Add a new task: /todo add <title>"),
                                     ("clear", "Clear completed tasks"),
                                 ],
+                                "/compact": [
+                                    ("preview", "Dry-run: show projected savings without changing history"),
+                                ],
                             }
                             if cmd in arg_options:
                                 for opt, meta in arg_options[cmd]:
@@ -384,7 +400,20 @@ class InputHandler:
                                 return
 
             self._pt_completer = SlashAndMentionCompleter(SLASH_COMMANDS, COMMAND_DESCRIPTIONS)
-            self._pt_history = InMemoryHistory()
+            # Persistent history across runs (~/.harness/history); falls back
+            # to in-memory when the file can't be created (read-only HOME, etc.)
+            try:
+                hist_file = str(Path.home() / ".harness" / "history")
+                Path.home().joinpath(".harness").mkdir(parents=True, exist_ok=True)
+                self._pt_history = FileHistory(hist_file)
+                # Probe writability now so a failure surfaces here, not mid-prompt
+                try:
+                    with open(hist_file, "a", encoding="utf-8"):
+                        pass
+                except Exception:
+                    self._pt_history = InMemoryHistory()
+            except Exception:
+                self._pt_history = InMemoryHistory()
             self._pt_session = PromptSession(completer=self._pt_completer, history=self._pt_history)
             self._has_prompt_toolkit = True
         except ImportError:
@@ -418,6 +447,10 @@ class InputHandler:
             @kb.add(keys.Keys.Escape)
             def _back(event):
                 event.app.exit(result=SENTINEL_BACK)
+
+        @kb.add("c-l")
+        def _clear_screen(event):
+            event.app.exit(result=SENTINEL_CLEAR)
 
         from prompt_toolkit.styles import Style
         pt_style = Style.from_dict({
@@ -460,7 +493,7 @@ class InputHandler:
                 from prompt_toolkit.patch_stdout import patch_stdout
                 with patch_stdout(raw=True):
                     result = session.prompt(prompt_text, **kwargs).strip()
-                if result in (SENTINEL_OPEN_AGENTS, SENTINEL_BACK):
+                if result in (SENTINEL_OPEN_AGENTS, SENTINEL_BACK, SENTINEL_CLEAR):
                     return result
                 return result
             except EOFError:
@@ -504,6 +537,8 @@ class InputHandler:
         """
         if raw == b"\x07":
             return SENTINEL_OPEN_AGENTS
+        if raw == b"\x0c":
+            return SENTINEL_CLEAR
         if raw == b"\x03":
             raise KeyboardInterrupt
         if raw == b"\x04":
@@ -583,6 +618,9 @@ class InputHandler:
                 if b == b"\x07":
                     os.write(out, b"\r\n")
                     return SENTINEL_OPEN_AGENTS
+                if b == b"\x0c":
+                    os.write(out, b"\r\n")
+                    return SENTINEL_CLEAR
                 if b == b"\x03":
                     raise KeyboardInterrupt
                 if b == b"\x04":

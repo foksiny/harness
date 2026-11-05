@@ -44,13 +44,48 @@ def detect_session_type() -> str:
     return "x11"
 
 
+def detect_de() -> str:
+    """Detect the desktop environment (cosmic/gnome/kde/sway/hyprland/...).
+
+    Checks XDG_CURRENT_DESKTOP, then compositor binaries, then distro markers.
+    Returns a lowercase short name ("cosmic", "gnome", ...).
+    """
+    cur = (os.environ.get("XDG_CURRENT_DESKTOP") or "").strip().lower()
+    ses = (os.environ.get("XDG_SESSION_DESKTOP") or "").strip().lower()
+    for cand in (cur, ses):
+        if "cosmic" in cand:
+            return "cosmic"
+        if "gnome" in cand:
+            return "gnome"
+        if "kde" in cand or "plasma" in cand:
+            return "kde"
+        if "sway" in cand:
+            return "sway"
+        if "hyprland" in cand:
+            return "hyprland"
+    if _which("cosmic-comp") or _which("cosmic-screenshot"):
+        return "cosmic"
+    if _which("gnome-shell") and os.path.exists("/usr/bin/gnome-screenshot"):
+        return "gnome"
+    if _which("swaymsg"):
+        return "sway"
+    if _which("hyprctl"):
+        return "hyprland"
+    if _which("kscreen-doctor"):
+        return "kde"
+    return cur.split(":")[0].split(";")[0] or "unknown"
+
+
 def is_wayland() -> bool:
     return bool((os.environ.get("WAYLAND_DISPLAY") or "").strip())
 
 
 def capture_hints() -> List[str]:
     out: List[str] = []
-    if is_wayland():
+    if detect_de() == "cosmic":
+        out.append("COSMIC: cosmic-screenshot is built-in (used automatically)")
+        out.append("fallback: install grim for Wayland screenshot")
+    elif is_wayland():
         out.append("install grim (Wayland screenshot)")
         if not (_which("grim") or _which("grimblast")):
             out.append("grim -- or grimblast for a one-liner")
@@ -62,10 +97,12 @@ def capture_hints() -> List[str]:
 
 def input_hints() -> List[str]:
     out: List[str] = []
+    if detect_de() == "cosmic":
+        out.append("COSMIC (Wayland): input via ydotool (uinput) — no XTEST/xdotool for native windows")
     if is_wayland():
         out.append("install ydotool (Wayland input); needs uinput root or udev rules")
     out.append("install xdotool (X11 input; also works over XWayland)")
-    out.append("install wmctrl (window focus/list; X11)")
+    out.append("wmctrl only lists X11/XWayland windows — empty on COSMIC/Wayland-native apps")
     return out
 
 
@@ -101,33 +138,46 @@ def cli_capture(
             f"+{int(region.get('x', 0))}+{int(region.get('y', 0))}"
         )
 
+    # COSMIC native screencapture first when on COSMIC (portal-based).
+    use_cosmic_first = detect_de() == "cosmic" and _which("cosmic-screenshot")
+
+    def _try_cosmic():
+        out_dir_arg = os.path.dirname(path) or out_dir
+        cmd = ["cosmic-screenshot", "--interactive=false", "--modal=false",
+               "--notify=false", f"--save-dir={out_dir_arg}"]
+        res = _run(cmd)
+        if res and res["rc"] == 0:
+            import glob
+            files = sorted(glob.glob(os.path.join(out_dir_arg, "Screenshot_*.png")),
+                           key=os.path.getmtime, reverse=True)
+            if files:
+                actual = files[0]
+                if actual != path:
+                    os.rename(actual, path)
+                return {"ok": True, "path": path, "backend": "cosmic-screenshot"}
+        err = res["stderr"].strip() if res else "cosmic-screenshot not found"
+        return {"ok": False, "error": f"cosmic-screenshot failed: {err}", "hints": capture_hints()}
+
+    if use_cosmic_first:
+        r = _try_cosmic()
+        if r.get("ok"):
+            return r
+        # Fall through to grim/scrot on COSMIC failure (never abort on one backend).
+
     if _which("grim"):
         args = ["grim", "-g", geom, path] if region and region.get("width") else ["grim", path]
         res = _run(args)
         if res and res["rc"] == 0:
             return {"ok": True, "path": path, "backend": "grim"}
         err = res["stderr"].strip() if res else "grim not found"
-        return {"ok": False, "error": f"grim failed: {err}", "hints": capture_hints()}
+        if not _which("cosmic-screenshot") and not _which("scrot") and not _which("import"):
+            return {"ok": False, "error": f"grim failed: {err}", "hints": capture_hints()}
 
-    # cosmic-screenshot: COSMIC desktop's native Wayland screencapture
-    if _which("cosmic-screenshot"):
-        out_dir_arg = os.path.dirname(path) or out_dir
-        cmd = ["cosmic-screenshot", "--interactive=false", "--modal=false",
-               "--notify=false", f"--save-dir={out_dir_arg}"]
-        res = _run(cmd)
-        if res and res["rc"] == 0:
-            # cosmic-screenshot saves with its own filename pattern — find the newest file
-            import glob
-            files = sorted(glob.glob(os.path.join(out_dir_arg, "Screenshot_*.png")),
-                           key=os.path.getmtime, reverse=True)
-            if files:
-                actual = files[0]
-                # Rename to our expected path
-                if actual != path:
-                    os.rename(actual, path)
-                return {"ok": True, "path": path, "backend": "cosmic-screenshot"}
-        err = res["stderr"].strip() if res else "cosmic-screenshot not found"
-        return {"ok": False, "error": f"cosmic-screenshot failed: {err}", "hints": capture_hints()}
+    # cosmic-screenshot fallback when not on COSMIC (or after COSMIC tried first).
+    if _which("cosmic-screenshot") and not use_cosmic_first:
+        r = _try_cosmic()
+        if r.get("ok"):
+            return r
 
     if _which("scrot"):
         args = [path]
@@ -169,15 +219,29 @@ def cli_input(action: Dict[str, Any]) -> Dict[str, Any]:
         if name == "move":
             cmd = ["xdotool", "mousemove", str(action.get("x", 0)), str(action.get("y", 0))]
         elif name == "click":
-            cmd = ["xdotool", "click", str(action.get("button", "left"))]
-        elif name == "double_click":
-            cmd = ["xdotool", "click", "--repeat", "2", str(action.get("button", "left"))]
+            # D2: honor x/y — move before click (xdotool click alone ignores coords).
+            x, y = action.get("x"), action.get("y")
+            if x is not None and y is not None:
+                cmd = ["xdotool", "mousemove", str(x), str(y), "click", str(action.get("button", "left"))]
+            else:
+                cmd = ["xdotool", "click", str(action.get("button", "left"))]
+        elif name in ("double_click", "double"):
+            x, y = action.get("x"), action.get("y")
+            if x is not None and y is not None:
+                cmd = ["xdotool", "mousemove", str(x), str(y), "click", "--repeat", "2", str(action.get("button", "left"))]
+            else:
+                cmd = ["xdotool", "click", "--repeat", "2", str(action.get("button", "left"))]
         elif name == "scroll":
+            # D2: run xdotool per step (flat cmd list was one broken invocation).
             button = "5" if action.get("direction") == "down" else "4"
-            steps = int(action.get("amount", 1))
-            cmd = []
-            for _ in range(max(1, steps)):
-                cmd += ["xdotool", "click", button]
+            steps = max(1, int(action.get("amount", 1)))
+            for _ in range(steps):
+                res = _run(["xdotool", "click", button])
+                if not res or res["rc"] != 0:
+                    break
+            else:
+                return {"ok": True, "backend": backend}
+            return {"ok": False, "error": f"xdotool scroll failed: {(res and res['stderr'] or '').strip()}"}
         elif name == "type":
             cmd = ["xdotool", "type", "--delay", "12", str(action.get("text", ""))]
         elif name == "key":
@@ -195,29 +259,61 @@ def cli_input(action: Dict[str, Any]) -> Dict[str, Any]:
 
     if _which("ydotool"):
         backend = "ydotool"
-        if name == "click":
+        if name == "move":
+            cmd = ["ydotool", "mousemove", str(action.get("x", 0)), str(action.get("y", 0))]
+        elif name in ("click", "double_click", "double"):
+            x, y = action.get("x"), action.get("y")
+            if x is not None and y is not None:
+                # ydotool click alone doesn't move the cursor first.
+                mv = _run(["ydotool", "mousemove", str(x), str(y)])
+                if mv is None or mv.get("rc") != 0:
+                    return {"ok": False, "error": f"ydotool mousemove failed: {(mv and mv['stderr'] or '').strip()}"}
+            if name in ("double_click", "double"):
+                return {"ok": False,
+                        "error": ("ydotool has no double-click — issue two clicks 100ms apart via computer_act steps."),
+                        "hints": input_hints()}
             cmd = ["ydotool", "click", str(_ydotool_button(action.get("button", "left")))]
         elif name == "type":
             cmd = ["ydotool", "type", str(action.get("text", ""))]
         elif name == "key":
             cmd = ["ydotool", "key", str(action.get("key", ""))]
         elif name in ("combo", "keys"):
-            keys = action.get("keys") or []
-            cmd = ["ydotool", "key", *[str(k) for k in keys]]
+            # ydotool key wants a single "+"-joined sequence, not separate args.
+            parts = [str(k) for k in (action.get("keys") or []) if str(k)]
+            cmd = ["ydotool", "key", "+".join(parts)] if parts else ["ydotool", "key"]
+        elif name == "scroll":
+            return {"ok": False,
+                    "error": "ydotool cannot scroll (buttons 4/5 unsupported) — use computer_type Page_Down or a scrollable target.",
+                    "hints": input_hints()}
+        elif name in ("drag", "hscroll"):
+            return {"ok": False,
+                    "error": f"ydotool cannot {name} — use move + key/type fallbacks on Wayland.",
+                    "hints": input_hints()}
         else:
-            return {"ok": False, "error": f"unsupported ydotool action '{name}'"}
+            # Never claim unsupported actions (e.g. `ydotool search`) exist.
+            return {"ok": False, "error": f"unsupported ydotool action '{name}'",
+                    "hints": input_hints()}
         res = _run(cmd)
         if res and res["rc"] == 0:
             return {"ok": True, "backend": backend}
         return {"ok": False, "error": f"ydotool {name} failed: "
-                                        f"{(res and res['stderr'] or '').strip()}"}
+                                        f"{(res and res['stderr'] or '').strip()}. "
+                                        f"(ydotool needs ydotoold/uinput perms on Wayland.)",
+                "hints": input_hints()}
 
     return {"ok": False, "error": "no input CLI (xdotool/ydotool) available",
             "hints": input_hints()}
 
 
 def cli_window(op: str, **kwargs: Any) -> Dict[str, Any]:
-    """Window introspection/focus via wmctrl + xdotool."""
+    """Window introspection/focus via wmctrl + xdotool.
+
+    On Wayland native sessions (COSMIC, Sway, Hyprland) wmctrl/xdotool only see
+    XWayland windows — COSMIC apps like Discord (ozone Wayland) are invisible
+    to them, so an empty list is expected, not a bug. There is no generic
+    Wayland window-list protocol without compositor export; degrade with DE-
+    aware guidance + a process fallback instead of flailing.
+    """
     if op == "list":
         if _which("wmctrl"):
             res = _run(["wmctrl", "-l"])
@@ -228,9 +324,18 @@ def cli_window(op: str, **kwargs: Any) -> Dict[str, Any]:
                     if len(parts) >= 4:
                         windows.append({"id": parts[0], "desktop": parts[1],
                                         "title": parts[3]})
-                return {"ok": True, "windows": windows, "backend": "wmctrl"}
+                de = detect_de()
+                note = (
+                    f" ({len(windows)} X11/XWayland window(s); {de} Wayland-native apps are NOT visible to wmctrl)"
+                    if is_wayland() else ""
+                )
+                return {"ok": True, "windows": windows,
+                        "backend": "wmctrl",
+                        "de": de, "session": detect_session_type(),
+                        "note": note.strip() or None,
+                        "fallback": "screenshot + computer_ocr to identify focused app" if is_wayland() else None}
         return {"ok": False, "error": "wmctrl unavailable for window list",
-                "hints": ["install wmctrl"]}
+                "hints": ["install wmctrl (X11 only)", "on COSMIC/Wayland use screenshot + OCR — native windows have no wmctrl IDs"]}
     if op == "focus":
         wid = kwargs.get("window_id")
         if not wid:

@@ -48,10 +48,18 @@ DEFAULT_OUTPUT_LIMITS: Dict[str, int] = {
     "list_dir": 4000,
     "execute_python": 16000,
     "exa_search": 8000,
+    "web_fetch": 12000,
     "read_skill": 12000,
     "spawn_swarm": 12000,
     "spawn_subagent": 12000,
+    "git_diff": 8000,
+    "list_skills": 8000,
+    "browser_snapshot": 12000,
+    "browser_get_page_info": 8000,
 }
+
+# Hard ceiling: no single tool result may exceed this regardless of max_chars.
+HARD_OUTPUT_CEILING = 64000
 
 
 # --------------------------------------------------------------------------
@@ -168,21 +176,27 @@ class ContextBudget:
     def truncate_output(self, tool_name: str, result: str, max_chars: Optional[int] = None) -> str:
         """Clamp ``result`` to the tool's cap (or an explicit override).
 
-        A trailing marker preserves transparency so the model knows output was
-        deliberately elided rather than truncated mid-string. An explicit
-        ``max_chars`` always wins — the agent can request more when it needs the
-        full payload.
+        Head+tail truncation keeps failure tails (stack traces, assertion errors)
+        which live at the end of run_command output. An explicit ``max_chars``
+        wins, but never beyond HARD_OUTPUT_CEILING — the budget cannot be
+        defeated in one call.
         """
         if not isinstance(result, str):
             result = str(result)
         cap = max_chars if max_chars is not None else self.get_output_limit(tool_name)
-        if cap <= 0 or len(result) <= cap:
+        if cap <= 0:
+            cap = HARD_OUTPUT_CEILING
+        cap = min(cap, HARD_OUTPUT_CEILING)
+        if len(result) <= cap:
             return result
+        head = cap // 2
+        tail = cap - head
         marker = (
             f"\n...[output truncated by context budget: was {len(result)} chars, "
-            f"keeping first {cap}]...\n(or pass max_chars=N to this tool for the full result)"
+            f"keeping head+tail {cap}; middle elided]...\n"
+            f"(or pass max_chars=N up to {HARD_OUTPUT_CEILING} for more)"
         )
-        return result[:cap] + marker
+        return result[:head] + marker + result[-tail:]
 
 
 def _canonical_tool(name: str) -> str:
@@ -191,10 +205,16 @@ def _canonical_tool(name: str) -> str:
 
 
 def truncate_output(result: str, max_chars: int, marker_note: Optional[str] = None) -> str:
-    """Standalone helper: clamp ``result`` to ``max_chars`` (0 == unlimited)."""
-    if max_chars <= 0 or not isinstance(result, str) or len(result) <= max_chars:
+    """Standalone helper: clamp to ``max_chars`` head+tail (0 == ceiling)."""
+    if not isinstance(result, str):
+        return result
+    cap = max_chars if max_chars > 0 else HARD_OUTPUT_CEILING
+    cap = min(cap, HARD_OUTPUT_CEILING)
+    if len(result) <= cap:
         return result
     note = marker_note or (
-        f"...[output truncated: was {len(result)} chars, keeping first {max_chars}]..."
+        f"...[output truncated: was {len(result)} chars, keeping head+tail {cap}; middle elided]..."
     )
-    return result[:max_chars] + "\n" + note
+    head = cap // 2
+    tail = cap - head
+    return result[:head] + "\n" + note + "\n" + result[-tail:]

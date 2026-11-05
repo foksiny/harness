@@ -69,8 +69,8 @@ class TestTemperatureParsing(unittest.TestCase):
             self.assertIsNone(parse_temperature_arg(bad), bad)
 
     def test_default_temperature_is_one(self):
-        self.assertEqual(DEFAULT_TEMPERATURE, 1.0)
-        self.assertEqual(HarnessConfig().temperature, 1.0)
+        self.assertEqual(DEFAULT_TEMPERATURE, 0.3)
+        self.assertEqual(HarnessConfig().temperature, 0.3)
 
 
 class TestClampTemperature(unittest.TestCase):

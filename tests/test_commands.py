@@ -22,6 +22,9 @@ class DummyRenderer(TerminalRenderer):
     def print_success(self, msg: str):
         self.messages.append(("success", msg))
 
+    def print_warning(self, msg: str):
+        self.messages.append(("warning", msg))
+
     def print_info(self, msg: str):
         self.messages.append(("info", msg))
 
@@ -93,6 +96,82 @@ class TestCommands(unittest.TestCase):
         saved = self._saved_config_json()
         self.assertEqual(saved["provider"], "openrouter")
         self.assertEqual(saved["model"], self.agent.config.model)
+
+    def test_login_command_usage_and_unknown(self):
+        # No args -> usage help mentioning all four login targets
+        self.registry.handle("/login", self.agent, self.renderer)
+        md = [m for tag, m in self.renderer.messages if tag == "markdown"]
+        self.assertTrue(md and "openaiauth" in md[0] and "claudeauth" in md[0])
+        # Unknown provider -> error
+        self.registry.handle("/login gemini", self.agent, self.renderer)
+        errors = [m for tag, m in self.renderer.messages if tag == "error"]
+        self.assertTrue(any("Unknown provider" in m for m in errors))
+
+    def _mock_browser_unavailable(self):
+        """Patch the browser login flow to 'unavailable' so tests exercise the manual paste fallback.
+
+        Without this the /login web-session tests would pop a REAL Chrome window
+        and poll for a real login (up to 600s).
+        """
+        from unittest import mock as _mock
+        return _mock.patch("harness.providers.web_login.capture_session_token", return_value=None)
+
+    def test_login_openaiauth_stores_session_token(self):
+        import harness.secure_store as ss
+        from unittest import mock as _mock
+        with self._mock_browser_unavailable(), \
+             _mock.patch("getpass.getpass", return_value="  tok-web-123  "):
+            self.registry.handle("/login openaiauth", self.agent, self.renderer)
+        # Stored (trimmed) and retrievable through the standard key path
+        self.assertEqual(self.agent.config.api_keys.get("openaiauth"), "tok-web-123")
+        successes = [m for tag, m in self.renderer.messages if tag == "success"]
+        self.assertTrue(any("/provider openaiauth" in m for m in successes))
+
+    def test_login_openaiauth_browser_flow_stores_captured_token(self):
+        # Preferred path: browser captures the cookie -> no getpass involved
+        from unittest import mock as _mock
+        with _mock.patch("harness.providers.web_login.capture_session_token",
+                         return_value="tok-captured-by-browser"), \
+             _mock.patch("harness.providers.web_login.verify_session_token", return_value=True):
+            self.registry.handle("/login openaiauth", self.agent, self.renderer)
+        self.assertEqual(self.agent.config.api_keys.get("openaiauth"), "tok-captured-by-browser")
+        successes = [m for tag, m in self.renderer.messages if tag == "success"]
+        self.assertTrue(any("Logged in to ChatGPT" in m for m in successes))
+
+    def test_login_claudeauth_normalizes_full_cookie_paste(self):
+        from unittest import mock as _mock
+        with self._mock_browser_unavailable(), \
+             _mock.patch("getpass.getpass", return_value="sessionKey=sk-ant-sid-abc"):
+            self.registry.handle("/login claudeauth", self.agent, self.renderer)
+        # "sessionKey=<value>" pastes are normalized to the bare value
+        self.assertEqual(self.agent.config.api_keys.get("claudeauth"), "sk-ant-sid-abc")
+
+    def test_login_openaiauth_normalizes_full_cookie_paste(self):
+        from unittest import mock as _mock
+        with self._mock_browser_unavailable(), \
+             _mock.patch("getpass.getpass", return_value="__Secure-next-auth.session-token=abc.def"):
+            self.registry.handle("/login openaiauth", self.agent, self.renderer)
+        self.assertEqual(self.agent.config.api_keys.get("openaiauth"), "abc.def")
+
+    def test_login_api_key_flow_untouched(self):
+        # /login claude must behave like the classic API-key login
+        from unittest import mock as _mock
+        with _mock.patch("getpass.getpass", return_value="sk-ant-api03-test"):
+            self.registry.handle("/login claude", self.agent, self.renderer)
+        self.assertEqual(self.agent.config.api_keys.get("anthropic"), "sk-ant-api03-test")
+        # /login openai also stores a plain API key
+        with _mock.patch("getpass.getpass", return_value="sk-openai-test"):
+            self.registry.handle("/login openai", self.agent, self.renderer)
+        self.assertEqual(self.agent.config.api_keys.get("openai"), "sk-openai-test")
+
+    def test_login_empty_input_cancels(self):
+        from unittest import mock as _mock
+        with self._mock_browser_unavailable(), \
+             _mock.patch("getpass.getpass", return_value=""):
+            self.registry.handle("/login openaiauth", self.agent, self.renderer)
+        self.assertNotIn("openaiauth", self.agent.config.api_keys)
+        warns = [m for tag, m in self.renderer.messages if tag == "warning"]
+        self.assertTrue(any("cancelled" in m.lower() for m in warns))
 
     def test_model_command_persists_to_config(self):
         self.cfg.provider = "mock"

@@ -201,6 +201,7 @@ class AnthropicProvider(BaseProvider):
             if getattr(self, "_abort_gen", 0) != abort_gen:
                 return
             saw_payload = False
+            finish_emitted = False
             tool_blocks.clear()
             try:
                 # httpx streams each SSE line the moment its bytes arrive
@@ -236,6 +237,20 @@ class AnthropicProvider(BaseProvider):
                                             current_tool_id = block.get("id")
                                             current_tool_name = block.get("name")
                                             current_tool_idx = b_idx
+                                            # Announce the tool the moment the
+                                            # native block starts (before any
+                                            # input_json_delta arrives) so the
+                                            # UI can show what is being built.
+                                            saw_payload = True
+                                            yield LLMChunk(
+                                                tool_calls=[ToolCallDelta(
+                                                    index=b_idx,
+                                                    id=block.get("id"),
+                                                    name=block.get("name"),
+                                                    arguments_delta="",
+                                                )],
+                                                native=ev,
+                                            )
 
                                     elif ev_type == "content_block_delta":
                                         delta = ev.get("delta", {})
@@ -243,10 +258,10 @@ class AnthropicProvider(BaseProvider):
 
                                         if dtype == "text_delta":
                                             saw_payload = True
-                                            yield LLMChunk(delta_text=delta.get("text", ""))
+                                            yield LLMChunk(delta_text=delta.get("text", ""), native=ev)
                                         elif dtype == "thinking_delta":
                                             saw_payload = True
-                                            yield LLMChunk(delta_reasoning=delta.get("thinking", ""))
+                                            yield LLMChunk(delta_reasoning=delta.get("thinking", ""), native=ev)
                                         elif dtype == "input_json_delta":
                                             saw_payload = True
                                             b_idx = ev.get("index", current_tool_idx)
@@ -257,16 +272,29 @@ class AnthropicProvider(BaseProvider):
                                                     id=tb.get("id", current_tool_id),
                                                     name=tb.get("name", current_tool_name),
                                                     arguments_delta=delta.get("partial_json", ""),
-                                                )]
+                                                )],
+                                                native=ev,
                                             )
 
                                     elif ev_type == "message_delta":
                                         delta = ev.get("delta", {})
                                         saw_payload = True
+                                        stop_reason = delta.get("stop_reason")
+                                        if stop_reason:
+                                            finish_emitted = True
                                         yield LLMChunk(
-                                            finish_reason=delta.get("stop_reason"),
+                                            finish_reason=stop_reason,
                                             usage=ev.get("usage"),
+                                            native=ev,
                                         )
+
+                                    elif ev_type == "message_stop":
+                                        # Normally message_delta already carried
+                                        # the stop reason; only synthesize a
+                                        # finish when the stream never did.
+                                        if not finish_emitted:
+                                            finish_emitted = True
+                                            yield LLMChunk(finish_reason="stop", native=ev)
 
                                 except Exception:
                                     continue

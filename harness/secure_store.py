@@ -48,11 +48,22 @@ def _save_file_store(data: dict) -> None:
     KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
     # Write with restrictive permissions (create new or truncate)
     fd = os.open(str(KEYS_FILE), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, KEYS_FILE_PERMS)
+    f = None
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        f = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None  # ownership transferred to f; only f may close it now
+        json.dump(data, f, indent=2)
+        f.close()
+        f = None
     except Exception:
-        os.close(fd)
+        # Close whichever handle still owns the fd (fdopen may have failed).
+        try:
+            if f is not None:
+                f.close()
+            elif fd is not None:
+                os.close(fd)
+        except OSError:
+            pass
         raise
     # Enforce permissions on existing files (in case umask was wrong)
     KEYS_FILE.chmod(KEYS_FILE_PERMS)
@@ -112,14 +123,15 @@ def remove_key(provider: str) -> bool:
     return removed
 
 
-def migrate_plaintext_keys(api_keys: dict) -> None:
+def migrate_plaintext_keys(api_keys: dict) -> bool:
     """One-time migration: move plaintext keys from config into secure store.
 
     Call this after loading config.json. Any keys in `api_keys` dict that
     are not yet in the secure store get migrated and cleared from the dict.
+    Returns True when at least one key was migrated.
     """
     if not api_keys:
-        return
+        return False
     kr = _get_keyring()
     file_store = _load_file_store()
     changed = False

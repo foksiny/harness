@@ -344,8 +344,16 @@ KNOWN_MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "together/qwen-2.5-coder-32b-instruct": _E(128000, 8192, False, vision=False),
     "together/deepseek-v4-pro": _E(1048576, 16384, True, vision=False,
                                    ttype="reasoning_toggle", reasoning_options=["reasoning_toggle"]),
-    "moonshotai/kimi-k3": _E(1048576, 16384, True, vision=False,
+    "moonshotai/kimi-k3": _E(1048576, 16384, True, vision=True, video=True,
                              reasoning_options=["reasoning_toggle", "reasoning_effort", "reasoning_object"]),
+    "moonshotai/kimi-k3.1-pro": _E(1048576, 943718, True, vision=True, video=True,
+                                   reasoning_options=["reasoning_toggle", "reasoning_effort", "reasoning_object"]),
+    "kimi-k3.1-pro": _E(1048576, 943718, True, vision=True, video=True,
+                         reasoning_options=["reasoning_toggle", "reasoning_effort", "reasoning_object"]),
+    "moonshotai/kimi-k3.1": _E(1048576, 943718, True, vision=True, video=True,
+                               reasoning_options=["reasoning_toggle", "reasoning_effort", "reasoning_object"]),
+    "kimi-k3.1": _E(1048576, 943718, True, vision=True, video=True,
+                    reasoning_options=["reasoning_toggle", "reasoning_effort", "reasoning_object"]),
     "zai-org/glm-5.2": _E(524288, 16384, True, vision=False,
                           reasoning_options=["reasoning_toggle", "reasoning_effort"]),
     "z-ai/glm-5.3": _E(1310720, 16384, True, vision=False,
@@ -360,6 +368,18 @@ KNOWN_MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
                                  reasoning_options=["reasoning_toggle", "reasoning_effort"]),
     "minimaxai/minimax-m3": _E(524288, 16384, True, vision=False,
                                reasoning_options=["reasoning_toggle", "reasoning_effort"]),
+    "minimaxai/minimax-m3.1": _E(524288, 16384, True, vision=False,
+                                 reasoning_options=["reasoning_toggle", "reasoning_effort"]),
+    "minimax-m3.1": _E(524288, 16384, True, vision=False,
+                       reasoning_options=["reasoning_toggle", "reasoning_effort"]),
+    "minimaxai/minimax-m3.1-flash": _E(131072, 16384, True, vision=False,
+                                       reasoning_options=["reasoning_effort"]),
+    "minimax-m3.1-flash": _E(131072, 16384, True, vision=False,
+                             reasoning_options=["reasoning_effort"]),
+    "minimaxai/minimax-m3-flash": _E(131072, 16384, True, vision=False,
+                                     reasoning_options=["reasoning_effort"]),
+    "minimax-m3-flash": _E(131072, 16384, True, vision=False,
+                           reasoning_options=["reasoning_effort"]),
 
     # ─── OpenRouter GPT-OSS (also on Groq / Together) ────────────────────────
     "openai/gpt-oss-120b": _E(131072, 65536, True, vision=True),
@@ -377,27 +397,57 @@ def _lookup_registry(model_name: str) -> Optional[Dict[str, Any]]:
     Handles OpenRouter ``provider/model:tag`` names, bare model names, and
     dashed-vs-dotted alias families. No fuzzy/prefix matching on arbitrary
     substrings — the id must actually be known.
+
+    Backed by a lazily-built O(1) index over every accepted key form (rebuilt
+    if the registry dict changes size, so runtime edits never go stale).
     """
+    return _lookup_registry_entry(model_name)
+
+
+# Lazily-built normalized index: every accepted key spelling -> entry.
+# Rebuilt whenever the registry size changes so runtime edits never go stale.
+_REGISTRY_INDEX: Dict[str, Dict[str, Any]] = {}
+_REGISTRY_INDEX_SIZE: int = -1
+
+# Sentinel distinguishing "no pre-resolved entry" from "resolved to None".
+_UNSET: Any = object()
+
+
+def _rebuild_registry_index() -> None:
+    global _REGISTRY_INDEX, _REGISTRY_INDEX_SIZE
+    index: Dict[str, Dict[str, Any]] = {}
+    for k, v in KNOWN_MODEL_REGISTRY.items():
+        kl = k.lower()
+        index[kl] = v
+        index[kl.replace(".", "-")] = v
+        base = kl.split("/")[-1]
+        index.setdefault(base, v)
+        index.setdefault(base.replace(".", "-"), v)
+    _REGISTRY_INDEX = index
+    _REGISTRY_INDEX_SIZE = len(KNOWN_MODEL_REGISTRY)
+
+
+def _lookup_registry_entry(model_name: str) -> Optional[Dict[str, Any]]:
+    """O(1) exact-id lookup against the bundled catalog (see _lookup_registry)."""
+    global _REGISTRY_INDEX_SIZE
     name = (model_name or "").strip().lower()
     if not name:
         return None
+    if _REGISTRY_INDEX_SIZE != len(KNOWN_MODEL_REGISTRY):
+        _rebuild_registry_index()
     name_base = name.split(":")[0]
-
-    # Pass 1: exact match (preferred).
+    hit = _REGISTRY_INDEX.get(name) or _REGISTRY_INDEX.get(name_base)
+    if hit is not None:
+        return hit
+    # Suffix match for OpenRouter provider/model patterns
+    # ("together/llama-3.3-70b" -> bare entry and vice versa).
+    base = name_base.split("/")[-1]
+    hit = _REGISTRY_INDEX.get(base)
+    if hit is not None:
+        return hit
     for k, v in KNOWN_MODEL_REGISTRY.items():
         kl = k.lower()
-        if name == kl or name_base == kl or name == kl.replace(".", "-") or name_base == kl.replace(".", "-"):
-            return v
-
-    # Pass 2: suffix/prefix match (OpenRouter provider/model patterns).
-    for k, v in KNOWN_MODEL_REGISTRY.items():
-        kl = k.lower()
-        if (
-            name.endswith(f"/{kl}")
-            or name_base.endswith(f"/{kl}")
-            or kl.endswith(f"/{name}")
-            or kl.endswith(f"/{name_base}")
-        ):
+        if name.endswith(f"/{kl}") or kl.endswith(f"/{name}") or kl.endswith(f"/{name_base}"):
             return v
     return None
 
@@ -435,7 +485,9 @@ PROVIDER_FALLBACKS: Dict[str, Dict[str, Any]] = {
     "gemini":     {"context": 1048576, "thinking": True,  "vision": True,  "video": True},
     "google":     {"context": 1048576, "thinking": True,  "vision": True,  "video": True},
     "anthropic":  {"context": 200000,  "thinking": True,  "vision": True,  "video": True},
+    "claudeauth": {"context": 200000,  "thinking": True,  "vision": True,  "video": True},
     "openai":     {"context": 128000,  "thinking": True,  "vision": True,  "video": False},
+    "openaiauth": {"context": 128000,  "thinking": True,  "vision": True,  "video": False},
     "xai":        {"context": 131072,  "thinking": True,  "vision": True,  "video": False},
     "openrouter": {"context": 128000,  "thinking": False, "vision": False, "video": False},
     "together":   {"context": 131072,  "thinking": False, "vision": False, "video": False},
@@ -456,9 +508,11 @@ PROVIDER_FALLBACKS: Dict[str, Dict[str, Any]] = {
 # uses when a model advertises thinking but no server mechanism pinned it.
 PROVIDER_DIALECTS: Dict[str, str] = {
     "anthropic": "budget_tokens",
+    "claudeauth": "budget_tokens",
     "gemini": "thinking_budget",
     "google": "thinking_budget",
     "openai": "reasoning_effort",
+    "openaiauth": "reasoning_effort",
     "xai": "reasoning_effort",
     "mistral": "reasoning_effort",
     "groq": "reasoning_effort",
@@ -495,6 +549,9 @@ def _provider_dialect(thinking_type: Optional[str], name: str, provider: str,
     nlow = (name or "").lower()
     if prov == "together" and any(x in nlow for x in ("kimi-k3", "kimi_k3", "glm-5.2", "glm_5.2", "minimax-m2", "minimax-m3", "minimax_m2", "minimax_m3")):
         return "reasoning_toggle"
+    if prov in ("nvidia", "nim") and thinking_type == "reasoning_toggle":
+        # NIM rejects the toggle dialect — convert to its native effort dialect.
+        return "reasoning_effort"
     if prov in PROVIDER_DIALECTS:
         return PROVIDER_DIALECTS[prov]
     if thinking_type:
@@ -502,16 +559,19 @@ def _provider_dialect(thinking_type: Optional[str], name: str, provider: str,
     return "reasoning_effort"
 
 
-def detect_context_window(model_name: str, provider: str = "") -> int:
+def detect_context_window(model_name: str, provider: str = "",
+                          _entry: Any = _UNSET) -> int:
     """Resolve a model's context window, newest metadata first.
 
     Catalog entry -> literal token-count suffix in the id -> provider fallback
     -> conservative universal default. Never guesses from model *family*.
+    ``_entry`` is an internal fast path: a pre-resolved catalog entry so
+    ``inspect_model`` pays for one lookup instead of five.
     """
     name = (model_name or "").strip()
     name_base = (name or "").lower().split(":")[0]
 
-    entry = _lookup_registry(name)
+    entry = _lookup_registry(name) if _entry is _UNSET else _entry
     if entry is not None and entry.get("context"):
         return int(entry["context"])
 
@@ -526,26 +586,25 @@ def detect_context_window(model_name: str, provider: str = "") -> int:
     return FALLBACK_CONTEXT
 
 
-def detect_thinking_support(model_name: str, provider: str = "") -> Tuple[bool, Optional[str]]:
+def detect_thinking_support(model_name: str, provider: str = "",
+                            _entry: Any = _UNSET) -> Tuple[bool, Optional[str]]:
     """Resolve thinking support + request dialect for any model id.
 
     Catalog pin -> literal reasoning marker in the id -> provider fallback.
     The dialect comes from the provider (or the catalog pin), never from the
-    model family name.
+    model family name. ``_entry`` is an internal fast path (see
+    ``detect_context_window``).
     """
     name = (model_name or "").strip().lower()
     prov = (provider or "").lower().strip()
 
-    # NVIDIA NIM does not expose Together-style hybrid toggle models as reasoning
-    # models. Generic hybrid ids (kimi-k3, glm-5.2, minimax-m2/m3) are flagged
-    # as thinking only for providers that actually host them as reasoning models.
-    if prov in ("nvidia", "nim") and any(x in name for x in ("kimi-k3", "kimi_k3", "glm-5.2", "glm_5.2", "minimax-m2", "minimax-m3", "minimax_m2", "minimax_m3")):
-        # z-ai glm-5.3 family IS hosted on NIM as thinking via chat_template_kwargs
-        # (don't blanket-disable that family).
-        if "glm-5.3" not in name:
-            return False, None
-
-    entry = _lookup_registry(model_name)
+    entry = _lookup_registry(model_name) if _entry is _UNSET else _entry
+    # NVIDIA NIM rejects the Together-style reasoning_toggle dialect, but it
+    # DOES accept reasoning_effort for these families (incl. minimax-m3.x and
+    # glm-5.3 via chat_template_kwargs). Only the toggle dialect is disabled
+    # on NIM — never blanket-disable thinking-capable models there.
+    if prov in ("nvidia", "nim") and entry is not None:
+        pass  # fall through: _provider_dialect maps NIM -> reasoning_effort
     if entry is not None:
         thinking = bool(entry["thinking"])
         if not thinking:
@@ -588,15 +647,17 @@ def detect_temperature_support(model_name: str, provider: str = "") -> bool:
     return True
 
 
-def detect_vision_support(model_name: str, provider: str = "") -> bool:
+def detect_vision_support(model_name: str, provider: str = "",
+                          _entry: Any = _UNSET) -> bool:
     """Resolve vision-language (image input) support for any model id.
 
     Catalog pin -> literal modality marker in the id -> provider fallback -> False.
+    ``_entry`` is an internal fast path (see ``detect_context_window``).
     """
     name = (model_name or "").lower().strip()
     prov = (provider or "").lower().strip()
 
-    entry = _lookup_registry(model_name)
+    entry = _lookup_registry(model_name) if _entry is _UNSET else _entry
     if entry is not None and entry.get("vision") is not None:
         return bool(entry["vision"])
 
@@ -617,12 +678,13 @@ def detect_vision_support(model_name: str, provider: str = "") -> bool:
 VIDEO_CAPABLE_PROVIDERS = ("gemini", "google", "anthropic", "nvidia", "nim")
 
 
-def _model_supports_video(model_name: str, provider: str) -> bool:
+def _model_supports_video(model_name: str, provider: str,
+                          _entry: Any = _UNSET) -> bool:
     """Video input follows the same data-driven tiers as vision."""
     name = (model_name or "").lower().strip()
     prov = (provider or "").lower().strip()
 
-    entry = _lookup_registry(model_name)
+    entry = _lookup_registry(model_name) if _entry is _UNSET else _entry
     if entry is not None and entry.get("video") is not None:
         return bool(entry["video"])
 
@@ -641,10 +703,14 @@ def inspect_model(model_name: str, provider: str = "") -> ModelSpec:
     Network-free: bundled catalog + literal markers + provider fallbacks +
     universal default. Live provider metadata is merged on top by
     ``discovery.resolve_model_spec_dynamic``.
+
+    The catalog is looked up exactly once and the entry is shared across all
+    capability detectors (previously five linear scans per call).
     """
     clean_name = (model_name or "").strip()
-    context = detect_context_window(clean_name, provider)
-    supports_thinking, thinking_type = detect_thinking_support(clean_name, provider)
+    entry = _lookup_registry(clean_name)
+    context = detect_context_window(clean_name, provider, _entry=entry)
+    supports_thinking, thinking_type = detect_thinking_support(clean_name, provider, _entry=entry)
 
     entry = _lookup_registry(clean_name)
 
@@ -681,8 +747,8 @@ def inspect_model(model_name: str, provider: str = "") -> ModelSpec:
         supports_thinking=supports_thinking,
         thinking_type=thinking_type,
         supports_tools=True,
-        supports_vision=detect_vision_support(clean_name, provider),
-        supports_video=_model_supports_video(clean_name, provider),
+        supports_vision=detect_vision_support(clean_name, provider, _entry=entry),
+        supports_video=_model_supports_video(clean_name, provider, _entry=entry),
         supports_temperature=detect_temperature_support(clean_name, provider),
         reasoning_options=reasoning_options,
         source=source,

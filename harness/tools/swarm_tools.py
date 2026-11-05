@@ -38,6 +38,9 @@ class SpawnSwarmTool(Tool):
                         },
                         "task": {"type": "string", "description": "Precise task prompt with acceptance criteria and expected output format."},
                         "agent_id": {"type": "string", "description": "Optional unique id other agents can address messages to (defaults to <type>_<n>)."},
+                        "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Agent ids whose results must arrive before this one starts."},
+                        "paths": {"type": "array", "items": {"type": "string"}, "description": "Files this agent owns (never shared with another worker)."},
+                        "todo_id": {"type": "integer", "description": "Optional todo id to bind this worker to."},
                     },
                     "required": ["agent_type", "task"],
                 },
@@ -46,20 +49,31 @@ class SpawnSwarmTool(Tool):
                 "type": "boolean",
                 "description": "Run in background (default true). Set to false to block until all agents finish.",
             },
+            "preset": {
+                "type": "string",
+                "description": "Topology preset: research-build-verify | parallel-coders | debate (overrides agents if set).",
+            },
         },
-        "required": ["agents"],
+        "required": [],
     }
 
     def __init__(self, orchestrator: SubagentOrchestrator):
         self.orchestrator = orchestrator
 
-    def execute(self, agents: List[Dict[str, Any]], background: bool = True, **kwargs) -> str:
+    def execute(self, agents: List[Dict[str, Any]] = None, background: bool = True,
+                preset: str = "", **kwargs) -> str:
+        if preset:
+            from harness.core.swarm_presets import get_preset
+            p = get_preset(preset)
+            if p is None:
+                return f"Error: unknown preset '{preset}'."
+            agents = list(p["agents"])
         if not isinstance(agents, list) or not agents:
-            return "Error: `agents` must be a non-empty list of {agent_type, task} objects."
+            return "Error: `agents` must be a non-empty list of {agent_type, task} objects (or set `preset`)."
         result = self.orchestrator.launch_swarm(agents, background=background)
         if background:
             lines = [f"=== SWARM SPAWNED ({len(agents)} agents) ==="]
-            lines.append(f"Status: {result.status} | Running in background")
+            lines.append(f"Status: {result.status} | Running in background run={getattr(result, 'run_id', '?')}")
             lines.append("The swarm is processing in the background. You can continue working.")
             lines.append("Use `swarm_read_messages` to check inter-agent communication.")
             lines.append("=" * 50)
@@ -84,6 +98,9 @@ class SwarmSendMessageTool(Tool):
                 "description": "Target agent_id, 'all' to broadcast to every swarm agent, or 'main' for the parent agent.",
             },
             "message": {"type": "string", "description": "The message body to deliver."},
+            "payload_json": {"type": "string", "description": "Optional JSON structured handoff payload."},
+            "artifacts_json": {"type": "string", "description": "Optional JSON array of artifact file paths."},
+            "requires_ack": {"type": "boolean", "description": "Ask the recipient to ack this handoff."},
         },
         "required": ["recipient", "message"],
     }
@@ -91,11 +108,43 @@ class SwarmSendMessageTool(Tool):
     def __init__(self, orchestrator: SubagentOrchestrator):
         self.orchestrator = orchestrator
 
-    def execute(self, recipient: str, message: str, **kwargs) -> str:
+    def execute(self, recipient: str, message: str, payload_json: str = "",
+                artifacts_json: str = "", requires_ack: bool = False, **kwargs) -> str:
+        import json as _json
         recipient = str(recipient or "all").strip()
-        msg = self.orchestrator.post_message(recipient, message)
+        payload = None
+        artifacts = []
+        if payload_json:
+            try:
+                payload = _json.loads(payload_json)
+            except Exception:
+                payload = {"raw": payload_json}
+        if artifacts_json:
+            try:
+                artifacts = list(_json.loads(artifacts_json))
+            except Exception:
+                artifacts = []
+        msg = self.orchestrator.post_message(recipient, message, payload=payload,
+                                             artifacts=artifacts, requires_ack=requires_ack)
         target = "ALL" if recipient == "all" else recipient
         return f"Message #{msg.id} from {msg.sender} -> {target} posted to swarm bus."
+
+
+class SwarmAckTool(Tool):
+    name = "swarm_ack"
+    description = "Acknowledge a swarm handoff message by id."
+    action_type = "swarm"
+    is_read_only = False
+    parameters = {"type": "object", "properties": {"message_id": {"type": "integer"}}, "required": ["message_id"]}
+
+    def __init__(self, orchestrator: SubagentOrchestrator):
+        self.orchestrator = orchestrator
+
+    def execute(self, message_id: int, **kwargs) -> str:
+        bus = getattr(self.orchestrator, "bus", None)
+        if bus is None:
+            return "No bus."
+        return f"Acked #{message_id}." if bus.ack(int(message_id)) else f"Message #{message_id} not found."
 
 
 class SwarmReadMessagesTool(Tool):

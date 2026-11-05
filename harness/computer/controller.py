@@ -62,8 +62,14 @@ def _probe_env() -> Dict[str, Any]:
     display = env.get("DISPLAY", "")
     wayland = env.get("WAYLAND_DISPLAY", "")
     session = detect_session_type()
+    try:
+        from harness.computer.wayland_utils import detect_de
+        de = detect_de()
+    except Exception:
+        de = "unknown"
     return {
         "session": session,
+        "de": de,
         "display": display,
         "wayland_display": wayland,
         "xtest": bool(xtest_available()),
@@ -73,9 +79,11 @@ def _probe_env() -> Dict[str, Any]:
             "scrot": bool(shutil.which("scrot")),
             "import": bool(shutil.which("import")),
             "gnome_screenshot": bool(shutil.which("gnome-screenshot")),
+            "cosmic_screenshot": bool(shutil.which("cosmic-screenshot")),
             "xdotool": bool(shutil.which("xdotool")),
             "ydotool": bool(shutil.which("ydotool")),
             "wmctrl": bool(shutil.which("wmctrl")),
+            "tesseract": bool(shutil.which("tesseract")),
             "xclip": bool(shutil.which("xclip")),
             "wl_paste": bool(shutil.which("wl-paste")),
         },
@@ -202,7 +210,7 @@ def _default_input_exec(action: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
-_XTEST_ACTIONS = {"move", "click", "drag", "scroll", "type", "key", "keys", "combo", "keyup", "keydown", "button"}
+_XTEST_ACTIONS = {"move", "click", "double", "double_click", "drag", "scroll", "type", "key", "keys", "combo", "keyup", "keydown", "button"}
 
 
 def _apply_xtest(session: Any, action: Dict[str, Any]) -> Dict[str, Any]:
@@ -313,6 +321,14 @@ class ComputerController:
         result = self.capture_backend(region, monitor_index, out_dir)
         if result.get("ok"):
             self._latest_capture_path = result.get("image_path") or result.get("path")
+            # D2: normalize to one shape {ok, image_path, width, height, monitors, backend}
+            result["image_path"] = self._latest_capture_path
+            if result.get("path") and not result.get("image_path"):
+                result["image_path"] = result["path"]
+            result.setdefault("width", result.get("width") or 0)
+            result.setdefault("height", result.get("height") or 0)
+            result.setdefault("monitors", result.get("monitors") or [])
+            result.setdefault("backend", result.get("backend") or "default")
         return result
 
     def latest_capture(self) -> Optional[str]:

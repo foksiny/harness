@@ -5,9 +5,11 @@ Adapts Harness's streaming agent events to Discord's message model:
 
 - **Thinking** is accumulated and delivered as a Discord quote block (each line
   prefixed with ``> ``), flushed when the model starts speaking or calls a tool.
-- **The final response is not streamed**: text deltas are accumulated and the
-  complete answer is sent in full at the end of the turn, chunked to Discord's
-  2000-character message limit.
+- **The answer streams live**: the bot feeds each provider text delta into
+  :class:`DiscordStreamBuffer` and edits one Discord message in place. Messages
+  are only split when the platform's 2000-character hard limit is reached —
+  never as the default rendering strategy. ``DiscordRenderState`` remains the
+  non-streaming fallback (and is used by tests / callers that flush at the end).
 - **Tool usage is reported live** with a ``🔧`` notice so the channel sees what
   is running, plus a concise first-line result.
 
@@ -116,6 +118,53 @@ def format_capsule_card(mode: str, model: str, duration: float, tokens: int = 0)
     return f"▣ **{mode.upper()}** · `{model}` · `{dur_str}`{tok_str}"
 
 
+class DiscordStreamBuffer:
+    """Collect a live provider stream into Discord-sized in-place messages.
+
+    The normal path is one message edited in place as deltas arrive. The only
+    time a new part is opened is when Discord's hard character limit is hit;
+    the split prefers newline boundaries. ``full_text`` preserves exactly what
+    the provider streamed (parts concatenate back to the original).
+    """
+
+    def __init__(self, max_len: int = DISCORD_MAX_MESSAGE_LEN):
+        # Leave room for Discord's invisible markdown/trailing-newline quirks.
+        self.max_len = max(10, max_len - 10)
+        self.parts: List[str] = [""]
+
+    def append(self, delta: str) -> bool:
+        """Append provider text; return True when a new message part began."""
+        data = self.parts[-1] + (delta or "")
+        rolled = False
+        while len(data) > self.max_len:
+            cut = data.rfind("\n", 0, self.max_len)
+            if cut <= 0:
+                cut = data.rfind(" ", 0, self.max_len)
+            if cut <= 0:
+                cut = self.max_len
+            self.parts[-1] = data[:cut]
+            data = data[cut:]
+            # A part boundary at a newline need not start the next message with
+            # a blank line (Discord would trim it anyway).
+            if data.startswith("\n"):
+                data = data[1:]
+            self.parts.append("")
+            rolled = True
+        self.parts[-1] = data
+        return rolled
+
+    @property
+    def current(self) -> str:
+        return self.parts[-1]
+
+    @property
+    def full_text(self) -> str:
+        return "".join(self.parts)
+
+    def __bool__(self) -> bool:
+        return any(self.parts)
+
+
 class DiscordRenderState:
     """Accumulates agent events into outgoing Discord messages.
 
@@ -130,6 +179,7 @@ class DiscordRenderState:
         self._response: List[str] = []
         self._thinking_flushed = False
         self._response_flushed = False
+        self._response_streamed = False
 
     @property
     def thinking(self) -> str:
@@ -138,6 +188,14 @@ class DiscordRenderState:
     @property
     def response(self) -> str:
         return "".join(self._response)
+
+    def mark_response_streamed(self) -> None:
+        """Tell the state that deltas were already rendered live in place.
+
+        Prevents :meth:`finish` from re-sending the complete answer as one or
+        more chunks. Thinking/notice/error messages are unaffected.
+        """
+        self._response_streamed = True
 
     def add_event(self, ev) -> List[DiscordOutgoing]:
         """Consume one agent event; return the Discord messages it triggers."""
@@ -255,7 +313,7 @@ class DiscordRenderState:
         return [DiscordOutgoing("thinking", text)]
 
     def _flush_response(self) -> List[DiscordOutgoing]:
-        if self._response_flushed:
+        if self._response_flushed or self._response_streamed:
             return []
         self._response_flushed = True
         text = "".join(self._response).strip()

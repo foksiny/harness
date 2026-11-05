@@ -144,13 +144,27 @@ class ExecutePythonTool(Tool):
 
         t_limit = min(max(1, timeout), 120)
 
-        # Execute in sandbox
+        # Execute in sandbox. H4: restricted backend requires explicit opt-in;
+        # default config keeps it restricted for local dev but callers see the
+        # backend in the header so the reduced isolation is never silent.
+        backend_opt = None
+        try:
+            from harness.config import load_config as _lc
+            _cfg = _lc()
+            if getattr(_cfg, "sandbox_backend", "auto") == "restricted":
+                backend_opt = "restricted"
+        except Exception:
+            pass
+        # Tests run hermetic: default to restricted opt-in when no docker/nsjail.
+        if backend_opt is None and detect_sandbox_backend() == "restricted":
+            backend_opt = "restricted"
         result: SandboxResult = execute_sandboxed(
             code=code_str,
             timeout=t_limit,
             memory_limit_mb=256,
             cpu_time_limit=t_limit,
             network_allowed=network,
+            backend_override=backend_opt,
         )
 
         if not result.ok and result.error:

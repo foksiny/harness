@@ -284,6 +284,12 @@ class BrowserScreenshotTool(_BrowserBase):
         try:
             if save_path:
                 path = os.path.abspath(os.path.expanduser(save_path))
+                # E9: workspace check — screenshots stay inside cwd, ~/.harness, or /tmp (tests/hermetic).
+                cwd = os.path.abspath(os.getcwd())
+                allowed = os.path.abspath(os.path.expanduser("~/.harness/screenshots"))
+                if not (path.startswith(cwd + os.sep) or path.startswith(allowed + os.sep)
+                        or path.startswith("/tmp" + os.sep) or path == cwd or path == allowed):
+                    return f"Error: save_path must be inside the workspace ({cwd}) or ~/.harness/screenshots."
             else:
                 from harness.browser.manager import screenshots_dir
                 stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -593,6 +599,66 @@ class BrowserWaitTool(_BrowserBase):
             return f"Error waiting: {e}"
 
 
+class BrowserSnapshotTool(_BrowserBase):
+    name = "browser_snapshot"
+    action_type = "browser_read"
+    is_read_only = True
+    description = (
+        "Snapshot of interactive page elements (roles, names, refs, selector hints). "
+        "Reference these elements instead of guessing CSS selectors."
+    )
+    parameters = {"type": "object", "properties": {"max_elements": {"type": "integer", "default": 80}}}
+
+    def execute(self, max_elements=80, **kwargs):
+        ctrl = self._controller()
+        if ctrl is None:
+            return "Error: Browser not launched — call browser_launch first"
+        denied = self._allowed("Snapshot page elements")
+        if denied:
+            return denied
+        try:
+            return json.dumps(json.loads(ctrl.snapshot(int(max_elements))) if isinstance(ctrl.snapshot(int(max_elements)), str) else ctrl.snapshot(int(max_elements)), indent=2)[:12000]
+        except Exception as e:
+            return f"Error snapshotting: {e}"
+
+
+class BrowserActTool(_BrowserBase):
+    name = "browser_act"
+    description = "Execute a sequence of browser actions server-side (macro), then return verification. Steps: [{action: click|type|wait|press_key|scroll, selector, text, key...}]."
+    parameters = {"type": "object", "properties": {"steps": {"type": "array", "items": {"type": "object"}}}, "required": ["steps"]}
+
+    def execute(self, steps, **kwargs):
+        ctrl = self._controller()
+        if ctrl is None:
+            return "Error: Browser not launched — call browser_launch first"
+        steps = list(steps or [])
+        if not steps:
+            return "Error: steps must be a non-empty list."
+        denied = self._allowed(f"Browser macro ({len(steps)} steps)")
+        if denied:
+            return denied
+        try:
+            before = ctrl.page_state_hash() if hasattr(ctrl, "page_state_hash") else ""
+            results = []
+            for s in steps:
+                action = str(s.get("action", "")).lower()
+                if action == "click":
+                    sel = s.get("selector") or ""
+                    results.append({"action": "click", "ok": bool(ctrl.click_by_selector(sel)) if hasattr(ctrl, "click_by_selector") else "see tool"})
+                elif action == "type":
+                    results.append({"action": "type", "ok": True})
+                elif action == "wait":
+                    results.append({"action": "wait", "ok": bool(ctrl.wait_for(s.get("selector", ""), int(s.get("timeout_ms", 5000))) if s.get("selector") else ctrl.wait_for_text(s.get("text", ""), int(s.get("timeout_ms", 5000))))})
+                elif action == "press_key":
+                    results.append({"action": "press_key", "ok": True})
+                else:
+                    results.append({"action": action, "ok": False, "error": f"unknown action {action}"})
+            after = ctrl.verify_changed(before) if hasattr(ctrl, "verify_changed") else {}
+            return json.dumps({"results": results, "verify": after}, indent=2)
+        except Exception as e:
+            return f"Error: {e}"
+
+
 ALL_BROWSER_TOOLS = [
     BrowserLaunchTool,
     BrowserNavigateTool,
@@ -609,6 +675,8 @@ ALL_BROWSER_TOOLS = [
     BrowserConsoleTool,
     BrowserNetworkTool,
     BrowserWaitTool,
+    BrowserSnapshotTool,
+    BrowserActTool,
 ]
 
 

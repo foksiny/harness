@@ -65,8 +65,18 @@ class HarnessAgent:
         # Debounce heuristic auto-learning so at most one learned lesson is
         # captured per session.
         self._auto_learned_session = None
-        self.mcp_manager = MCPManager(self.tool_registry)
-        self.mcp_manager.load_and_connect()
+        self.mcp_manager = MCPManager(
+            self.tool_registry,
+            lazy=True,
+            timeout=float(getattr(config, "mcp_timeout", 10.0) or 10.0),
+            enabled=bool(getattr(config, "mcp_enabled", True)),
+        )
+        # H5: read config now, connect lazily on first use (ensure_connected).
+        try:
+            self.mcp_manager.get_configured_servers()
+            self.mcp_manager._pending_servers = self.mcp_manager._filter_servers(self.mcp_manager.get_configured_servers())
+        except Exception:
+            pass
 
         # Initialize checkpoint manager
         self.checkpoint_manager = get_checkpoint_manager()
@@ -131,6 +141,15 @@ class HarnessAgent:
             parent_mode=self.mode,
             interactive_deny_fn=lambda deny: setattr(self.permission_manager, "interactive_deny", deny),
         )
+        self.subagent_orchestrator.set_todo_manager(self.todo_manager)
+        self.subagent_orchestrator.max_subagents = int(getattr(config, "max_subagents", 4) or 4)
+        self.subagent_orchestrator.max_swarm_size = int(getattr(config, "max_swarm_size", 8) or 8)
+        self.subagent_orchestrator.timeout_seconds = int(getattr(config, "timeout_seconds", 120) or 120)
+        self.subagent_orchestrator._semaphore = threading.BoundedSemaphore(self.subagent_orchestrator.max_subagents)
+        try:
+            self.subagent_orchestrator._parent_effort = getattr(config, "thinking_effort", "high")
+        except Exception:
+            pass
 
     def emit(self, event_type: str, data: Any = None):
         if self.event_callback:
@@ -169,6 +188,7 @@ class HarnessAgent:
         "ls", "cat", "cd", "pwd", "echo", "find", "grep", "rg", "head",
         "tail", "wc", "which", "whoami", "stat", "file", "du", "df",
         "printenv", "type", "less", "more", "uname", "id", "date", "tree",
+        "ps", "top", "jobs", "env", "history", "lsof", "free", "uptime",
     })
     _READ_ONLY_GIT_SUBCOMMANDS = ("status", "diff", "log", "show", "branch")
     _COMMAND_MUTATION_MARKERS = (
@@ -202,6 +222,76 @@ class HarnessAgent:
         if first not in self._READ_ONLY_COMMAND_WORDS:
             return False
         return not any(m in lowered for m in self._COMMAND_MUTATION_MARKERS)
+
+    # ── Tool-result classification (F4b) + verification tracking (G1) ──
+    _MUTATING_TOOLS = frozenset({
+        "write_file", "edit_file", "delete_file", "run_command", "execute_python",
+        "spawn_subagent", "spawn_swarm", "computer_click", "computer_type",
+        "computer_act", "computer_drag", "computer_scroll", "computer_key",
+        "computer_combo", "computer_clipboard_write",
+    })
+
+    def _is_mutating_call(self, tool_name: str, args: Dict[str, Any]) -> bool:
+        """True only for writes that change state. Read-only run_command
+        (ps/ls/cat/which/grep...) is exploration, not a mutation — otherwise
+        every `ps` triggers the false 'mutation without plan' nudge."""
+        if tool_name not in self._MUTATING_TOOLS:
+            return False
+        if tool_name == "run_command":
+            cmd = str((args or {}).get("command", "")).strip().lower()
+            if not cmd:
+                return False
+            # Pipes of read-only tools (ps | grep | head) are exploration.
+            # Only count as mutation if the command clearly writes/changes state.
+            mutation_markers = (
+                ">", "rm ", " mv ", " cp ", "mkdir", "touch ", "tee ", "chmod", "chown",
+                "sed -i", "python", "pip install", "npm install", "git commit",
+                "git push", "git checkout -b", ">>", "sed ", "awk ", "node ", "docker ",
+            )
+            # Bare '>' (redirect) mutates; '|' alone does not.
+            if any(m in cmd for m in mutation_markers):
+                return True
+            return False
+        return True
+    _VERIFICATION_TOOLS = frozenset({
+        "run_command", "execute_python", "spawn_subagent", "spawn_swarm",
+        "git_diff", "browser_screenshot", "computer_screenshot",
+    })
+
+    @staticmethod
+    def _classify_tool_result(tool_name: str, args: Dict[str, Any], result: str) -> str:
+        """Prefix error results with a machine-readable kind (F4b)."""
+        low = (result or "").strip().lower()
+        if not low.startswith("error"):
+            return result
+        if "not found" in low or "no such" in low or "does not exist" in low:
+            kind = "not_found"
+        elif "permission" in low or "denied" in low or "forbidden" in low or "approval" in low:
+            kind = "permission"
+        elif "test" in low or "fail" in low or "assert" in low or "traceback" in low:
+            kind = "test_failure"
+        elif "timeout" in low or "timed out" in low:
+            kind = "timeout"
+        elif "invalid" in low or "argument" in low or "required" in low:
+            kind = "invalid_args"
+        else:
+            kind = "error"
+        return f"[tool_error: {kind} tool={tool_name}] {result}\nWhat does this tell you? Name the cause, then your next action (retry differently, fix args, or report blocker)."
+
+    @staticmethod
+    def _is_verification_call(tool_name: str, args: Dict[str, Any]) -> bool:
+        """Did this tool call actually verify something (not just mutate)?"""
+        if tool_name in ("execute_python", "git_diff"):
+            return True
+        if tool_name == "run_command":
+            cmd = str((args or {}).get("command", "")).lower()
+            return any(k in cmd for k in ("pytest", "npm test", "cargo test", "go test", "python -m unittest", "tsc", "eslint", "ruff", "vitest", "jest", "mvn test", "gradle test", "build", "run ", "smoke"))
+        if tool_name in ("spawn_subagent", "spawn_swarm"):
+            blob = str(args or "").lower()
+            return any(k in blob for k in ("tester", "reviewer", "test", "verify", "review"))
+        if tool_name in ("browser_screenshot", "computer_screenshot"):
+            return True
+        return False
 
     def _stream_interruptible(self, stream_factory: Callable[[], Iterator[LLMChunk]]) -> Iterator[LLMChunk]:
         """Yield provider chunks while staying responsive to stop requests.
@@ -318,9 +408,12 @@ class HarnessAgent:
             self.session.model = new_model
         self.subagent_orchestrator.model = new_model
         model_spec = self.provider.get_model_spec(new_model)
-        self.compactor.context_window = model_spec.context_window
-        if self.config.compact_max_message_tokens == 0:
-            self.compactor.max_message_tokens = int(model_spec.context_window * 0.15)
+        # Rebind resets the hysteresis gauge for the new window; max cap 0
+        # means "auto" (15% of the new window), else the configured value.
+        self.compactor.rebind(
+            model_spec.context_window,
+            max_message_tokens=self.config.compact_max_message_tokens,
+        )
         self.context_budget.rebind(
             context_window=model_spec.context_window,
             threshold_ratio=self.config.compact_threshold,
@@ -340,6 +433,8 @@ class HarnessAgent:
         mode: Optional[Mode] = None,
         agent_id: Optional[str] = None,
         agent_type: Optional[str] = None,
+        thinking_effort: Optional[str] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> tuple[str, int]:
         """Subagent runner executing with isolated conversation context.
 
@@ -360,6 +455,14 @@ class HarnessAgent:
         provider = provider_factory() if provider_factory else self.provider
         effective_model = model or (self.session.model if self.session is not None else self.config.model)
         exec_mode = mode if mode is not None else Mode.BUILD
+        # Per-role effort: quality-critical roles inherit parent effort; researcher/planner stay cheap.
+        _role_effort = {
+            "coder": None, "tester": None, "reviewer": None,  # inherit parent (None -> self.config)
+            "researcher": "low", "planner": "low", "general": "low",
+        }
+        if thinking_effort is None:
+            thinking_effort = _role_effort.get((agent_type or "general").lower(), "low")
+        effective_effort = thinking_effort or getattr(self.config, "thinking_effort", "high")
 
         def _finish_report(summary: str) -> tuple[str, int]:
             report = summary.strip()
@@ -368,6 +471,10 @@ class HarnessAgent:
             return report, turns
 
         for _ in range(max_turns):
+            if cancel_event is not None and cancel_event.is_set():
+                return _finish_report(accumulated_output + "\n[Cancelled by parent]")
+            if self._stop_requested.is_set():
+                return _finish_report(accumulated_output + "\n[Interrupted]")
             turns += 1
             text_acc = ""
             tool_calls_acc: Dict[int, Dict[str, Any]] = {}
@@ -382,7 +489,7 @@ class HarnessAgent:
             for chunk in provider.stream_chat(
                 messages=sub_messages,
                 model=effective_model,
-                thinking_effort="low",
+                thinking_effort=effective_effort,
                 tools=schemas if schemas else None,
                 system_prompt=system_prompt,
             ):
@@ -414,6 +521,12 @@ class HarnessAgent:
 
             for v in tool_calls_acc.values():
                 tname = v["name"]
+                # A4: enforce allowed-tools at execution — hallucinated tools never run.
+                if tname not in allowed_tools and tname != "finish":
+                    res = f"Error: Tool '{tname}' is not allowed for this subagent role. Allowed: {', '.join(allowed_tools)}"
+                    action_log.append(f"- {tname} => BLOCKED (not in role allow-list)")
+                    sub_messages.append({"role": "tool", "tool_call_id": v["id"], "name": tname, "content": res})
+                    continue
                 if tname == "finish":
                     try:
                         fargs = json.loads(v["arguments"]) if v["arguments"] else {}
@@ -427,6 +540,14 @@ class HarnessAgent:
                 except Exception:
                     args = {}
                 res = self.tool_registry.execute(tname, args, exec_mode)
+                # F4b: classify tool errors so the worker (and auto-learner) sees the kind, not just "Error".
+                res = self._classify_tool_result(tname, args, str(res))
+                # A8: bound worker context growth — collapse oversized old payloads.
+                if len(sub_messages) > 20:
+                    for _m in sub_messages[:-4]:
+                        _c = _m.get("content")
+                        if isinstance(_c, str) and len(_c) > 4000:
+                            _m["content"] = _c[:2000] + "\n...[collapsed for subagent budget]...\n" + _c[-1000:]
 
                 # Live visibility + durable record of everything the worker does.
                 if tname == "swarm_send_message":
@@ -759,6 +880,20 @@ class HarnessAgent:
         self.is_running = True
         self.clear_stop()
         tools_executed_this_turn = 0
+        # G1/G3 turn tracking: verification evidence, mutations, finish rejections.
+        turn_mutation_seen = False
+        turn_verification_seen = False
+        turn_finish_rejections = 0
+        turn_plan_seen = False
+        turn_steps_without_progress = 0
+        turn_escalated = False
+        turn_review_done = False
+        turn_error_streak = 0
+        # J3: quality telemetry for this turn.
+        telemetry = {"verification_actions": 0, "finish_rejections": 0, "escalations": 0, "compactions": 0}
+        self._last_telemetry = telemetry  # type: ignore[attr-defined]
+        # C3: progressive vs redundant exploration (track files seen read-only).
+        exploration_files_seen: set = set()
         # End-of-turn outcome for desktop notifications. "interrupted" is the
         # default so a user Ctrl-C never pings the user who just pressed it.
         turn_outcome: Dict[str, Any] = {"type": "interrupted"}
@@ -768,6 +903,15 @@ class HarnessAgent:
 
         if user_prompt:
             self.ensure_session()
+            # Auto-title untitled sessions from the first prompt so /session
+            # list stays scannable without a manual rename.
+            try:
+                if self.session is not None and (self.session.title or "") in ("", "New Session"):
+                    first_line = user_prompt.strip().split("\n")[0].strip()
+                    if first_line:
+                        self.session.title = first_line[:60] + ("…" if len(first_line) > 60 else "")
+            except Exception:
+                pass
 
             # ── Security gate: input length validation ────────────────────
             from harness.core.security import validate_input_length, MAX_TUI_INPUT_LENGTH
@@ -895,6 +1039,12 @@ class HarnessAgent:
             self.session.messages.append({"role": "user", "content": user_content})
             self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
 
+        # H5: lazy MCP connect on first turn (never blocks TUI launch).
+        try:
+            self.mcp_manager.ensure_connected()
+        except Exception:
+            pass
+
         # Skills-first: eagerly consult the skill catalog via the list_skills tool at the
         # start of every task so the model always sees available skills before working,
         # then it can read_skill any skill that matches the user's use case.
@@ -933,12 +1083,14 @@ class HarnessAgent:
                 self.session.messages = compacted_msgs
                 yield AgentEvent("compaction", stats)
 
-        # Loop for tool executions. There is no hard step budget — iteration
-        # stops when the model delivers a text-only answer or calls the `finish`
-        # tool. Empty responses only get re-prompted, never end the turn.
+        # Loop for tool executions. Iteration stops when the model delivers a
+        # text-only answer or calls the `finish` tool. Empty responses only get
+        # re-prompted, never end the turn. A generous step cap (120) bounds
+        # runaway spend — hitting it ends the turn gracefully, it is not an error.
         current_loop = 0
         empty_streak = 0
         MAX_EMPTY_RETRIES = 2
+        MAX_TURN_STEPS = int(getattr(self.config, "max_turn_steps", 120) or 120)
         # SUPER mode: narration without tool calls must not abandon the goal —
         # challenge it once; a second consecutive text-only reply ends the turn.
         super_text_only_streak = 0
@@ -946,17 +1098,52 @@ class HarnessAgent:
         # Exploration watchdog: consecutive read-only calls without action.
         exploration_streak = 0
         MAX_EXPLORATION_STREAK = 10
+        # Repeat-loop watchdog: identical tool calls (same name + args) in a row
+        # mean the model is stuck retrying something that isn't working.
+        last_tool_sig: Optional[str] = None
+        repeat_streak = 0
+        MAX_REPEAT_NUDGE = 3
+        MAX_REPEAT_BREAK = 5
+        # Tool schemas are static within a turn (mode doesn't change mid-turn):
+        # build once and reuse instead of re-serializing 46 tools every step.
+        active_tools = self.tool_registry.get_openai_schemas(self.mode)
+        _schema_tool_count = len(self.tool_registry.tools)
 
         # Create checkpoint at start of turn
         self.checkpoint_manager.create_checkpoint(f"Turn {len(self.session.messages) // 2 + 1} start")
+        # G11/C2: SUPER auto-continuation budget (goal-check re-entry).
+        super_continuations = 0
+        MAX_SUPER_CONTINUATIONS = 3
 
         while self.is_running:
             if self._stop_requested.is_set():
                 yield AgentEvent("text_delta", "\n[Harness] Turn interrupted by user.\n")
                 yield AgentEvent("step_end", {"step": current_loop, "complete": True})
                 break
+            if current_loop >= MAX_TURN_STEPS:
+                # G11: in SUPER, auto-continue with a goal check (bounded).
+                if self.mode == Mode.SUPER and super_continuations < MAX_SUPER_CONTINUATIONS:
+                    super_continuations += 1
+                    self.session.messages.append({
+                        "role": "user",
+                        "content": ("[SYSTEM]: Step budget reached. Goal check: is the goal truly complete "
+                                    "with verification evidence? If yes, call `finish` with evidence. "
+                                    "If no, continue autonomously from where you stopped."),
+                    })
+                    yield AgentEvent("text_delta",
+                                     f"\n[Harness] Step budget reached — goal check {super_continuations}/{MAX_SUPER_CONTINUATIONS}, continuing.\n")
+                    current_loop = 0
+                    continue
+                yield AgentEvent("text_delta",
+                                 f"\n[Harness] Step budget ({MAX_TURN_STEPS}) reached — ending this turn. "
+                                 "Ask to continue if more work remains.\n")
+                yield AgentEvent("step_end", {"step": current_loop, "complete": True})
+                break
             current_loop += 1
-            active_tools = self.tool_registry.get_openai_schemas(self.mode)
+            # Refresh schemas only if the registry changed mid-turn (MCP connect).
+            if len(self.tool_registry.tools) != _schema_tool_count:
+                active_tools = self.tool_registry.get_openai_schemas(self.mode)
+                _schema_tool_count = len(self.tool_registry.tools)
 
             yield AgentEvent("step_start", {"step": current_loop, "mode": self.mode.value})
 
@@ -984,14 +1171,22 @@ class HarnessAgent:
                 # the moment its name becomes known.
                 announced_generating: Dict[int, str] = {}
                 error_accumulator = ""
+                # F1: escalate effort after >=2 consecutive tool errors.
+                _effort = self.config.thinking_effort
+                if turn_error_streak >= 2 and _effort not in ("max",):
+                    _effort = "max"
+                # G9: creative mode raises temperature for divergent sessions.
+                _temp = getattr(self.config, "temperature", None)
+                if getattr(self.config, "creative_mode", False):
+                    _temp = 0.85
                 stream_iter = self._stream_interruptible(
                     lambda: self.provider.stream_chat(
                         messages=self.session.messages,
                         model=self.session.model,
-                        thinking_effort=self.config.thinking_effort,
+                        thinking_effort=_effort,
                         tools=active_tools,
                         system_prompt=sys_prompt,
-                        temperature=getattr(self.config, "temperature", None),
+                        temperature=_temp,
                     )
                 )
                 try:
@@ -1190,6 +1385,37 @@ class HarnessAgent:
             stop_requested = False
             finish_summary = ""
             interrupted = self._stop_requested.is_set()
+            # Repeat-loop signature for this step (all calls, names + raw args).
+            # Pure read-only exploration spins belong to the exploration
+            # watchdog below — only mutating/action repeats are tracked here
+            # so the two watchdogs never fight over the same streak.
+            try:
+                _step_sig = json.dumps(
+                    sorted((str(v.get("name", "")), str(v.get("arguments", "")))
+                           for v in tool_calls_accumulator.values()),
+                    sort_keys=True,
+                )
+            except Exception:
+                _step_sig = None
+            try:
+                _step_is_exploration = bool(tool_calls_accumulator) and all(
+                    self._is_exploration_call(
+                        str(v.get("name", "")),
+                        (json.loads(v["arguments"]) if str(v.get("arguments", "")).strip() else {}),
+                    )
+                    for v in tool_calls_accumulator.values()
+                )
+            except Exception:
+                _step_is_exploration = False
+            if _step_is_exploration:
+                repeat_streak = 0
+                if _step_sig is not None:
+                    last_tool_sig = _step_sig
+            elif _step_sig is not None and _step_sig == last_tool_sig:
+                repeat_streak += 1
+            else:
+                repeat_streak = 0
+                last_tool_sig = _step_sig
             for v in tool_calls_accumulator.values():
                 tool_name = v["name"]
                 raw_args = v["arguments"]
@@ -1214,8 +1440,56 @@ class HarnessAgent:
 
                 # The `finish` tool is the model's explicit stop signal: deliver the
                 # summary and end the iteration without any further model calls.
+                # GATES (G1/G2/G3/G5): verify-before-done, evidence, open todos, self-review.
+                # Allow at most 2 rejections so a stuck model can still finish.
                 if tool_name == "finish":
                     finish_summary = str(args.get("summary", "")).strip() or "Task complete."
+                    evidence = str(args.get("evidence", "")).strip()
+                    if turn_finish_rejections < 2:
+                        open_tasks = [t for t in self.todo_manager.list_tasks()
+                                      if t.status.value in ("pending", "in_progress")]
+                        if turn_mutation_seen and not turn_verification_seen and not evidence:
+                            turn_finish_rejections += 1
+                            telemetry["finish_rejections"] += 1
+                            nudge = ("[SYSTEM]: You have not run any verification this turn. Run the "
+                                     "tests/build now, then call `finish` again with `evidence` "
+                                     "(what was checked + outcome) and `verified=true`, or explain why "
+                                     "verification is not applicable.")
+                            self.session.messages.append({
+                                "role": "tool", "tool_call_id": v["id"], "name": "finish",
+                                "content": nudge,
+                            })
+                            self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
+                            yield AgentEvent("tool_call_result", {"name": "finish", "result": nudge})
+                            yield AgentEvent("text_delta", "\n[Harness] Finish rejected: verification evidence required.\n")
+                            break
+                        if open_tasks:
+                            turn_finish_rejections += 1
+                            telemetry["finish_rejections"] += 1
+                            titles = ", ".join(f"#{t.id} {t.title}" for t in open_tasks[:5])
+                            nudge = (f"[SYSTEM]: {len(open_tasks)} task(s) are still open: {titles}. "
+                                     "Mark them complete (with evidence) or failed before finishing.")
+                            self.session.messages.append({
+                                "role": "tool", "tool_call_id": v["id"], "name": "finish",
+                                "content": nudge,
+                            })
+                            self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
+                            yield AgentEvent("tool_call_result", {"name": "finish", "result": nudge})
+                            yield AgentEvent("text_delta", f"\n[Harness] Finish rejected: {len(open_tasks)} open todo(s).\n")
+                            break
+                        if turn_mutation_seen and not turn_review_done and not args.get("verified"):
+                            turn_review_done = True
+                            nudge = ("[SYSTEM]: Before finishing, do a self-review pass: what was claimed vs "
+                                     "what was evidenced? What is likely broken? Fix or rebut, then call "
+                                     "`finish` again with evidence.")
+                            self.session.messages.append({
+                                "role": "tool", "tool_call_id": v["id"], "name": "finish",
+                                "content": nudge,
+                            })
+                            self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
+                            yield AgentEvent("tool_call_result", {"name": "finish", "result": nudge})
+                            yield AgentEvent("text_delta", "\n[Harness] Finish paused for self-review.\n")
+                            break
                     self.session.messages.append({
                         "role": "tool",
                         "tool_call_id": v["id"],
@@ -1228,9 +1502,33 @@ class HarnessAgent:
 
                 result = self.tool_registry.execute(tool_name, args, self.mode)
                 tools_executed_this_turn += 1
+                # G1 tracking: mutations + verification evidence for the finish gate.
+                if self._is_mutating_call(tool_name, args):
+                    turn_mutation_seen = True
+                    turn_steps_without_progress = 0
+                if self._is_verification_call(tool_name, args):
+                    turn_verification_seen = True
+                    telemetry["verification_actions"] += 1
+                if tool_name in ("todo_create", "todo_update"):
+                    turn_plan_seen = True
+                if tool_name in ("write_file", "edit_file", "delete_file"):
+                    turn_steps_without_progress = 0
+                # F4b error classification + F1 escalation tracking.
+                result = self._classify_tool_result(tool_name, args, result)
+                if str(result).startswith("[tool_error:"):
+                    turn_error_streak += 1
+                    if turn_error_streak == 2:
+                        telemetry["escalations"] += 1
+                else:
+                    turn_error_streak = 0
                 # Exploration watchdog: count consecutive read-only calls.
+                # C3: track progressive vs redundant — the watchdog below only
+                # fires when the streak is mostly re-reading the same files.
                 if self._is_exploration_call(tool_name, args):
                     exploration_streak += 1
+                    path_key = str(args.get("path") or args.get("pattern") or args.get("command") or "")
+                    if path_key:
+                        exploration_files_seen.add(path_key)
                 else:
                     exploration_streak = 0
 
@@ -1340,12 +1638,52 @@ class HarnessAgent:
                 })
                 yield AgentEvent("text_delta", "\n[Harness] Exploration loop detected — nudging the agent back to concrete action.\n")
 
+            # Repeat-loop watchdog: identical tool calls re-issued with the same
+            # arguments are stuck retries, not progress. Nudge once, then end
+            # the turn rather than burning context/money in a circle.
+            if repeat_streak == MAX_REPEAT_NUDGE:
+                self.session.messages.append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM]: You just issued the exact same tool call(s) "
+                        f"{MAX_REPEAT_NUDGE + 1} times in a row with identical arguments. The last "
+                        "result already contains the outcome — do NOT repeat it. Either act on that "
+                        "result differently, try another approach, or — if blocked — explain the "
+                        "blocker and call `finish` with what you accomplished."
+                    ),
+                })
+                yield AgentEvent("text_delta", "\n[Harness] Repeat loop detected — nudging the agent to try a different approach.\n")
+            elif repeat_streak >= MAX_REPEAT_BREAK:
+                yield AgentEvent("text_delta",
+                                 "\n[Harness] Same tool call repeated with identical arguments too many "
+                                 "times — ending this turn to stop the loop. Re-run with adjusted input if needed.\n")
+                yield AgentEvent("step_end", {"step": current_loop, "complete": True})
+                break
+
+            # Progress watchdog (C3): long input without any mutation/test on a
+            # code task. Also plan check (C4): multi-step mutation without todos.
+            if turn_mutation_seen and not turn_plan_seen:
+                # Heuristic: mutation happened but no plan was ever created this turn.
+                # Only nudge once (guarded by error streak counter reuse).
+                if turn_steps_without_progress == 0 and current_loop > 2:
+                    self.session.messages.append({
+                        "role": "user",
+                        "content": ("[SYSTEM]: You mutated files without a todo plan. Create/update todos "
+                                    "for the remaining steps so progress is tracked."),
+                    })
+                    yield AgentEvent("text_delta", "\n[Harness] Mutation without plan — nudging to create todos.\n")
+
             # Save session state
             self._sync_todos_to_session()
             self.session_manager.save(self.session)
             yield AgentEvent("step_end", {"step": current_loop, "complete": False})
 
         self.is_running = False
+        try:
+            if self.session is not None:
+                self.session.telemetry = telemetry  # type: ignore[attr-defined]
+        except Exception:
+            pass
         self._sync_todos_to_session()
         self.session_manager.save(self.session)
         self._maybe_auto_learn(user_prompt)

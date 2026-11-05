@@ -9,6 +9,7 @@ from harness.providers.anthropic_provider import AnthropicProvider
 from harness.providers.gemini_provider import GeminiProvider
 from harness.providers.openai_compatible import OpenAICompatibleProvider
 from harness.providers.mock_provider import MockProvider
+from harness.providers.web_session_provider import OpenAIWebProvider, ClaudeWebProvider
 from harness.config import HarnessConfig
 
 PROVIDER_CONFIGS = {
@@ -23,6 +24,23 @@ PROVIDER_CONFIGS = {
         "display_name": "OpenAI",
         "default_model": "gpt-5",
         "base_url": "https://api.openai.com/v1",
+    },
+    # Web-session providers: drive chatgpt.com / claude.ai with the browser's
+    # session cookie instead of a developer API key. Any plan works, including
+    # free. Log in with:  /login openaiauth   or   /login claudeauth
+    "openaiauth": {
+        "class": OpenAIWebProvider,
+        "display_name": "OpenAI (ChatGPT Web Session)",
+        "default_model": "gpt-5.2",
+        "base_url": "https://chatgpt.com",
+        "web_session": True,
+    },
+    "claudeauth": {
+        "class": ClaudeWebProvider,
+        "display_name": "Claude (claude.ai Web Session)",
+        "default_model": "claude-sonnet-4-5",
+        "base_url": "https://claude.ai",
+        "web_session": True,
     },
     "gemini": {
         "class": GeminiProvider,
@@ -144,6 +162,10 @@ def get_provider(provider_name: str, config: Optional[HarnessConfig] = None) -> 
             pass
 
     cls = cfg_entry["class"]
+    if cls is OpenAIWebProvider or cls is ClaudeWebProvider:
+        # Web-session providers: the "key" is the browser session credential
+        # (session cookie value) stored in the secure store by /login.
+        return cls(api_key=api_key or None, base_url=base_url, max_retries=max_retries, base_delay=base_delay, stream_timeout=stream_timeout)
     if cls is AnthropicProvider or cls is GeminiProvider:
         return cls(api_key=api_key, base_url=base_url, max_retries=max_retries, base_delay=base_delay, stream_timeout=stream_timeout)
     elif cls is MockProvider:
