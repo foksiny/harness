@@ -225,8 +225,16 @@ def thinking_line(tick: int = 0, tokens: int = 0) -> str:
 
 
 def tool_line(activity: str, tick: int = 0, label: str = "") -> str:
-    """Cute tool line, e.g. ``⠙ 📖 reading… view_file``."""
-    return f"{working_line(activity, tick)} {label}".strip() if label else working_line(activity, tick)
+    """Plain tool line: ``spinner mascot label`` — no cute custom message.
+
+    Historically this appended a playful verb ("reading… view_file"),
+    but tool invocation is reported factually by the renderer now
+    ("Invoking Read: view_file"), so the helper must not reintroduce
+    a mascot sentence next to it.
+    """
+    name = mascot_name(tick)
+    line = f"{spinner_frame('braille', tick)} {mascot_frame(name, tick)}"
+    return f"{line} {label}".strip() if label else line
 
 
 # ── Activity classification ──────────────────────────────────────────

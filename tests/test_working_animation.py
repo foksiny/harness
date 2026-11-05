@@ -71,7 +71,15 @@ class WorkingHelpersTests(unittest.TestCase):
     def test_tool_line_includes_label(self):
         line = tool_line("reading", 0, label="Read: view_file")
         self.assertIn("Read: view_file", line)
-        self.assertIn(rotating_message(0, "reading"), line)
+
+    def test_tool_line_has_no_custom_message(self):
+        # Tool lines are factual only: spinner/mascot + label, never a
+        # funny rotating sentence.
+        for tick in (0, 1, 10, MESSAGE_INTERVAL, 2 * MESSAGE_INTERVAL):
+            line = tool_line("reading", tick, label="Read: view_file")
+            self.assertIn("Read: view_file", line)
+            for msg in FUNNY_MESSAGES:
+                self.assertNotIn(msg, line)
 
     def test_activity_for_tool(self):
         cases = {
@@ -205,9 +213,21 @@ class RendererIntegrationTests(unittest.TestCase):
 
         r = self._renderer()
         r.render_agent_event(Ev("tool_call_delta", {"name": "view_file", "id": "1"}))
+        # The live line says factually WHAT is being generated — no cute
+        # custom message attached to the tool call.
         self.assertTrue(r._live_working_line)
         self.assertIn("view_file", r._live_working_line)
-        self.assertIn(rotating_message(r._animator.tick, "reading"), r._live_working_line)
+        self.assertIn("Generating", r._live_working_line)
+        for msg in FUNNY_MESSAGES:
+            self.assertNotIn(msg, r._live_working_line)
+
+        # Same for the invocation event.
+        r.render_agent_event(Ev("tool_call_start", {"name": "view_file", "arguments": {}}))
+        self.assertIn("Invoking", r._live_working_line)
+        self.assertIn("view_file", r._live_working_line)
+        for msg in FUNNY_MESSAGES:
+            self.assertNotIn(msg, r._live_working_line)
+
         r.render_agent_event(Ev("tool_call_result", {"result": "ok"}))
         self.assertEqual(r._live_working_line, "")
 

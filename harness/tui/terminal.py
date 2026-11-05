@@ -2183,12 +2183,13 @@ class TerminalRenderer:
                 return
             self._generating_announced.add(tid)
             icon, category = self._tool_meta(tname)
-            self._animator.set_activity(activity_for_tool(tname))
-            self._animator.advance()
-            cute = tool_line(self._animator.activity, self._animator.tick, label=f"{category}: {tname}")
-            self._live_working_line = cute
+            # Tool generation is reported factually only — no cute custom
+            # message; the line just says WHAT is being generated. The
+            # animated spinner keeps running so the wait stays visible.
+            self._animator.set_activity("generating")
+            self._live_working_line = f"◌ Generating {category}: {tname}"
             self._start_working_animation()
-            self.console.print(f"\n[{self.theme.accent}]◌ Generating {category}: [bold]{tname}[/bold] · {cute}[/{self.theme.accent}]")
+            self.console.print(f"\n[{self.theme.accent}]◌ Generating {category}: [bold]{tname}[/bold][/{self.theme.accent}]")
 
         elif etype == "tool_call_start":
             self._finish_markdown()
@@ -2197,8 +2198,9 @@ class TerminalRenderer:
             tname = (data or {}).get("name", "tool")
             icon, category = self._tool_meta(tname)
             args = (data or {}).get("arguments", {})
-            self._animator.set_activity(activity_for_tool(tname))
-            self._live_working_line = tool_line(self._animator.activity, self._animator.tick, label=f"{category}: {tname}")
+            # As with generation: report the invocation factually only.
+            self._animator.set_activity("generating")
+            self._live_working_line = f"{icon} Invoking {category}: {tname}"
             self._start_working_animation()
             self.console.print(f"\n[{self.theme.secondary}]{icon} Invoking {category}: [bold]{tname}[/bold][/{self.theme.secondary}]")
             if args:

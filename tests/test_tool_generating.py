@@ -96,6 +96,12 @@ class TestToolGeneratingDelta(unittest.TestCase):
         combined = " ".join(outputs)
         self.assertIn("view_file", combined)
         self.assertIn("Generating", combined)
+        # The announcement is factual only — no cute custom message.
+        for funny in (
+            "Cooking up your project", "Trying not to explode the tests",
+            "Bribing the compiler", "Asking the rubber duck",
+        ):
+            self.assertNotIn(funny, combined)
 
     def test_renderer_dedupes_same_tool_id(self):
         renderer = TerminalRenderer("minimal")
