@@ -10,6 +10,20 @@ and safe to call from any thread.
 """
 from typing import Sequence, Tuple
 
+# ── Cadence constants ──────────────────────────────────────────────────
+# The spinner (loading icon) and the sentence are animated on two
+# INDEPENDENT cadences:
+#
+#   TICK_INTERVAL      → 0.12s per spinner frame (~8fps, icon only)
+#   MESSAGE_INTERVAL   → 42 frames → ~5.0s per message (slow, calm)
+#   MASCOT_INTERVAL    → 16 frames → ~2.0s per mascot swap
+#
+# The icon therefore keeps moving while the sentence stays put for a
+# good while — no more flickering every second.
+TICK_INTERVAL: float = 0.12        # seconds per spinner frame
+MESSAGE_INTERVAL: int = 42         # frames between message rotations (~5s)
+MASCOT_INTERVAL: int = 16          # frames between mascot swaps (~2s)
+
 # ── Mascots ──────────────────────────────────────────────────────────
 # Each mascot is a tuple of frames (one per animation tick). Frames are
 # chosen to be single cells wide where possible so they never break
@@ -154,25 +168,27 @@ def mascot_frame(name: str = "cat", tick: int = 0) -> str:
 
 
 def message_for(activity: str = "thinking", tick: int = 0) -> str:
-    """Pick a cute message for *activity* — cycles every few ticks.
+    """Pick a cute message for *activity* — cycles every ~5s.
 
-    The message index advances every 4 ticks so messages change
-    roughly every second at the default 250ms tick rate, instead of
-    flickering on every frame.
+    The message rotates on its own slow cadence (``MESSAGE_INTERVAL``
+    ticks), independent of the spinner/mascot animation, which flips
+    every tick. At the default 120ms tick rate that's a new message
+    roughly every 5 seconds — calm, not flickery.
     """
     pool = messages_for(activity)
-    return pool[(tick // 4) % len(pool)]
+    return pool[(tick // MESSAGE_INTERVAL) % len(pool)]
 
 
 def rotating_message(tick: int = 0, activity: str = "") -> str:
     """One of the 15+ funny full-sentence lines, rotating over time.
 
-    Cycles every 12 ticks (~3s at the default 250ms prompt refresh),
-    so the line above the prompt box feels alive without flickering.
-    When *activity* names a known pool, that pool's sentence is mixed
-    in every 4th slot so tool-specific lines still appear.
+    Advances every ``MESSAGE_INTERVAL`` ticks (~5s at the default
+    120ms tick rate) — deliberately much slower than the spinner,
+    which updates independently every tick. When *activity* names a
+    known pool, that pool's sentence is mixed in every 4th slot so
+    tool-specific lines still appear.
     """
-    slot = tick // 12
+    slot = tick // MESSAGE_INTERVAL
     pool = messages_for(activity) if activity else ()
     if pool and slot % 4 == 3:
         return pool[(slot // 4) % len(pool)]
@@ -180,8 +196,8 @@ def rotating_message(tick: int = 0, activity: str = "") -> str:
 
 
 def mascot_name(tick: int = 0) -> str:
-    """Default rotating mascot — cycles every 8 ticks (~2s)."""
-    return MASCOT_ORDER[(tick // 8) % len(MASCOT_ORDER)]
+    """Default rotating mascot — cycles every ``MASCOT_INTERVAL`` ticks (~2s)."""
+    return MASCOT_ORDER[(tick // MASCOT_INTERVAL) % len(MASCOT_ORDER)]
 
 
 def working_line(
@@ -239,20 +255,25 @@ def activity_for_tool(tool_name: str) -> str:
 # ── Animation driver ─────────────────────────────────────────────────
 
 class WorkingAnimator:
-    """Thread-safe tick counter shared between renderer & toolbar.
+    """Thread-safe, clock-driven animation driver.
 
-    The renderer increments the tick (e.g. from a background thread or
-    on each throttled header refresh); the prompt_toolkit toolbar reads
-    :meth:`line` on its 0.5s repaint and gets a fresh frame for free.
-    The tick advances on its own via :meth:`ensure_running`, so the
-    line above the prompt box keeps animating for as long as the agent
-    is working — even between token bursts.
+    The tick is derived from elapsed wall time (single source of truth),
+    so the renderer thread, the prompt repaint and the toolbar can never
+    disagree or double-count. From that tick:
+
+    * the **spinner glyph** advances every frame (~8fps), and
+    * the **message** advances only every ``MESSAGE_INTERVAL`` frames
+      (~5s) — completely independent of the icon.
+
+    Elapsed time accumulates across stop/start cycles, so pausing the
+    animation never resets the message rotation mid-cycle.
     """
 
     def __init__(self, activity: str = "thinking") -> None:
         self._tick = 0
         self._activity = activity
         self._running_since: float | None = None
+        self._elapsed_base: float = 0.0
 
     @property
     def tick(self) -> int:
@@ -263,14 +284,30 @@ class WorkingAnimator:
         return self._activity
 
     def set_activity(self, activity: str) -> None:
+        """Switch activity — the message rotation restarts for the new one."""
         self._activity = activity
+        self._elapsed_base = 0.0
+        if self._running_since is not None:
+            import time as _time
+            self._running_since = _time.monotonic()
         self._tick = 0
 
     def advance(self, steps: int = 1) -> int:
+        """Advance the animation.
+
+        While the wall clock is running the tick is derived from elapsed
+        time (single source of truth), so the renderer thread and the
+        prompt repaint can never disagree or double-count. Manual
+        stepping only applies when the clock is stopped (tests).
+        """
+        if self._running_since is not None:
+            return self.sync_tick()
         self._tick += steps
         return self._tick
 
     def line(self, tokens: int | None = None) -> str:
+        if self._running_since is not None:
+            self.sync_tick()
         if self._activity == "thinking" and tokens is not None:
             return thinking_line(self._tick, tokens)
         return working_line(self._activity, self._tick)
@@ -279,32 +316,41 @@ class WorkingAnimator:
     # The tick is derived from elapsed wall time so ANY caller that
     # repaints (prompt_toolkit's 0.5s refresh, the renderer's spinner
     # thread) gets a fresh frame without anyone having to advance it.
-    TICK_INTERVAL: float = 0.25  # seconds per animation frame
+    # The spinner frame rate lives in the module-level TICK_INTERVAL so
+    # the renderer thread and the animator agree on the cadence.
 
     def ensure_running(self) -> None:
         """Start the clock if it isn't already running."""
         import time as _time
         if self._running_since is None:
             self._running_since = _time.monotonic()
-            self._tick = 0
 
     def stop(self) -> None:
-        self._running_since = None
-        self._tick = 0
+        """Stop the clock, keeping the accumulated elapsed time."""
+        import time as _time
+        if self._running_since is not None:
+            self._elapsed_base += _time.monotonic() - self._running_since
+            self._running_since = None
 
     @property
     def running(self) -> bool:
         return self._running_since is not None
 
+    def elapsed(self) -> float:
+        """Total animated seconds so far (across stop/start cycles)."""
+        import time as _time
+        total = self._elapsed_base
+        if self._running_since is not None:
+            total += _time.monotonic() - self._running_since
+        return total
+
     def sync_tick(self) -> int:
         """Recompute the tick from elapsed time and return it."""
-        import time as _time
-        if self._running_since is None:
-            return self._tick
-        self._tick = int((_time.monotonic() - self._running_since) / self.TICK_INTERVAL)
+        self._tick = int(self.elapsed() / TICK_INTERVAL)
         return self._tick
 
     def live_line(self, tokens: int | None = None) -> str:
         """Current line — auto-advances the tick from wall time."""
         self.ensure_running()
-        return self.line(tokens) if self.sync_tick() or True else ""
+        self.sync_tick()
+        return self.line(tokens)

@@ -19,7 +19,12 @@ from harness import __version__
 from harness.providers.base import probe_effort_options
 from harness.themes import Theme, get_theme, THEMES, render_theme_preview
 from harness.sysinfo import get_ram_usage_mb
-from harness.tui.working import WorkingAnimator, activity_for_tool, tool_line
+from harness.tui.working import (
+    WorkingAnimator,
+    activity_for_tool,
+    tool_line,
+    TICK_INTERVAL,
+)
 
 
 # Streaming flush tuning: completed markdown blocks print instantly, but a
@@ -41,7 +46,10 @@ _THINKING_INDICATOR_TOKEN_STEP = 128
 # line at this interval so the spinner/mascot visibly animates even when
 # no new provider tokens arrive (e.g. a long tool call or a stalled
 # stream). 120ms ≈ 8fps — smooth without hammering the terminal.
-_WORKING_TICK_INTERVAL = 0.12
+# NOTE: the *message* rotates on its own slower cadence (see
+# working.MESSAGE_INTERVAL ≈ 5s) — the icon and the sentence are
+# intentionally decoupled.
+_WORKING_TICK_INTERVAL = TICK_INTERVAL
 
 
 class DynamicStdout:

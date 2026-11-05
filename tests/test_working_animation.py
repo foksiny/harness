@@ -4,6 +4,7 @@ import unittest
 
 from harness.tui.working import (
     SPINNERS, MASCOT_FRAMES, MASCOT_ORDER, MESSAGES, FUNNY_MESSAGES,
+    TICK_INTERVAL, MESSAGE_INTERVAL, MASCOT_INTERVAL,
     spinner_frame, mascot_frame, message_for, mascot_name,
     working_line, thinking_line, tool_line, activity_for_tool,
     rotating_message, WorkingAnimator,
@@ -24,16 +25,27 @@ class WorkingHelpersTests(unittest.TestCase):
         self.assertEqual(mascot_frame("nope", 0), frames[0])
 
     def test_message_cycles_slowly(self):
-        # Message index advances every 4 ticks, not every tick.
-        self.assertEqual(message_for("thinking", 0), message_for("thinking", 3))
+        # Message index advances only every MESSAGE_INTERVAL ticks (~5s),
+        # not every tick — the spinner is the fast-moving part.
+        self.assertEqual(message_for("thinking", 0), message_for("thinking", MESSAGE_INTERVAL - 1))
         pool = MESSAGES["thinking"]
-        self.assertEqual(message_for("thinking", 4), pool[1])
-        self.assertEqual(message_for("unknown_activity", 0), message_for("unknown_activity", 0))
+        self.assertEqual(message_for("thinking", MESSAGE_INTERVAL), pool[1])
+        self.assertEqual(message_for("thinking", 2 * MESSAGE_INTERVAL), pool[2 % len(pool)])
+
+    def test_message_interval_is_about_five_seconds(self):
+        # MESSAGE_INTERVAL frames at TICK_INTERVAL seconds/frame ≈ 5s.
+        self.assertAlmostEqual(MESSAGE_INTERVAL * TICK_INTERVAL, 5.0, delta=0.25)
+
+    def test_spinner_and_message_are_independent(self):
+        # Within one message slot the spinner must still move.
+        self.assertNotEqual(spinner_frame("braille", 0), spinner_frame("braille", 1))
+        self.assertEqual(rotating_message(0), rotating_message(MESSAGE_INTERVAL - 1))
+        self.assertNotEqual(rotating_message(0), rotating_message(MESSAGE_INTERVAL))
 
     def test_mascot_rotation(self):
         self.assertEqual(mascot_name(0), MASCOT_ORDER[0])
-        self.assertEqual(mascot_name(8), MASCOT_ORDER[1 % len(MASCOT_ORDER)])
-        self.assertEqual(mascot_name(len(MASCOT_ORDER) * 8), MASCOT_ORDER[0])
+        self.assertEqual(mascot_name(MASCOT_INTERVAL), MASCOT_ORDER[1 % len(MASCOT_ORDER)])
+        self.assertEqual(mascot_name(len(MASCOT_ORDER) * MASCOT_INTERVAL), MASCOT_ORDER[0])
 
     def test_working_line_shape(self):
         line = working_line("thinking", 0)
@@ -49,7 +61,7 @@ class WorkingHelpersTests(unittest.TestCase):
         self.assertIn("Trying not to explode the tests", joined)
 
     def test_rotating_message_cycles(self):
-        seen = {rotating_message(t * 12) for t in range(len(FUNNY_MESSAGES))}
+        seen = {rotating_message(t * MESSAGE_INTERVAL) for t in range(len(FUNNY_MESSAGES))}
         self.assertEqual(seen, set(FUNNY_MESSAGES))
 
     def test_thinking_line_has_tokens(self):
@@ -105,6 +117,31 @@ class WorkingAnimatorTests(unittest.TestCase):
         self.assertIn("7 tokens", line)
         a.stop()
         self.assertFalse(a.running)
+
+    def test_stop_preserves_elapsed(self):
+        # Pausing must not reset the message rotation mid-cycle: after a
+        # stop/start the message slot resumes from accumulated elapsed time.
+        import time as _time
+        a = WorkingAnimator("thinking")
+        a.ensure_running()
+        _time.sleep(0.3)
+        a.stop()
+        first = a.elapsed()
+        self.assertGreaterEqual(first, 0.3)
+        a.ensure_running()
+        _time.sleep(0.1)
+        a.stop()
+        self.assertGreaterEqual(a.elapsed(), first + 0.1)
+
+    def test_rotation_holds_for_five_seconds_of_ticks(self):
+        # Spinner ticks keep advancing while the message stays put.
+        a = WorkingAnimator("thinking")
+        first = rotating_message(a.tick)
+        self.assertEqual(first, FUNNY_MESSAGES[0])
+        a.advance(MESSAGE_INTERVAL - 1)
+        self.assertEqual(first, rotating_message(a.tick))
+        a.advance(1)
+        self.assertEqual(rotating_message(a.tick), FUNNY_MESSAGES[1])
 
     def test_prompt_message_splits_above_input(self):
         """The cute line must render ABOVE the prompt box (multi-line prompt)."""
