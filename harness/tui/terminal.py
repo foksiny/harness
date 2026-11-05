@@ -19,6 +19,7 @@ from harness import __version__
 from harness.providers.base import probe_effort_options
 from harness.themes import Theme, get_theme, THEMES, render_theme_preview
 from harness.sysinfo import get_ram_usage_mb
+from harness.tui.working import WorkingAnimator, activity_for_tool, tool_line
 
 
 # Streaming flush tuning: completed markdown blocks print instantly, but a
@@ -35,6 +36,12 @@ _MD_FLUSH_MAX_SIZE = 2000
 # a fast reasoning stream repaints at most a few times a second.
 _THINKING_INDICATOR_MIN_INTERVAL = 0.75
 _THINKING_INDICATOR_TOKEN_STEP = 128
+
+# Cute working animation: a background thread repaints the live working
+# line at this interval so the spinner/mascot visibly animates even when
+# no new provider tokens arrive (e.g. a long tool call or a stalled
+# stream). 120ms ≈ 8fps — smooth without hammering the terminal.
+_WORKING_TICK_INTERVAL = 0.12
 
 
 class DynamicStdout:
@@ -91,8 +98,6 @@ class TerminalRenderer:
         # mode the live counter is surfaced through the prompt toolbar instead
         # (see _live_thinking_tokens / _live_thinking_active).
         self.interactive_prompt: bool = False
-        self._live_thinking_tokens: int = 0
-        self._live_thinking_active: bool = False
         self._md_buffer: str = ""
         self._md_stream_started: bool = False
         self._md_last_blank: bool = False
@@ -117,6 +122,19 @@ class TerminalRenderer:
         # Tool ids already announced as "generating" — each in-progress tool
         # call prints its ◌ line exactly once per turn.
         self._generating_announced: set = set()
+        # Cute working animation state (see harness/tui/working.py): the
+        # animator tick is what both the in-place header and the
+        # prompt_toolkit toolbar read, so every surface animates in sync.
+        self._animator = WorkingAnimator("thinking")
+        # Public aliases read by the interactive toolbar (kept in sync with
+        # the underscore-prefixed live-thinking attributes below).
+        self._live_working_line: str = ""
+        # Legacy mirror: toolbar code historically read these names.
+        self._live_thinking_tokens: int = 0
+        self._live_thinking_active: bool = False
+        # Background spinner thread (daemon) + stop event.
+        self._working_thread = None
+        self._working_stop = None
 
     def set_theme(self, theme_name: str):
         self.theme = get_theme(theme_name)
@@ -1237,6 +1255,13 @@ class TerminalRenderer:
         tokens = self._thinking_token_estimate()
         self._live_thinking_tokens = tokens
         self._live_thinking_active = True
+        # Cute animated line (spinner + mascot + playful message). The
+        # animator tick advances on every header refresh; the background
+        # spinner thread advances it between refreshes so the animation
+        # never stalls when tokens stop arriving.
+        self._animator.advance()
+        cute = self._animator.line(tokens)
+        self._live_working_line = cute
         if self.interactive_prompt:
             # prompt_toolkit repaints the entry/toolbar rows every frame; a raw
             # write here would land on the input row. Surface via toolbar only.
@@ -1244,16 +1269,19 @@ class TerminalRenderer:
             self._thinking_indicator_last_tokens = tokens
             self._thinking_indicator_last_refresh = time.time()
             return
+        # Keep the historical keywords ("Thought" / "Thinking") in the
+        # visible header so existing consumers/tests that grep for them
+        # keep working; the cute animation follows them.
         if self._show_thinking:
             self.console.print(
-                f"\r  [bold yellow]Thought[/bold yellow] [dim]· streaming… (~{tokens:,} tokens)[/dim]",
+                f"\r  [bold yellow]Thought[/bold yellow] [dim]·[/dim] [bold yellow]{cute}[/bold yellow]",
                 end="",
                 highlight=False,
             )
         else:
             c = self.theme.thinking
             self.console.print(
-                f"\r  [bold {c}]◆ Thinking…[/bold {c}] [dim](~{tokens:,} tokens)[/dim]",
+                f"\r  [bold {c}]◆ Thinking…[/bold {c}] [dim]·[/dim] [bold {c}]{cute}[/bold {c}]",
                 end="",
                 highlight=False,
             )
@@ -1270,6 +1298,8 @@ class TerminalRenderer:
             # No on-screen line to rewrite — just keep the toolbar source fresh.
             self._live_thinking_tokens = tokens
             self._live_thinking_active = True
+            self._animator.advance()
+            self._live_working_line = self._animator.line(tokens)
             return
         if not self._thinking_header_open:
             return
@@ -1280,6 +1310,46 @@ class TerminalRenderer:
         ):
             return
         self._thinking_print_header()
+
+    # ── Cute working animation: background spinner thread ──────────
+    def _start_working_animation(self) -> None:
+        """Start (idempotently) the daemon thread that advances the tick."""
+        if self._working_thread is not None and self._working_thread.is_alive():
+            return
+        import threading
+        self._working_stop = threading.Event()
+        stop = self._working_stop
+
+        def _loop() -> None:
+            while not stop.wait(_WORKING_TICK_INTERVAL):
+                self._animator.advance()
+                # Keep the toolbar's cached line warm even when no tokens
+                # are streaming, so the toolbar always shows a fresh frame.
+                tokens = self._thinking_token_estimate() if self._is_thinking_visible else 0
+                try:
+                    self._live_working_line = self._animator.line(tokens or None)
+                except Exception:
+                    pass
+                # In non-interactive mode the in-place header is the
+                # animation surface; repaint it with the new frame.
+                if not self.interactive_prompt and self._is_thinking_visible and self._thinking_header_open:
+                    try:
+                        self._thinking_print_header()
+                    except Exception:
+                        pass
+
+        self._working_thread = threading.Thread(
+            target=_loop, daemon=True, name="harness-working-animator",
+        )
+        self._working_thread.start()
+
+    def _stop_working_animation(self) -> None:
+        """Stop the spinner thread and clear the live line."""
+        if self._working_stop is not None:
+            self._working_stop.set()
+            self._working_stop = None
+        self._working_thread = None
+        self._live_working_line = ""
 
     def _finish_thinking(self):
         """Close out the thinking display panel and show timing stats."""
@@ -1332,6 +1402,7 @@ class TerminalRenderer:
         self._thinking_indicator_last_tokens = 0
         self._live_thinking_tokens = 0
         self._live_thinking_active = False
+        self._stop_working_animation()
 
     def _thinking_print_block(self, chunk: str):
         """Print completed thinking lines (only lines terminated by a real \n).
@@ -2064,6 +2135,7 @@ class TerminalRenderer:
                 # estimate that refreshes in place with each delta.
                 self._thinking_print_header()
                 self._is_thinking_visible = True
+                self._start_working_animation()
             else:
                 self._thinking_refresh_header()
             if not self._show_thinking:
@@ -2103,7 +2175,12 @@ class TerminalRenderer:
                 return
             self._generating_announced.add(tid)
             icon, category = self._tool_meta(tname)
-            self.console.print(f"\n[{self.theme.accent}]◌ Generating {category}: [bold]{tname}[/bold][/{self.theme.accent}]")
+            self._animator.set_activity(activity_for_tool(tname))
+            self._animator.advance()
+            cute = tool_line(self._animator.activity, self._animator.tick, label=f"{category}: {tname}")
+            self._live_working_line = cute
+            self._start_working_animation()
+            self.console.print(f"\n[{self.theme.accent}]◌ Generating {category}: [bold]{tname}[/bold] · {cute}[/{self.theme.accent}]")
 
         elif etype == "tool_call_start":
             self._finish_markdown()
@@ -2112,6 +2189,9 @@ class TerminalRenderer:
             tname = (data or {}).get("name", "tool")
             icon, category = self._tool_meta(tname)
             args = (data or {}).get("arguments", {})
+            self._animator.set_activity(activity_for_tool(tname))
+            self._live_working_line = tool_line(self._animator.activity, self._animator.tick, label=f"{category}: {tname}")
+            self._start_working_animation()
             self.console.print(f"\n[{self.theme.secondary}]{icon} Invoking {category}: [bold]{tname}[/bold][/{self.theme.secondary}]")
             if args:
                 preview = str(args)
@@ -2121,6 +2201,7 @@ class TerminalRenderer:
 
         elif etype == "tool_call_result":
             self._finish_markdown()
+            self._stop_working_animation()
             elapsed_str = ""
             if hasattr(self, "_active_tool_start") and self._active_tool_start:
                 el = time.time() - self._active_tool_start

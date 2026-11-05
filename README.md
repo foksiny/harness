@@ -1,6 +1,6 @@
-# Harness ⚡ — v0.11.0 (Beta)
+# Harness ⚡ — v0.11.1 (Beta)
 
-> **The Premier Agentic AI Engineering Harness & CLI** — now in **v0.11.0 Beta**
+> **The Premier Agentic AI Engineering Harness & CLI** — now in **v0.11.1 Beta**
 > Built for developers, autonomous AI workflows, and software engineers who demand speed, low memory (~24MB RAM), subagent orchestration, and multi-provider intelligence.
 
 ```

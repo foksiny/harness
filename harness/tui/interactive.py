@@ -618,6 +618,13 @@ def run_interactive(agent: HarnessAgent):
 
             try:
                 agent.is_running = True
+                # Start the cute working-line clock so the line above
+                # the prompt box animates for the whole turn, even
+                # between token bursts.
+                try:
+                    renderer._animator.ensure_running()
+                except Exception:
+                    pass
                 # Accumulate response for Discord mirroring
                 response_parts: list[str] = []
                 tokens_est = 0
@@ -730,6 +737,10 @@ def run_interactive(agent: HarnessAgent):
                 queue.finish_current(status="failed")
             finally:
                 agent.is_running = False
+                try:
+                    renderer._animator.stop()
+                except Exception:
+                    pass
 
     worker_thread = threading.Thread(target=_worker_loop, daemon=True, name="harness-tui-worker")
     worker_thread.start()
@@ -837,6 +848,32 @@ def run_interactive(agent: HarnessAgent):
                 plain_prompt = HTML("<ansicyan><b>│</b></ansicyan> ")
                 placeholder = HTML('<style color="#666666">Ask anything.. "What is the tech stack of this project?"</style>')
 
+        # ── Cute working line ABOVE the prompt box ────────────────
+        # prompt_toolkit splits a multi-line prompt message: everything
+        # before the last "\n" renders on its own line(s) above the
+        # input, and the final segment is the "│ " prompt itself.
+        # Passing a *callable* message makes prompt_toolkit re-evaluate
+        # it on every repaint (refresh_interval=0.5s), so the spinner,
+        # mascot and funny rotating message animate continuously for
+        # the whole time the agent is running — and disappear the
+        # moment it stops.
+        def get_prompt():
+            import html as _html
+            base = plain_prompt  # HTML with the "│ " prompt
+            if not (agent.is_running and view == VIEW_PARENT):
+                return base
+            live_tok = getattr(renderer, "_live_thinking_tokens", 0)
+            animator = getattr(renderer, "_animator", None)
+            if animator is not None:
+                cute = animator.live_line(live_tok or None)
+            else:
+                cute = f"◆ Thinking… (~{live_tok:,} tok)" if live_tok else "◆ Thinking…"
+            # Newline => the cute line sits ABOVE the prompt box.
+            return HTML(
+                f'<style color="#e8b64c">{_html.escape(cute)}</style>\n'
+                + base.value
+            )
+
         def get_bottom_toolbar():
             try:
                 import html
@@ -880,12 +917,9 @@ def run_interactive(agent: HarnessAgent):
                 else:
                     line1 = f'<ansicyan><b>│</b></ansicyan> {mode_badge} <style color="#666666">·</style> <style color="#cccccc">{model_str}</style> <style color="#666666">·</style> <ansiyellow><b>{effort_str}</b></ansiyellow>{perm_badge}'
 
-                # Live thinking counter: the renderer suppresses its raw in-place line
-                # while the prompt frame owns the screen (it would collide with the
-                # input row), and repaints the count atomically through this toolbar.
-                if agent.is_running and getattr(renderer, "_live_thinking_active", False):
-                    live_tok = getattr(renderer, "_live_thinking_tokens", 0)
-                    line1 += f' <style color="#888888">·</style> <style color="#e8b64c">◆ Thinking… (~{live_tok:,} tok)</style>'
+                # NOTE: the cute working line lives ABOVE the prompt box
+                # (see get_prompt above), not in the footer. It is shown
+                # for as long as the agent is running.
 
                 if agent.is_running:
                     status_tag = '<ansigreen><b>[▶ RUNNING]</b></ansigreen> '
@@ -935,7 +969,7 @@ def run_interactive(agent: HarnessAgent):
                 return f"│ {agent.mode.value.capitalize()} · {fallback_m} · Harness {__version__}"
 
         user_input = input_handler.get_input(
-            plain_prompt,
+            get_prompt,
             view,
             bottom_toolbar=get_bottom_toolbar,
             refresh_interval=0.5,
