@@ -71,7 +71,6 @@ class HarnessConfig:
     permission: str = "default"      # secure, default, full
     thinking_effort: str = "high"    # off, low, medium, high, or token count
     temperature: float = 0.3        # Sampling temperature; 1.0 = provider default. Low default for coding reliability.
-    max_turn_steps: int = 120       # Per-turn step budget
     max_output_chars: int = 64000   # Hard ceiling for any single tool result
     max_swarm_size: int = 8         # Max concurrent swarm workers
     sandbox_backend: str = "auto"   # auto | nsjail | docker | restricted

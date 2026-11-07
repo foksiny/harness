@@ -1209,12 +1209,11 @@ class HarnessAgent:
 
         # Loop for tool executions. Iteration stops when the model delivers a
         # text-only answer or calls the `finish` tool. Empty responses only get
-        # re-prompted, never end the turn. A generous step cap (120) bounds
-        # runaway spend — hitting it ends the turn gracefully, it is not an error.
+        # re-prompted, never end the turn. There is no step budget: the turn
+        # runs until the model finishes or the user interrupts.
         current_loop = 0
         empty_streak = 0
         MAX_EMPTY_RETRIES = 2
-        MAX_TURN_STEPS = int(getattr(self.config, "max_turn_steps", 120) or 120)
         # SUPER mode: narration without tool calls must not abandon the goal —
         # challenge it once; a second consecutive text-only reply ends the turn.
         super_text_only_streak = 0
@@ -1250,32 +1249,10 @@ class HarnessAgent:
 
         # Create checkpoint at start of turn
         self.checkpoint_manager.create_checkpoint(f"Turn {len(self.session.messages) // 2 + 1} start")
-        # G11/C2: SUPER auto-continuation budget (goal-check re-entry).
-        super_continuations = 0
-        MAX_SUPER_CONTINUATIONS = 3
 
         while self.is_running:
             if self._stop_requested.is_set():
                 yield AgentEvent("text_delta", "\n[Harness] Turn interrupted by user.\n")
-                yield AgentEvent("step_end", {"step": current_loop, "complete": True})
-                break
-            if current_loop >= MAX_TURN_STEPS:
-                # G11: in SUPER, auto-continue with a goal check (bounded).
-                if self.mode == Mode.SUPER and super_continuations < MAX_SUPER_CONTINUATIONS:
-                    super_continuations += 1
-                    self.session.messages.append({
-                        "role": "user",
-                        "content": ("[SYSTEM]: Step budget reached. Goal check: is the goal truly complete "
-                                    "with verification evidence? If yes, call `finish` with evidence. "
-                                    "If no, continue autonomously from where you stopped."),
-                    })
-                    yield AgentEvent("text_delta",
-                                     f"\n[Harness] Step budget reached — goal check {super_continuations}/{MAX_SUPER_CONTINUATIONS}, continuing.\n")
-                    current_loop = 0
-                    continue
-                yield AgentEvent("text_delta",
-                                 f"\n[Harness] Step budget ({MAX_TURN_STEPS}) reached — ending this turn. "
-                                 "Ask to continue if more work remains.\n")
                 yield AgentEvent("step_end", {"step": current_loop, "complete": True})
                 break
             current_loop += 1

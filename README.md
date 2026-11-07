@@ -112,7 +112,7 @@ When a delegation finishes, the report you receive already includes each agent's
   - **Persistent command history** (`~/.harness/history`) with Up/Down + Ctrl+R search across runs, `@`-mention file completion (capped, hidden-aware), and slash-command + argument completion.
   - **Ctrl+L** clears the screen anywhere; turn capsules show elapsed time plus tokens/context; sessions auto-title from the first prompt; `/copy` grabs the last answer, `/undo`/`/redo` shortcut checkpoints.
 - 🧠 **Self-Correcting Agent Loop**:
-  - Repeat-loop watchdog ends identical mutating-call spins (nudge, then graceful stop; read-only spins stay with the exploration watchdog), a 120-step turn budget bounds runaway spend, and tool schemas build once per turn instead of every step.
+  - Repeat-loop watchdog ends identical mutating-call spins (nudge, then graceful stop; read-only spins stay with the exploration watchdog), and tool schemas build once per turn instead of every step (no step budget — turns run until the model finishes or the user interrupts).
 - 🧩 **Extensible Skills & 67 Built-in Skills**:
   - Discovers skills from `~/.harness/skills/` and `.harness/skills/` on top of the built-ins.
   - Includes specialized **`skill_creator`** (generates and installs new skills on user request) and **`mcp_integrator`** (connects and configures MCP servers).
