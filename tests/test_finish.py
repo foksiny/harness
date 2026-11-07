@@ -36,6 +36,59 @@ class ScriptedProvider(MockProvider):
             yield LLMChunk(delta_text="done.", finish_reason="stop")
 
 
+class TestFinishDeliveryGate(unittest.TestCase):
+    def test_undelivered_gui_text_rejects_finish_once(self):
+        from harness.tools.base import Tool
+
+        class _FailedType(Tool):
+            name = "computer_type"
+            description = "fake"
+            action_type = "computer_input"
+            is_read_only = False
+            parameters = {"type": "object",
+                          "properties": {"text": {"type": "string"}},
+                          "required": []}
+
+            def execute(self, text="", **kwargs):
+                return ('Error: {"ok": false, "delivered": false, '
+                        '"kind": "overview_open", "error": "app-search is open"}')
+
+        cfg = HarnessConfig()
+        cfg.provider = "mock"
+        cfg.learning_enabled = False
+        finish_args = '{"summary": "message sent", "evidence": "checked", "verified": true}'
+        script = [
+            [LLMChunk(tool_calls=[ToolCallDelta(
+                index=0, id="call_type_1", name="computer_type",
+                arguments_delta='{"text": "hello"}')])],
+            [LLMChunk(tool_calls=[ToolCallDelta(
+                index=0, id="call_fin_1", name="finish",
+                arguments_delta=finish_args)])],
+            [LLMChunk(tool_calls=[ToolCallDelta(
+                index=0, id="call_fin_2", name="finish",
+                arguments_delta=finish_args)])],
+        ]
+        agent = HarnessAgent(cfg)
+        provider = ScriptedProvider(script)
+        agent.provider = provider
+        agent.tool_registry.tools["computer_type"] = _FailedType()
+
+        events = list(agent.step("send the message"))
+
+        self.assertTrue(any(
+            ev.type == "text_delta" and "GUI text was not delivered" in str(ev.data)
+            for ev in events))
+        self.assertEqual(provider.call_count, 3)
+        finish_results = [
+            m for m in agent.session.messages
+            if m.get("role") == "tool" and m.get("name") == "finish"
+        ]
+        self.assertTrue(any("did not complete" in str(m.get("content"))
+                            for m in finish_results))
+        self.assertTrue(any("message sent" in str(m.get("content"))
+                            for m in finish_results))
+
+
 class TestFinishTool(unittest.TestCase):
 
     def test_finish_tool_is_registered_and_allowed(self):
@@ -126,6 +179,69 @@ class TestFinishTool(unittest.TestCase):
         self.assertTrue(any(ev.type == "text_delta" and "done." in str(ev.data) for ev in events))
         self.assertTrue(any(ev.type == "step_end" and ev.data.get("complete") for ev in events))
 
+
+class TestAntiLazinessGuard(unittest.TestCase):
+    def test_build_prompt_contains_laziness_guard(self):
+        from harness.core.prompt import SystemPromptBuilder
+        from harness.core.modes import Mode
+        prompt = SystemPromptBuilder(Mode.BUILD).build()
+        self.assertIn("BUILD MODE", prompt)
+        self.assertIn("Anti-laziness guard", prompt)
+        self.assertIn("No stub/placeholder/TODO", prompt)
+        self.assertIn("MUST run a verification step", prompt)
+        self.assertIn("capped", prompt)
+
+    def test_mutating_no_verification_finish_rejected(self):
+        cfg = HarnessConfig()
+        cfg.provider = "mock"
+        cfg.learning_enabled = False
+        script = [
+            [LLMChunk(tool_calls=[ToolCallDelta(
+                index=0, id="call_write", name="write_file",
+                arguments_delta='{"path": "tmp/x.txt", "content": "hello"}',
+            )])],
+            [LLMChunk(tool_calls=[ToolCallDelta(
+                index=0, id="call_fin", name="finish",
+                arguments_delta='{"summary": "done"}',
+            )])],
+            # After rejection, script runs out -> provider emits "done." stop.
+        ]
+        agent = HarnessAgent(cfg)
+        provider = ScriptedProvider(script)
+        agent.provider = provider
+        events = list(agent.step("make a file"))
+        self.assertTrue(any(
+            ev.type == "text_delta" and "verification evidence required" in str(ev.data)
+            for ev in events))
+        self.assertGreaterEqual(provider.call_count, 2)
+
+    def test_exploration_early_nudge_fires_at_six(self):
+        cfg = HarnessConfig()
+        cfg.provider = "mock"
+        cfg.learning_enabled = False
+        # Six consecutive read-only calls: list_dir each with distinct path so
+        # the repeat-loop watchdog does not pre-empt the exploration watchdog.
+        calls = []
+        for i in range(6):
+            calls.append([LLMChunk(tool_calls=[ToolCallDelta(
+                index=0, id=f"call_read_{i}", name="list_dir",
+                arguments_delta=f'{{"path": "harness/core/agent_{i}.py"}}',
+            )])])
+        calls.append([LLMChunk(tool_calls=[ToolCallDelta(
+            index=0, id="call_fin", name="finish",
+            arguments_delta='{"summary": "did reads"}',
+        )])])
+        agent = HarnessAgent(cfg)
+        provider = ScriptedProvider(calls)
+        agent.provider = provider
+        events = list(agent.step("look around"))
+        self.assertTrue(any(
+            ev.type == "text_delta" and "Exploration streak reached" in str(ev.data)
+            for ev in events))
+        # The hard 10-streak nudge must NOT have fired yet (early nudge is first).
+        self.assertFalse(any(
+            ev.type == "text_delta" and "Exploration loop detected" in str(ev.data)
+            for ev in events))
 
 if __name__ == "__main__":
     unittest.main()

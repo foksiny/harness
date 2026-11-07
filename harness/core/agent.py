@@ -131,6 +131,9 @@ class HarnessAgent:
         # Cooperative stop: set from any thread (TUI Ctrl-C handler, Discord
         # /stop) to interrupt the running turn at the next safe checkpoint.
         self._stop_requested = threading.Event()
+        # Serializes whole turns across threads (TUI worker, inline /goal,
+        # company loop, mesh). Held for the entire step() generator.
+        self._turn_lock = threading.Lock()
 
         # Wire concurrent swarm workers: each worker thread builds its own provider
         # for the currently selected provider/model, propagates the parent's mode so
@@ -279,6 +282,66 @@ class HarnessAgent:
         return f"[tool_error: {kind} tool={tool_name}] {result}\nWhat does this tell you? Name the cause, then your next action (retry differently, fix args, or report blocker)."
 
     @staticmethod
+    def _delivery_status(tool_name: str, result: str) -> Optional[Dict[str, Any]]:
+        """Parse delivered=... from computer_type/computer_act results.
+
+        Returns ``{"status": "failed", ...}`` when text provably did not land,
+        ``{"status": "delivered"}`` on a verified send, or None when the call
+        did not type anything / cannot be parsed.
+        """
+        if tool_name not in ("computer_type", "computer_act"):
+            return None
+        text = str(result or "").strip()
+        if text.lower().startswith("error:"):
+            text = text.split(":", 1)[1].strip()
+        start = text.find("{")
+        if start < 0:
+            return None
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(text[start:])
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        def _failure(src: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "status": "failed",
+                "kind": src.get("kind") or "delivery_failed",
+                "error": src.get("error") or "the typed text was not delivered",
+                "next": src.get("next") or "",
+                "failed_at_step": src.get("failed_at_step"),
+            }
+
+        # For macros, prefer the failing step's detail over the rollup.
+        for i, step in enumerate(payload.get("results") or []):
+            if isinstance(step, dict) and step.get("delivered") is False:
+                out = _failure(step)
+                out["failed_at_step"] = i
+                return out
+        if (tool_name == "computer_act" and payload.get("failed_at_step") is not None
+                and str(payload.get("failed_step_action") or "").lower()
+                in ("key", "keys", "combo", "chord")):
+            # The text landed but the send key failed: nothing was submitted.
+            out = _failure(payload)
+            out["failed_at_step"] = payload.get("failed_at_step")
+            return out
+        if payload.get("delivered") is False:
+            return _failure(payload)
+        ok = payload.get("ok")
+        if payload.get("delivered") is True:
+            # delivered=true only means the text is in the input. If the call
+            # itself failed (e.g. Return failed), the send did not complete.
+            if ok is False:
+                return _failure(payload)
+            return {"status": "delivered"}
+        if ok is False and payload.get("submitted") is not True:
+            # Typed but unverifiable (no OCR, capture failed) or blocked: the
+            # turn must not end claiming the message was sent.
+            return _failure(payload)
+        return None
+
+    @staticmethod
     def _is_verification_call(tool_name: str, args: Dict[str, Any]) -> bool:
         """Did this tool call actually verify something (not just mutate)?"""
         if tool_name in ("execute_python", "git_diff"):
@@ -292,6 +355,54 @@ class HarnessAgent:
         if tool_name in ("browser_screenshot", "computer_screenshot"):
             return True
         return False
+
+    # ── Computer-use watchdog helpers ──────────────────────────────────
+    # GUI work has a failure mode code work does not: the model can observe
+    # forever (screenshot / window-list / OCR / ps) without ever clicking or
+    # typing. On Wayland the window list is *always* empty, so "retry window
+    # discovery" is a trap. These helpers drive a dedicated, much shorter
+    # watchdog than the generic exploration one.
+    _COMPUTER_OBSERVATION_TOOLS = frozenset({
+        "computer_screenshot", "computer_ocr", "computer_env",
+    })
+    _COMPUTER_ACTION_TOOLS = frozenset({
+        "computer_click", "computer_move", "computer_drag", "computer_scroll",
+        "computer_type", "computer_key", "computer_combo", "computer_act",
+        "computer_clipboard_write",
+    })
+
+    @staticmethod
+    def _is_computer_observation_call(tool_name: str, args: Dict[str, Any]) -> bool:
+        if tool_name in HarnessAgent._COMPUTER_OBSERVATION_TOOLS:
+            return True
+        if tool_name == "computer_windows":
+            return str((args or {}).get("op", "list")).lower() in ("list", "active")
+        return False
+
+    @staticmethod
+    def _computer_action_label(tool_name: str, args: Dict[str, Any]) -> str:
+        """Compact, human-readable action signature for stall nudges."""
+        if not args:
+            return tool_name
+        if tool_name == "computer_act":
+            # A macro is defined by its steps, not by the tool name alone —
+            # otherwise two different macros look identical and trip the
+            # repeat watchdog.
+            bits = []
+            for step in list(args.get("steps") or [])[:6]:
+                if not isinstance(step, dict):
+                    continue
+                name = str(step.get("action") or "?")
+                target = step.get("mark")
+                if target is None:
+                    target = step.get("key") or step.get("text") or step.get("app")
+                if target is None and step.get("x") is not None:
+                    target = f"{step.get('x')},{step.get('y')}"
+                bits.append(f"{name}:{str(target)[:30]}" if target is not None else name)
+            return "computer_act(" + ",".join(bits) + ")" if bits else "computer_act"
+        keep = ("mark", "nx", "ny", "x", "y", "text", "key", "keys", "app", "op", "submit")
+        bits = [f"{k}={str(args[k])[:40]}" for k in keep if args.get(k) not in (None, "", [])]
+        return f"{tool_name}(" + ", ".join(bits[:5]) + ")" if bits else tool_name
 
     def _stream_interruptible(self, stream_factory: Callable[[], Iterator[LLMChunk]]) -> Iterator[LLMChunk]:
         """Yield provider chunks while staying responsive to stop requests.
@@ -876,7 +987,16 @@ class HarnessAgent:
                 pass
 
     def step(self, user_prompt: Optional[str] = None) -> Generator[AgentEvent, None, None]:
-        """Execute a single or multi-step agent turn, yielding live events."""
+        """Execute a single or multi-step agent turn, yielding live events.
+
+        Whole turns are serialized through ``_turn_lock`` so background
+        drivers (TUI worker, mesh, Discord, company) can never overlap two
+        ``step()`` calls on the same agent.
+        """
+        with self._turn_lock:
+            yield from self._step_inner(user_prompt)
+
+    def _step_inner(self, user_prompt: Optional[str] = None) -> Generator[AgentEvent, None, None]:
         self.is_running = True
         self.clear_stop()
         tools_executed_this_turn = 0
@@ -889,6 +1009,10 @@ class HarnessAgent:
         turn_escalated = False
         turn_review_done = False
         turn_error_streak = 0
+        # GUI text delivery: a failed computer_type means the message was NOT
+        # sent, so finish must not silently accept a success claim.
+        turn_delivery_failure: Optional[Dict[str, Any]] = None
+        turn_delivery_nudged = False
         # J3: quality telemetry for this turn.
         telemetry = {"verification_actions": 0, "finish_rejections": 0, "escalations": 0, "compactions": 0}
         self._last_telemetry = telemetry  # type: ignore[attr-defined]
@@ -1097,13 +1221,28 @@ class HarnessAgent:
         MAX_SUPER_TEXT_NUDGES = 1
         # Exploration watchdog: consecutive read-only calls without action.
         exploration_streak = 0
+        # Anti-laziness guard fires FIRST (BUILD most strict): after 6 read-only
+        # calls a soft "act now" nudge; the existing hard nudge at 10 stays as backstop.
+        MAX_EXPLORATION_NUDGE = 6
         MAX_EXPLORATION_STREAK = 10
+        exploration_nudged = False
         # Repeat-loop watchdog: identical tool calls (same name + args) in a row
         # mean the model is stuck retrying something that isn't working.
         last_tool_sig: Optional[str] = None
         repeat_streak = 0
         MAX_REPEAT_NUDGE = 3
         MAX_REPEAT_BREAK = 5
+        # Computer-use watchdog: observation-only or identical GUI action loops.
+        computer_seen = False
+        computer_observation_streak = 0
+        computer_observation_nudged = False
+        MAX_COMPUTER_OBSERVATION_NUDGE = 3
+        MAX_COMPUTER_OBSERVATION_BREAK = 6
+        last_computer_action_sig: Optional[str] = None
+        computer_action_repeat = 0
+        computer_action_nudged = False
+        MAX_COMPUTER_ACTION_NUDGE = 2
+        MAX_COMPUTER_ACTION_BREAK = 4
         # Tool schemas are static within a turn (mode doesn't change mid-turn):
         # build once and reuse instead of re-serializing 46 tools every step.
         active_tools = self.tool_registry.get_openai_schemas(self.mode)
@@ -1446,6 +1585,29 @@ class HarnessAgent:
                     finish_summary = str(args.get("summary", "")).strip() or "Task complete."
                     evidence = str(args.get("evidence", "")).strip()
                     if turn_finish_rejections < 2:
+                        if turn_delivery_failure and not turn_delivery_nudged:
+                            turn_delivery_nudged = True
+                            turn_finish_rejections += 1
+                            telemetry["finish_rejections"] += 1
+                            detail = turn_delivery_failure
+                            nudge = (
+                                "[SYSTEM]: A GUI text send did not complete this turn — "
+                                f"computer_type returned ok=false ({detail.get('error')}). "
+                                "The text may not have reached the intended input and was "
+                                "NOT verifiably sent. Do not claim it was sent. Re-screenshot, "
+                                "press Escape if an overview or app-search surface is open, "
+                                "click the real input, and retry computer_type(expect=..., "
+                                "submit=true); or report the failure clearly. Then call "
+                                "`finish` again."
+                            )
+                            self.session.messages.append({
+                                "role": "tool", "tool_call_id": v["id"], "name": "finish",
+                                "content": nudge,
+                            })
+                            self.checkpoint_manager.record_message_append(len(self.session.messages) - 1, self.session.messages[-1])
+                            yield AgentEvent("tool_call_result", {"name": "finish", "result": nudge})
+                            yield AgentEvent("text_delta", "\n[Harness] Finish rejected: GUI text was not delivered.\n")
+                            break
                         open_tasks = [t for t in self.todo_manager.list_tasks()
                                       if t.status.value in ("pending", "in_progress")]
                         if turn_mutation_seen and not turn_verification_seen and not evidence:
@@ -1454,7 +1616,8 @@ class HarnessAgent:
                             nudge = ("[SYSTEM]: You have not run any verification this turn. Run the "
                                      "tests/build now, then call `finish` again with `evidence` "
                                      "(what was checked + outcome) and `verified=true`, or explain why "
-                                     "verification is not applicable.")
+                                     "verification is not applicable. [Anti-laziness guard: finish is rejected "
+                                     "until verification evidence is present.]")
                             self.session.messages.append({
                                 "role": "tool", "tool_call_id": v["id"], "name": "finish",
                                 "content": nudge,
@@ -1468,7 +1631,8 @@ class HarnessAgent:
                             telemetry["finish_rejections"] += 1
                             titles = ", ".join(f"#{t.id} {t.title}" for t in open_tasks[:5])
                             nudge = (f"[SYSTEM]: {len(open_tasks)} task(s) are still open: {titles}. "
-                                     "Mark them complete (with evidence) or failed before finishing.")
+                                     "Mark them complete (with evidence) or failed before finishing. "
+                                     "[Anti-laziness guard: cannot finish with open todos.]")
                             self.session.messages.append({
                                 "role": "tool", "tool_call_id": v["id"], "name": "finish",
                                 "content": nudge,
@@ -1481,7 +1645,7 @@ class HarnessAgent:
                             turn_review_done = True
                             nudge = ("[SYSTEM]: Before finishing, do a self-review pass: what was claimed vs "
                                      "what was evidenced? What is likely broken? Fix or rebut, then call "
-                                     "`finish` again with evidence.")
+                                     "`finish` again with evidence. [Anti-laziness guard: self-review is mandatory on code-changing turns.]")
                             self.session.messages.append({
                                 "role": "tool", "tool_call_id": v["id"], "name": "finish",
                                 "content": nudge,
@@ -1502,6 +1666,14 @@ class HarnessAgent:
 
                 result = self.tool_registry.execute(tool_name, args, self.mode)
                 tools_executed_this_turn += 1
+                # GUI delivery tracking: keep the last failed send visible to the
+                # finish gate; a later verified send clears it.
+                _delivery = self._delivery_status(tool_name, result)
+                if _delivery:
+                    if _delivery.get("status") == "delivered":
+                        turn_delivery_failure = None
+                    else:
+                        turn_delivery_failure = _delivery
                 # G1 tracking: mutations + verification evidence for the finish gate.
                 if self._is_mutating_call(tool_name, args):
                     turn_mutation_seen = True
@@ -1521,6 +1693,35 @@ class HarnessAgent:
                         telemetry["escalations"] += 1
                 else:
                     turn_error_streak = 0
+
+                # ── Computer-use watchdog bookkeeping ─────────────────
+                # Observation-only steps (screenshot/OCR/window list/ps) never
+                # advance the GUI. Count them separately from real actions and
+                # from the generic exploration watchdog.
+                if tool_name.startswith("computer_"):
+                    computer_seen = True
+                _computer_obs = self._is_computer_observation_call(tool_name, args)
+                if (tool_name == "run_command" and computer_seen
+                        and self._is_exploration_call(tool_name, args)):
+                    _computer_obs = True
+                if _computer_obs:
+                    computer_observation_streak += 1
+                elif tool_name in self._COMPUTER_ACTION_TOOLS:
+                    computer_observation_streak = 0
+                    computer_observation_nudged = False
+                    _sig = self._computer_action_label(tool_name, args)
+                    if _sig == last_computer_action_sig:
+                        computer_action_repeat += 1
+                    else:
+                        computer_action_repeat = 0
+                        computer_action_nudged = False
+                        last_computer_action_sig = _sig
+                else:
+                    computer_observation_streak = 0
+                    computer_observation_nudged = False
+                    computer_action_repeat = 0
+                    computer_action_nudged = False
+
                 # Exploration watchdog: count consecutive read-only calls.
                 # C3: track progressive vs redundant — the watchdog below only
                 # fires when the streak is mostly re-reading the same files.
@@ -1531,6 +1732,7 @@ class HarnessAgent:
                         exploration_files_seen.add(path_key)
                 else:
                     exploration_streak = 0
+                    exploration_nudged = False
 
                 # ── Tool image routing ────────────────────────────────
                 # Tools such as browser_screenshot embed
@@ -1541,6 +1743,27 @@ class HarnessAgent:
                 # configured, else a plain path reference.
                 from harness.core.attachments import split_tool_images
                 result, tool_image_paths = split_tool_images(result)
+
+                # Wayland window lists are empty by design; make that explicit
+                # in the tool result so the model does not treat it as a
+                # transient failure and retry window discovery.
+                _wl_empty = (
+                    tool_name == "computer_windows"
+                    and '"windows": []' in str(result)
+                    and ('"session": "wayland"' in str(result)
+                         or '"session": "xwayland"' in str(result))
+                )
+                if _wl_empty:
+                    result = (
+                        f"{result}\n[Harness] windows=[] is EXPECTED on Wayland-native "
+                        "desktops. Do not call computer_windows again this turn. Use "
+                        "the screenshot marks (computer_click mark=N) or the apps list."
+                    )
+                # Keep the user's actual goal in front of the model during GUI
+                # work, so it does not drift into app internals (tokens, caches).
+                if tool_name.startswith("computer_") and user_prompt:
+                    _goal = " ".join(str(user_prompt).strip().split())[:280]
+                    result = f"{result}\n\n[Harness] TURN GOAL (stay on it): {_goal}"
 
                 # Replay any subagent/swarm activity that occurred during this tool
                 # call from the main thread so the renderer stays single-threaded.
@@ -1620,12 +1843,82 @@ class HarnessAgent:
                 yield AgentEvent("step_end", {"step": current_loop, "complete": True})
                 break
 
+            # ── Computer-use stall watchdog ───────────────────────────
+            # Observation-only loops and repeated identical GUI actions are
+            # the two ways desktop agents burn a turn doing nothing. Nudge at
+            # a low threshold, then end the turn instead of looping forever.
+            if computer_action_repeat >= MAX_COMPUTER_ACTION_BREAK:
+                yield AgentEvent("text_delta",
+                                 "\n[Harness] The same computer action was repeated too many times "
+                                 "without the screen changing — ending this turn to stop the loop. "
+                                 "Tell me the exact control/target to use and I'll continue.\n")
+                yield AgentEvent("step_end", {"step": current_loop, "complete": True})
+                break
+            if (computer_action_repeat >= MAX_COMPUTER_ACTION_NUDGE
+                    and not computer_action_nudged):
+                computer_action_nudged = True
+                self.session.messages.append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM]: You just repeated the same computer action "
+                        f"({last_computer_action_sig}). The screen did not advance. Do NOT "
+                        "repeat it. Either click a different mark, re-screenshot to re-ground, "
+                        "focus the correct window first, or — if the target is ambiguous — call "
+                        "`ask_user` with the visible candidates."
+                    ),
+                })
+                yield AgentEvent("text_delta",
+                                 "\n[Harness] Repeated computer action detected — nudging a new approach.\n")
+
+            if computer_observation_streak >= MAX_COMPUTER_OBSERVATION_BREAK:
+                yield AgentEvent("text_delta",
+                                 "\n[Harness] Computer-use stall: six observation-only steps with no "
+                                 "click/type/action. Ending this turn to avoid a loop. The latest "
+                                 "screen state is above; tell me which window/person/control to act on.\n")
+                yield AgentEvent("step_end", {"step": current_loop, "complete": True})
+                break
+            if (computer_observation_streak >= MAX_COMPUTER_OBSERVATION_NUDGE
+                    and not computer_observation_nudged):
+                computer_observation_nudged = True
+                self.session.messages.append({
+                    "role": "user",
+                    "content": (
+                        f"[SYSTEM]: You have made {computer_observation_streak} observation-only "
+                        "computer steps (screenshot/OCR/window list/ps) without acting. STOP "
+                        "observing. Use the numbered marks from the latest screenshot: call "
+                        "`computer_click(mark=N)`, or one `computer_act` batch "
+                        "(click mark → type → key Return). If the target is ambiguous (which "
+                        "friend/chat/app), call `ask_user` now with the candidates visible on "
+                        "screen. If the last action did nothing, change the target/approach — "
+                        "do not repeat it."
+                    ),
+                })
+                yield AgentEvent("text_delta",
+                                 "\n[Harness] Computer observation loop detected — forcing an action.\n")
+
             # Exploration watchdog: a long streak of consecutive read-only calls
             # means the model is spiraling in re-orientation instead of working.
             # Force it back to concrete action with a system nudge (fires once
             # per streak; the streak resets on any real work).
+            # EARLY nudge (anti-laziness guard): at MAX_EXPLORATION_NUDGE, inject a
+            # soft redirect BEFORE the hard 10-streak nudge exists.
+            if exploration_streak >= MAX_EXPLORATION_NUDGE and not exploration_nudged:
+                exploration_nudged = True
+                self.session.messages.append({
+                    "role": "user",
+                    "content": (
+                        f"[SYSTEM]: You have executed {MAX_EXPLORATION_NUDGE} consecutive read-only "
+                        "exploration calls in a row without producing any changes. You have enough "
+                        "context — STOP re-exploring and take concrete action toward the goal RIGHT NOW: "
+                        "write the code/files you already planned, run the builds/tests, or — if the "
+                        "goal is truly complete — call `finish` with your final summary. "
+                        "[Anti-laziness guard: exploration is capped at 6 calls before action is required.]"
+                    ),
+                })
+                yield AgentEvent("text_delta", "\n[Harness] Exploration streak reached — nudging to concrete action.\n")
             if exploration_streak >= MAX_EXPLORATION_STREAK:
                 exploration_streak = 0
+                exploration_nudged = False
                 self.session.messages.append({
                     "role": "user",
                     "content": (
@@ -1893,6 +2186,7 @@ class HarnessAgent:
             degrade_verbose=degrade_verbose,
             mesh_info=mesh_info,
             ultra_goal=str(current_query or "").startswith(ULTRA_GOAL_MARKER),
+            computer_enabled=self.tool_registry.get("computer_screenshot") is not None,
         )
 
     def _summarize_block(self, messages: List[Dict[str, Any]]) -> Optional[str]:

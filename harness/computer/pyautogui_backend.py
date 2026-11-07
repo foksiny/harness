@@ -38,12 +38,15 @@ def _ensure_imports():
 
     # XWayland rootless mode doesn't use Xauthority but python-xlib crashes
     # if ~/.Xauthority is missing. Create an empty file so the import works.
-    xauth = Path.home() / ".Xauthority"
-    if not xauth.exists():
-        try:
-            xauth.touch(mode=0o600)
-        except Exception:
-            pass
+    # Only relevant on Linux — never touch credential files on macOS/Windows.
+    import sys as _sys
+    if _sys.platform.startswith("linux"):
+        xauth = Path.home() / ".Xauthority"
+        if not xauth.exists():
+            try:
+                xauth.touch(mode=0o600)
+            except Exception:
+                pass
 
     try:
         import pyautogui
@@ -135,7 +138,18 @@ def capture_screen(
     _ensure_imports()
     out_dir = out_dir or os.path.expanduser("~/.harness/screenshots")
     os.makedirs(out_dir, exist_ok=True)
-    
+
+    # On Linux Wayland, mss/pyautogui capture the XWayland root at best and a
+    # black frame at worst. Compositor-native CLI tools are the reliable path.
+    try:
+        from harness.computer.wayland_utils import detect_platform, is_wayland
+        if detect_platform() == "linux" and is_wayland():
+            result = _capture_cli(region, monitor_index, out_dir)
+            if result.get("ok") and not _is_all_black(result.get("path")):
+                return result
+    except Exception:
+        pass
+
     # Try mss first (fastest, works on X11/macOS/Windows)
     if _mss is not None:
         try:
@@ -390,9 +404,43 @@ def execute_input(action: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": True, "action": "hscroll", "clicks": clicks}
         
         if name == "type":
-            text = action.get("text", "")
+            text = str(action.get("text", ""))
             interval = action.get("interval", 0.02)
-            _pyautogui.typewrite(text, interval=interval) if text.isascii() else _pyautogui.write(text)
+            # pyautogui typewrite/write synthesize keycodes and cannot type
+            # arbitrary Unicode. Paste Unicode via the clipboard instead.
+            if text and not text.isascii():
+                saved: Optional[str] = None
+                prev = clipboard_read()
+                if prev.get("ok") and prev.get("text") not in (None, ""):
+                    saved = str(prev.get("text"))
+                written = clipboard_write(text)
+                if not written.get("ok"):
+                    return {
+                        "ok": False,
+                        "error": (
+                            "Unicode typing needs a clipboard (key synthesis "
+                            "cannot type it). " + str(written.get("error") or "")
+                        ),
+                    }
+                if __import__("sys").platform == "darwin":
+                    _pyautogui.hotkey("command", "v")
+                else:
+                    _pyautogui.hotkey("ctrl", "v")
+                restored = False
+                if saved is not None:
+                    try:
+                        time.sleep(0.2)
+                        restored = bool(clipboard_write(saved).get("ok"))
+                    except Exception:
+                        pass
+                out: Dict[str, Any] = {
+                    "ok": True, "action": "type", "length": len(text),
+                    "via": "clipboard-paste", "backend": "pyautogui-paste",
+                }
+                if restored:
+                    out["restored_clipboard"] = True
+                return out
+            _pyautogui.typewrite(text, interval=interval)
             return {"ok": True, "action": "type", "length": len(text)}
         
         if name in ("key", "press"):
@@ -432,12 +480,12 @@ def execute_input(action: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def clipboard_read() -> Dict[str, Any]:
-    """Read system clipboard via pyperclip or xclip/wl-paste."""
+    """Read system clipboard via pyperclip, xclip/wl-paste, or libX11."""
     # Try pyperclip first
     try:
         import pyperclip
         return {"ok": True, "text": pyperclip.paste()}
-    except ImportError:
+    except Exception:  # ImportError, PyperclipException (no backend), ...
         pass
     
     # Try CLI tools
@@ -456,7 +504,15 @@ def clipboard_read() -> Dict[str, Any]:
             return {"ok": True, "text": result.stdout}
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    
+
+    try:
+        from harness.computer import x11clipboard
+        xtext = x11clipboard.read()
+        if xtext is not None:
+            return {"ok": True, "text": xtext, "backend": "x11clipboard"}
+    except Exception:
+        pass
+
     return {"ok": False, "error": "no clipboard backend available",
             "hints": ["install xclip (X11) or wl-clipboard (Wayland)"]}
 
@@ -467,9 +523,9 @@ def clipboard_write(text: str) -> Dict[str, Any]:
         import pyperclip
         pyperclip.copy(text)
         return {"ok": True}
-    except ImportError:
+    except Exception:
         pass
-    
+
     import subprocess
     try:
         result = subprocess.run(["xclip", "-selection", "clipboard"],
@@ -478,14 +534,21 @@ def clipboard_write(text: str) -> Dict[str, Any]:
             return {"ok": True}
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    
+
     try:
         result = subprocess.run(["wl-copy"], input=text.encode(), timeout=5)
         if result.returncode == 0:
             return {"ok": True}
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    
+
+    try:
+        from harness.computer import x11clipboard
+        if x11clipboard.is_available() and x11clipboard.write(str(text)):
+            return {"ok": True, "backend": "x11clipboard"}
+    except Exception:
+        pass
+
     return {"ok": False, "error": "no clipboard backend available"}
 
 

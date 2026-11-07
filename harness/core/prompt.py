@@ -92,7 +92,21 @@ Agent swarms are ACTIVE. You are expected to delegate aggressively but sensibly.
 
 """
 
+COMPUTER_PROTOCOL = """## COMPUTER USE (desktop GUI):
+- Start with `computer_screenshot`: it returns the image (vision models) plus numbered OCR marks (`[N] 'text' nx ny`).
+- Non-vision models: the marks are already text — use them directly; call `computer_ocr` if you need the full on-screen text.
+- Act with `computer_click(mark=N)` or a single `computer_act` batch (click → type → Return). Type steps are delivery-verified before the Return step runs. Do not guess pixel coordinates.
+- After each action, read the new screenshot/marks. If the screen did not change, do NOT repeat the same click/type — try a different mark, re-screenshot, or ask.
+- `computer_windows` returning `[]` is NORMAL on Wayland-native desktops. Never retry it; use the screenshot + marks. The `apps` list still tells you what is running.
+- Ambiguous target (which friend/chat/file/app) → call `ask_user` once with the candidates visible on screen, then act. Do not guess, and do not inspect app databases/tokens to operate a GUI.
+- Keyboard input goes to the FOCUSED window, not the window in your last screenshot. Before typing, take a fresh screenshot and click the intended input (`mark=N`).
+- NEVER type while an overview / app-search / launcher is open (placeholders like "Type to search" / "Digite para pesquisar", or Activities + Show Applications). Typing there searches the desktop and Return launches the top hit — the wrong app. Press Escape, click the real window, re-screenshot.
+- Use `computer_type(expect="<text visible in the target window>", submit=true)`: it captures before/after, refuses overviews, verifies the text appeared near the input you clicked, and only then presses Return. Prefer this over blind type + Return.
+- `delivered=false` means the text did NOT reach the intended input — it was NOT sent. Never claim success. Press Escape / re-screenshot / click the real input and retry, or tell the user it failed.
+"""
+
 _git_cache_lock = threading.Lock()
+
 _git_cache: Dict[str, Tuple[float, str]] = {}
 
 # TTL for the cached git summary — long enough to avoid subprocess churn on every
@@ -169,6 +183,7 @@ class SystemPromptBuilder:
         degrade_verbose: bool = False,
         mesh_info: str = "",
         ultra_goal: bool = False,
+        computer_enabled: bool = False,
     ) -> str:
         """Assemble the system prompt.
 
@@ -205,7 +220,14 @@ class SystemPromptBuilder:
                 "You are currently operating in **BUILD MODE**.\n"
                 "- You are actively implementing solutions, creating/editing files, and running test suites.\n"
                 "- Prioritize atomic, verifiable steps and validate each modification.\n"
-                "- Delegate parallelizable or deeply investigative subtasks to subagents/swarms instead of doing them inline."
+                "- Delegate parallelizable or deeply investigative subtasks to subagents/swarms instead of doing them inline.\n"
+                "- **Anti-laziness guard (enforced by the harness, not optional)**:\n"
+                "  * Every numbered item in the user's request must be addressed; if you dropped one, say so before `finish`.\n"
+                "  * No stub/placeholder/TODO code: implement the real behavior for every path the request names. If a TODO remains, implement it before `finish` or explicitly list why it is blocked.\n"
+                "  * Exploration is capped: after ≤6 consecutive read-only calls the harness injects a nudge; the exploration watchdog fires at the same threshold in agent loop. Act on what you have — do not spin re-reading files you already saw.\n"
+                "  * Mutations are gated: any turn that wrote/edited/deleted files (or ran a mutating shell command) MUST run a verification step (tests/build/lint/launch, `execute_python`, or a `tester`/`reviewer` subagent) before `finish`. `finish` without `evidence` + `verified=true` will be rejected by the harness — this is automatic, not a suggestion.\n"
+                "  * Plan tracking is gated for multi-step work: if you touched files and created no `todo_create`/`todo_update` entries on a 3+ step task, the harness will flag the missing plan before `finish`.\n"
+                "  * Self-review is mandatory before final delivery on a code-changing turn: re-read your diff, check edge cases you named, and fix the weakest point before `finish`."
             )
 
         # 2. Swarm protocol (active via config flag or SUPER mode)
@@ -215,6 +237,10 @@ class SystemPromptBuilder:
         # 2b. Ultra-Goal protocol (full app/game engineering mission)
         if ultra_goal:
             sections.append(ULTRA_GOAL_PROTOCOL)
+
+        # 2c. Desktop computer-use protocol (only when those tools are loaded)
+        if computer_enabled:
+            sections.append(COMPUTER_PROTOCOL)
 
         # 3. Permission Guidance
         sections.append("\n## PERMISSION PROFILE:")

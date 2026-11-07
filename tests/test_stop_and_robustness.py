@@ -251,7 +251,12 @@ class TestExplorationWatchdog(AgentStepTestCase):
         nudges = [m for m in agent.session.messages
                   if m.get("role") == "user"
                   and "read-only exploration calls" in str(m.get("content", ""))]
-        self.assertEqual(len(nudges), 1, "watchdog should fire exactly once per streak")
+        # Anti-laziness guard: early nudge at 6 fires first, then the hard
+        # exploration-loop nudge at 10 — each exactly once per streak.
+        early = [m for m in nudges if "6 consecutive" in str(m.get("content", ""))]
+        hard = [m for m in nudges if "10 consecutive" in str(m.get("content", ""))]
+        self.assertEqual(len(early), 1, "early anti-laziness nudge should fire at 6")
+        self.assertEqual(len(hard), 1, "hard watchdog should fire exactly once per streak")
         self.assertIn("turn_complete", [e.type for e in events])
 
     def test_real_work_resets_the_exploration_streak(self):
@@ -268,7 +273,8 @@ class TestExplorationWatchdog(AgentStepTestCase):
         # 10 explorations + 1 mutation: the streak reached only 10 AFTER the
         # mutation reset it, so one nudge still fires — but prove the reset by
         # checking the nuke fires only once and the turn completes normally.
-        self.assertLessEqual(len(nudges), 1)
+        # Anti-laziness guard adds the early nudge at 6, so at most 2 total.
+        self.assertLessEqual(len(nudges), 2)
 
 
 class TestToolNotFoundRecovery(unittest.TestCase):

@@ -251,6 +251,7 @@ class CommandRegistry:
         self.register("goal", self._cmd_goal, "Initiate Super Mode autonomous loop toward an explicit goal.")
         self.register("ultra-goal", self._cmd_ultra_goal, "Full app/game build: agent interviews you first, then max-capability Super Mode mission with parallel subagent/squad generation and enforced verification.")
         self.register("ultragoal", self._cmd_ultra_goal, "Alias of /ultra-goal: full app/game build mission.")
+        self.register("company", self._cmd_company, "Company mode: autonomous companion that watches your screen, chats and helps while you play/gaming/chatting. /company [role], /company stop, /company status.")
         self.register("stop", self._cmd_stop, "Interrupt running agent turn (use '/stop all' to also clear queue).")
         self.register("queue", self._cmd_queue, "View, drop, pause, resume, or clear prompt execution queue.")
         self.register("info", self._cmd_info, "Inspect workspace, session, model, and context info.")
@@ -358,6 +359,11 @@ class CommandRegistry:
         """Cooperatively interrupt the running turn from the CLI side."""
         was_running = ctx.agent.is_running
         ctx.agent.request_stop()
+        company = getattr(ctx.agent, "_company_controller", None)
+        company_was = bool(company is not None and company.is_running)
+        if company_was:
+            company.stop("stopped via /stop")
+            ctx.renderer.print_warning("🏠 Company stopped.")
         if ctx.args.lower() in ("all", "clear", "queue") and ctx.queue is not None:
             cleared = ctx.queue.clear()
             if cleared:
@@ -365,9 +371,84 @@ class CommandRegistry:
 
         if was_running:
             ctx.renderer.print_warning("⏹ Stop requested — interrupting current execution…")
+        elif company_was:
+            pass
         else:
             ctx.renderer.print_info("⏹ Stop flag set.")
             ctx.agent.clear_stop()
+
+    def _get_company(self, ctx: CommandContext):
+        """Lazily create the per-agent CompanyController."""
+        company = getattr(ctx.agent, "_company_controller", None)
+        if company is not None:
+            return company
+        from harness.company.controller import CompanyController, speak
+        agent = ctx.agent
+        renderer = ctx.renderer
+        company = CompanyController(
+            step_fn=lambda prompt: agent.step(prompt),
+            render_fn=lambda ev: renderer.render_agent_event(ev),
+            announce_fn=lambda text: renderer.print_info(text),
+            speak_fn=speak,
+            finish_fn=lambda: (renderer.finish_markdown(), renderer.finish_thinking()),
+        )
+        try:
+            ctx.agent._company_controller = company
+        except Exception:
+            pass
+        return company
+
+    def _cmd_company(self, ctx: CommandContext):
+        """/company: autonomous companion loop (runs forever until stopped)."""
+        from harness.company.controller import COMPANY_BANNER_ITEMS, DEFAULT_ROLE
+        args = (ctx.args or "").strip()
+        lowered = args.lower()
+        if lowered == "status":
+            company = getattr(ctx.agent, "_company_controller", None)
+            if company is None or not company.is_running:
+                ctx.renderer.print_info("🏠 Company is not running. Use /company [role] to start it.")
+            else:
+                st = company.status()
+                ctx.renderer.print_info(
+                    f"🏠 Company RUNNING — role: {st['role']} | beat #{st['tick']} "
+                    f"| every {st['interval']:.0f}s | quiet streak {st['quiet_streak']}"
+                )
+                ctx.renderer.print_info(f"Stop: /stop, /company stop, Ctrl+C, Shift+Esc (in-terminal), or touch {st['stop_file']}")
+            return
+        if lowered == "stop":
+            company = getattr(ctx.agent, "_company_controller", None)
+            if company is None or not company.is_running:
+                ctx.renderer.print_info("🏠 Company is not running.")
+            else:
+                company.stop("stopped via /company stop")
+                ctx.agent.request_stop()
+                ctx.renderer.print_warning("🏠 Company stop requested.")
+            return
+        if lowered in ("help", "--help", "-h"):
+            ctx.renderer.print_info(
+                "Usage: /company [role...] — e.g. '/company side-chat me on Discord', "
+                "'/company watch my game and help me win'. Bare /company uses a general-company role. "
+                "Stop anytime: /stop, /company stop, Ctrl+C, Shift+Esc, or your Super+Shift+Esc shortcut touching "
+                "~/.harness/company.stop (GNOME Settings → Keyboard → Shortcuts → Custom)."
+            )
+            return
+        role = args or DEFAULT_ROLE
+        company = self._get_company(ctx)
+        if company.is_running:
+            ctx.renderer.print_warning(
+                f"🏠 Company is already running (role: {company.role}). "
+                "Use /company stop first, then /company <new role>."
+            )
+            return
+        ok = company.start(role)
+        if not ok:
+            ctx.renderer.print_warning("🏠 Could not start company (already running).")
+            return
+        ctx.renderer.print_success(f"🏠 Company started — role: {role}")
+        for line in COMPANY_BANNER_ITEMS:
+            ctx.renderer.print_info(f"  {line}")
+        _publish_state({"company": True, "role": role}, ctx)
+        _publish_output(f"🏠 Company started — {role}", ctx)
 
     def _cmd_queue(self, ctx: CommandContext):
         """Manage prompt execution queue."""

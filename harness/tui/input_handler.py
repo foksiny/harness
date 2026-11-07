@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from typing import List, Optional, Iterator
 
 SLASH_COMMANDS = [
-    "/help", "/goal", "/ultra-goal", "/ultragoal", "/stop", "/queue", "/info", "/sidebar", "/status", "/mode", "/perm", "/theme",
+    "/help", "/goal", "/ultra-goal", "/ultragoal", "/company", "/stop", "/queue", "/info", "/sidebar", "/status", "/mode", "/perm", "/theme",
     "/provider", "/model", "/models", "/config", "/keys", "/login", "/setup",
     "/effort", "/temperature", "/todo", "/skills", "/reload", "/mcp", "/update", "/discord",
     "/subagent", "/agents", "/agent", "/back",
@@ -24,6 +24,7 @@ COMMAND_DESCRIPTIONS = {
     "/goal": "Launch autonomous goal loop in Super Mode",
     "/ultra-goal": "Full app/game build: interview + swarm file generation + verified delivery",
     "/ultragoal": "Alias of /ultra-goal",
+    "/company": "Autonomous company: /company [role], /company stop, /company status",
     "/stop": "Interrupt running task (or '/stop all' to clear queue)",
     "/queue": "View, drop, pause, resume or clear prompt queue",
     "/info": "Inspect workspace, session, model & context info",
@@ -73,6 +74,7 @@ VIEW_AGENTS = "agents"
 SENTINEL_OPEN_AGENTS = "\x00__OPEN_AGENTS__"
 SENTINEL_BACK = "\x00__BACK__"
 SENTINEL_CLEAR = "\x00__CLEAR__"
+SENTINEL_COMPANY_STOP = "\x00__COMPANY_STOP__"
 
 
 @contextmanager
@@ -452,6 +454,12 @@ class InputHandler:
         def _clear_screen(event):
             event.app.exit(result=SENTINEL_CLEAR)
 
+        # Shift+Esc is the in-terminal panic key for company mode (Super is
+        # consumed by GNOME before it reaches the terminal).
+        @kb.add(keys.Keys.ShiftEscape)
+        def _company_stop(event):
+            event.app.exit(result=SENTINEL_COMPANY_STOP)
+
         from prompt_toolkit.styles import Style
         pt_style = Style.from_dict({
             "bottom-toolbar": "noreverse noinherit",
@@ -493,7 +501,7 @@ class InputHandler:
                 from prompt_toolkit.patch_stdout import patch_stdout
                 with patch_stdout(raw=True):
                     result = session.prompt(prompt_text, **kwargs).strip()
-                if result in (SENTINEL_OPEN_AGENTS, SENTINEL_BACK, SENTINEL_CLEAR):
+                if result in (SENTINEL_OPEN_AGENTS, SENTINEL_BACK, SENTINEL_CLEAR, SENTINEL_COMPANY_STOP):
                     return result
                 return result
             except EOFError:
@@ -551,6 +559,9 @@ class InputHandler:
         """Classify an escape sequence; '' swallows a complete non-keybind sequence."""
         if seq == b"\x1b":
             return None
+        # xterm kitty-style Shift+Escape (\x1b[27;2;27~) -> stop company.
+        if seq in (b"\x1b[27;2;27~",):
+            return SENTINEL_COMPANY_STOP
         if seq in (b"\x1b[12~", b"\x1bOQ", b"\x1b[1;2Q"):
             return SENTINEL_OPEN_AGENTS
         if seq.startswith(b"\x1b["):

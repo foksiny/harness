@@ -224,6 +224,58 @@ class TestCurrentGenModelSpecs(unittest.TestCase):
         self.assertEqual(spec_oss.thinking_type, "reasoning_effort")
 
 
+class TestKimiK31ProRegression(unittest.TestCase):
+    """Regression: kimi-k3.1-pro is a 1M-context multimodal reasoning model.
+
+    It was previously resolved with a small/unknown context window and no
+    video/vision flags, which silently truncated conversations and dropped
+    image inputs. The catalog must answer the same way for every prefix the
+    providers use.
+    """
+
+    def test_catalog_specs_for_every_provider(self):
+        for provider in ("openrouter", "together", "nvidia"):
+            spec = inspect_model("moonshotai/kimi-k3.1-pro", provider)
+            self.assertEqual(spec.context_window, 1048576, provider)
+            self.assertEqual(spec.max_output_tokens, 943718, provider)
+            self.assertTrue(spec.supports_thinking, provider)
+            self.assertTrue(spec.supports_vision, provider)
+            self.assertTrue(spec.supports_video, provider)
+            self.assertEqual(spec.source, "catalog", provider)
+
+    def test_provider_dialects(self):
+        self.assertEqual(
+            inspect_model("moonshotai/kimi-k3.1-pro", "openrouter").thinking_type,
+            "reasoning_object")
+        self.assertEqual(
+            inspect_model("moonshotai/kimi-k3.1-pro", "together").thinking_type,
+            "reasoning_toggle")
+        self.assertEqual(
+            inspect_model("moonshotai/kimi-k3.1-pro", "nvidia").thinking_type,
+            "reasoning_effort")
+
+    def test_bare_alias_resolves(self):
+        spec = inspect_model("kimi-k3.1-pro", "openrouter")
+        self.assertEqual(spec.context_window, 1048576)
+        self.assertTrue(spec.supports_vision)
+        self.assertTrue(spec.supports_video)
+
+    def test_thinking_parameters(self):
+        prov = MockProvider()
+        self.assertEqual(
+            prov.normalize_thinking_effort(
+                inspect_model("moonshotai/kimi-k3.1-pro", "openrouter"), "high"),
+            {"reasoning": {"effort": "high"}})
+        self.assertEqual(
+            prov.normalize_thinking_effort(
+                inspect_model("moonshotai/kimi-k3.1-pro", "together"), "high"),
+            {"reasoning": {"enabled": True}})
+        self.assertEqual(
+            prov.normalize_thinking_effort(
+                inspect_model("moonshotai/kimi-k3.1-pro", "nvidia"), "high"),
+            {"reasoning_effort": "high"})
+
+
 class TestThinkingDialectNormalization(unittest.TestCase):
 
     def test_dialect_shapes(self):

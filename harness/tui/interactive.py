@@ -19,6 +19,7 @@ from harness.tui.input_handler import (
     SENTINEL_OPEN_AGENTS,
     SENTINEL_BACK,
     SENTINEL_CLEAR,
+    SENTINEL_COMPANY_STOP,
     VIEW_AGENTS,
     VIEW_PARENT,
     is_command_input,
@@ -921,15 +922,19 @@ def run_interactive(agent: HarnessAgent):
                 # (see get_prompt above), not in the footer. It is shown
                 # for as long as the agent is running.
 
+                _company = getattr(agent, "_company_controller", None)
+                _company_running = bool(_company is not None and _company.is_running)
                 if agent.is_running:
                     status_tag = '<ansigreen><b>[▶ RUNNING]</b></ansigreen> '
                     action_tag = '<style color="#888888">/stop to interrupt</style>'
+                    if _company_running:
+                        status_tag += '<ansiblue><b>[🏠 COMPANY]</b></ansiblue> '
                 elif queue.is_paused:
                     status_tag = '<ansiyellow><b>[PAUSED]</b></ansiyellow> '
                     action_tag = '<style color="#888888">/queue resume</style>'
                 else:
-                    status_tag = ''
-                    action_tag = '<b>ctrl+p</b> <style color="#888888">commands</style>'
+                    status_tag = '<ansiblue><b>[🏠 COMPANY]</b></ansiblue> ' if _company_running else ''
+                    action_tag = '<style color="#888888">/company stop</style>' if _company_running else '<b>ctrl+p</b> <style color="#888888">commands</style>'
 
                 q_tag = f'  <ansiyellow><b>Queue: {q_sz}</b></ansiyellow>' if q_sz > 0 else ''
 
@@ -988,6 +993,13 @@ def run_interactive(agent: HarnessAgent):
             view = VIEW_PARENT
             renderer.print_info("Returned to parent agent view.")
             continue
+        if user_input == SENTINEL_COMPANY_STOP:
+            company = getattr(agent, "_company_controller", None)
+            if company is not None and company.is_running:
+                company.stop("stopped via Shift+Esc")
+                agent.request_stop()
+                renderer.print_warning("🏠 Company stopped (Shift+Esc).")
+            continue
         if not user_input:
             continue
 
@@ -1009,6 +1021,14 @@ def run_interactive(agent: HarnessAgent):
             continue
 
         if user_input.lower() in ("/exit", "/quit", "exit", "quit"):
+            # Ctrl+C maps to /exit when idle — but with company running it
+            # must stop company first, not quit Harness.
+            company = getattr(agent, "_company_controller", None)
+            if company is not None and company.is_running:
+                company.stop("stopped via Ctrl+C")
+                agent.request_stop()
+                renderer.print_warning("🏠 Company stopped (Ctrl+C). Type /exit again to quit Harness.")
+                continue
             renderer.print_info("Saving session and shutting down Harness. Goodbye!")
             worker_stop.set()
             agent.request_stop()

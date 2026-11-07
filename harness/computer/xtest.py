@@ -12,6 +12,7 @@ callers can switch to a CLI driver instead.
 """
 import ctypes
 import ctypes.util
+import os
 from typing import Dict, List, Optional, Tuple
 
 # Classic X11 keycodes for the common US-layout keysyms (queried at runtime
@@ -59,8 +60,8 @@ _SHIFT_PAIRS: Dict[str, str] = {
 class XTestSession:
     """Live binding to libX11 + libXtst for XTEST input."""
 
-    def __init__(self, display: str) -> None:
-        self.display = display
+    def __init__(self, display: Optional[str] = None) -> None:
+        self.display = display or os.environ.get("DISPLAY", "").strip() or ":0"
         libx11_name = ctypes.util.find_library("X11") or "libX11.so.6"
         libxtst_name = ctypes.util.find_library("Xtst") or "libXtst.so.6"
         self.libx11 = ctypes.CDLL(libx11_name)
@@ -81,6 +82,7 @@ class XTestSession:
         self.libx11.XStringToKeysym.restype = ctypes.c_ulong
         self.libx11.XStringToKeysym.argtypes = [ctypes.c_char_p]
         self.libx11.XFlush.argtypes = [ctypes.c_void_p]
+        self.libx11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
         self.libxtst.XTestFakeMotionEvent.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
@@ -127,14 +129,16 @@ class XTestSession:
     # ---- mouse ----
     def move(self, x: int, y: int) -> None:
         self.libxtst.XTestFakeMotionEvent(self.dpy, -1, int(x), int(y), 0)
-        self.libx11.XFlush(self.dpy)
+        # XSync (not just XFlush) makes the request round-trip before a click
+        # is synthesized, so the button event is delivered at the new point.
+        self.libx11.XSync(self.dpy, 0)
 
     def button(self, name: str, down: bool = True) -> None:
         btn = MOUSE_BUTTONS.get(name.lower())
         if btn is None:
             raise ValueError(f"unknown mouse button '{name}'")
         self.libxtst.XTestFakeButtonEvent(self.dpy, btn, 1 if down else 0, 0)
-        self.libx11.XFlush(self.dpy)
+        self.libx11.XSync(self.dpy, 0)
 
     def click(self, name: str = "left") -> None:
         self.button(name, True)
@@ -143,6 +147,14 @@ class XTestSession:
     def double_click(self, name: str = "left") -> None:
         self.click(name)
         self.click(name)
+
+    def drag(self, x1: int, y1: int, x2: int, y2: int,
+             name: str = "left") -> None:
+        """Press at (x1, y1), move to (x2, y2), then release."""
+        self.move(int(x1), int(y1))
+        self.button(name, True)
+        self.move(int(x2), int(y2))
+        self.button(name, False)
 
     def scroll(self, x_steps: int = 0, y_steps: int = 0) -> None:
         for _ in range(abs(x_steps or 0)):
@@ -178,7 +190,18 @@ class XTestSession:
             self.key(k, False)
 
     def type_text(self, text: str) -> None:
-        """Type UTF-safe text, managing Shift for symbols/uppercase."""
+        """Type ASCII text, managing Shift for symbols/uppercase.
+
+        Non-ASCII characters have no keycode-bound key in general, so this
+        fails loudly instead of silently dropping them. Callers must route
+        Unicode through clipboard paste.
+        """
+        if text and not text.isascii():
+            bad = next(ch for ch in text if not ch.isascii())
+            raise ValueError(
+                f"XTEST cannot type non-ASCII {bad!r} via keycodes; "
+                "use clipboard paste for Unicode text."
+            )
         for ch in text:
             if ch == "\n":
                 self.key("enter")
